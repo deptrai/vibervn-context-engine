@@ -87,7 +87,7 @@
   <!-- Main content (hidden until loaded) -->
   <div id="main-content" class="hidden">
     <!-- Tab bar (Wikipedia-style underline tabs) -->
-    <div role="tablist" class="flex border-b border-gray-200 dark:border-wiki-border mb-6">
+    <div role="tablist" id="tablist-main" class="flex border-b border-gray-200 dark:border-wiki-border mb-6">
       <button role="tab" id="tab-repos" aria-selected="true" aria-controls="panel-repos"
               class="tab-btn px-4 py-2 text-sm border-b-2 border-blue-600 dark:border-wiki-border-active text-gray-900 dark:text-wiki-heading
                      focus:outline-none focus:ring-2 focus:ring-blue-400">
@@ -107,8 +107,17 @@
       </button>
     </div>
 
-    <!-- Tab: Repositories -->
+    <!-- Tab: Repositories (default) -->
     <div role="tabpanel" id="panel-repos">
+      <div class="flex items-center justify-between mb-3">
+        <span class="text-xs text-gray-500 dark:text-wiki-text-muted">Configured repositories</span>
+        <button id="btn-index-all"
+                class="px-3 py-1 text-xs rounded border border-gray-300 dark:border-wiki-border text-gray-600 dark:text-wiki-text-muted
+                       hover:bg-gray-100 dark:hover:bg-wiki-surface hover:text-gray-900 dark:hover:text-wiki-text
+                       focus:outline-none focus:ring-2 focus:ring-blue-400 disabled:opacity-50 disabled:cursor-not-allowed">
+          Index All
+        </button>
+      </div>
       <div id="repos-list" class="space-y-2 mb-4"></div>
       <div id="repos-empty" class="hidden text-gray-400 dark:text-wiki-text-muted text-sm mb-4">
         No repositories configured. Add an absolute path below.
@@ -201,12 +210,98 @@
       </form>
     </div>
   </div><!-- /main-content -->
+
+  <!-- Search page (full overlay, hidden by default) -->
+  <div id="search-page" class="hidden">
+    <div class="flex items-center gap-2 mb-4 border-b border-gray-200 dark:border-wiki-border pb-3">
+      <button id="btn-search-back"
+              class="text-sm text-gray-500 dark:text-wiki-text-muted hover:text-gray-900 dark:hover:text-wiki-heading
+                     focus:outline-none focus:ring-2 focus:ring-blue-400 rounded px-2 py-1">
+        &larr; Back
+      </button>
+      <span id="search-repo-name" class="font-mono text-sm text-gray-800 dark:text-wiki-text truncate"></span>
+    </div>
+    <form id="form-search" class="flex gap-2 mb-3" onsubmit="return false;">
+      <input id="input-search" type="text" placeholder="Search this repository…"
+             class="flex-1 border border-gray-200 dark:border-wiki-border bg-white dark:bg-wiki-surface rounded px-3 py-2 text-sm
+                    text-gray-900 dark:text-wiki-text placeholder:text-gray-400 dark:placeholder:text-wiki-text-muted
+                    focus:outline-none focus:ring-2 focus:ring-blue-400 focus:border-blue-400 dark:focus:border-wiki-border-active" />
+      <button type="submit" id="btn-search"
+              class="px-4 py-2 bg-blue-600 dark:bg-wiki-border-active/20 dark:border dark:border-wiki-border-active text-white dark:text-wiki-link text-sm rounded
+                     hover:bg-blue-700 dark:hover:bg-wiki-border-active/30 focus:outline-none focus:ring-2 focus:ring-blue-400
+                     disabled:opacity-50 disabled:cursor-not-allowed">
+        Search
+      </button>
+    </form>
+    <div id="search-error" class="hidden mb-3 text-sm text-red-600 dark:text-red-400"></div>
+    <div id="search-results" class="space-y-4"></div>
+    <div id="search-empty" class="hidden text-gray-400 dark:text-wiki-text-muted text-sm">No results found.</div>
+    <div id="search-timing" class="hidden mt-3 text-xs text-gray-400 dark:text-wiki-text-muted"></div>
+  </div><!-- /search-page -->
 </div><!-- /container -->
 
 <script>
 // ─── State ────────────────────────────────────────────────────────────────
 let cfg = null;
 let saveTimer = null;
+let indexStatuses = {}; // keyed by repo path
+let indexPollTimer = null;
+
+// ─── Base64url encode for repo_id ─────────────────────────────────────────
+function encodeRepoId(path) {
+  // URL-safe base64 (no padding) — matches Rust's URL_SAFE_NO_PAD
+  const bytes = new TextEncoder().encode(path);
+  let binary = '';
+  for (const b of bytes) binary += String.fromCharCode(b);
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+}
+
+// ─── Index status polling ─────────────────────────────────────────────────
+async function pollIndexStatus() {
+  try {
+    const res = await fetch('/api/index-status');
+    if (!res.ok) return;
+    const arr = await res.json();
+    const newStatuses = {};
+    for (const item of arr) {
+      newStatuses[item.repo] = item;
+    }
+    indexStatuses = newStatuses;
+    updateRepoIndexUI();
+  } catch (_) { /* ignore network errors in polling */ }
+}
+
+function startIndexPolling() {
+  clearInterval(indexPollTimer);
+  indexPollTimer = setInterval(pollIndexStatus, 3000);
+  pollIndexStatus();
+}
+
+function updateRepoIndexUI() {
+  if (!cfg || !cfg.repos) return;
+  cfg.repos.forEach((repo) => {
+    const statusEl = document.getElementById('repo-status-' + encodeRepoId(repo));
+    const btnEl = document.getElementById('repo-index-btn-' + encodeRepoId(repo));
+    if (!statusEl || !btnEl) return;
+    const s = indexStatuses[repo];
+    if (!s) {
+      statusEl.textContent = '';
+      btnEl.disabled = false;
+      return;
+    }
+    if (s.state === 'indexing') {
+      statusEl.innerHTML = '<span class="animate-pulse text-blue-500 dark:text-wiki-link">Indexing…</span>';
+      btnEl.disabled = true;
+    } else if (s.state === 'error') {
+      statusEl.innerHTML = '<span class="text-red-500 dark:text-red-400" title="' + escHtml(s.error || '') + '">Error</span>';
+      btnEl.disabled = false;
+    } else {
+      const count = s.indexed_files || 0;
+      statusEl.textContent = count > 0 ? count + ' files' : '';
+      btnEl.disabled = false;
+    }
+  });
+}
 
 // ─── Utility ──────────────────────────────────────────────────────────────
 function maskKey(k) {
@@ -279,15 +374,46 @@ function renderRepos() {
   }
   empty.classList.add('hidden');
   cfg.repos.forEach((repo, idx) => {
+    const repoId = encodeRepoId(repo);
     const row = document.createElement('div');
-    row.className = 'flex items-center justify-between border border-gray-200 dark:border-wiki-border rounded px-3 py-2 text-sm bg-white dark:bg-wiki-surface';
+    row.className = 'flex items-center gap-2 border border-gray-200 dark:border-wiki-border rounded px-3 py-2 text-sm bg-white dark:bg-wiki-surface';
     row.innerHTML = `
-      <span class="font-mono text-gray-800 dark:text-wiki-text truncate flex-1 mr-2">${escHtml(repo)}</span>
+      <button data-repo="${escHtml(repo)}" class="btn-open-search font-mono text-gray-800 dark:text-wiki-link truncate flex-1 mr-1 text-left hover:underline focus:outline-none focus:ring-2 focus:ring-blue-400 rounded">${escHtml(repo)}</button>
+      <span id="repo-status-${repoId}" class="text-xs text-gray-400 dark:text-wiki-text-muted whitespace-nowrap"></span>
+      <button id="repo-index-btn-${repoId}" data-repo="${escHtml(repo)}"
+              class="btn-index-repo text-xs px-2 py-1 rounded border border-gray-300 dark:border-wiki-border
+                     text-gray-600 dark:text-wiki-text-muted hover:bg-gray-100 dark:hover:bg-wiki-surface/60
+                     hover:text-gray-900 dark:hover:text-wiki-text
+                     focus:outline-none focus:ring-2 focus:ring-blue-400 disabled:opacity-40 disabled:cursor-not-allowed">
+        Index
+      </button>
       <button data-idx="${idx}" class="btn-remove-repo text-gray-400 dark:text-wiki-text-muted hover:text-red-500 dark:hover:text-red-400 text-xs
               focus:outline-none focus:ring-2 focus:ring-red-300 rounded px-2 py-1">Remove</button>
     `;
     list.appendChild(row);
   });
+
+  list.querySelectorAll('.btn-open-search').forEach(btn => {
+    btn.addEventListener('click', () => openRepoSearch(btn.dataset.repo));
+  });
+
+  list.querySelectorAll('.btn-index-repo').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const repo = btn.dataset.repo;
+      const repoId = encodeRepoId(repo);
+      btn.disabled = true;
+      const statusEl = document.getElementById('repo-status-' + repoId);
+      if (statusEl) statusEl.innerHTML = '<span class="animate-pulse text-blue-500 dark:text-wiki-link">Queued…</span>';
+      try {
+        await fetch('/api/repos/' + repoId + '/index', { method: 'POST' });
+        await pollIndexStatus();
+      } catch (e) {
+        if (statusEl) statusEl.innerHTML = '<span class="text-red-500">Error</span>';
+        btn.disabled = false;
+      }
+    });
+  });
+
   list.querySelectorAll('.btn-remove-repo').forEach(btn => {
     btn.addEventListener('click', () => {
       cfg.repos.splice(parseInt(btn.dataset.idx, 10), 1);
@@ -295,6 +421,9 @@ function renderRepos() {
       saveNow();
     });
   });
+
+  // Apply current status state to newly rendered buttons.
+  updateRepoIndexUI();
 }
 
 function renderKeyList(containerId, keys, onRemove) {
@@ -477,8 +606,146 @@ document.getElementById('btn-theme').addEventListener('click', () => {
 });
 updateThemeIcon();
 
+// ─── Search page ──────────────────────────────────────────────────────────
+let currentSearchRepo = null;
+
+function openRepoSearch(repo) {
+  currentSearchRepo = repo;
+  document.getElementById('main-content').classList.add('hidden');
+  document.getElementById('search-page').classList.remove('hidden');
+  document.getElementById('search-repo-name').textContent = repo;
+  document.getElementById('input-search').value = '';
+  document.getElementById('search-results').innerHTML = '';
+  document.getElementById('search-error').classList.add('hidden');
+  document.getElementById('search-empty').classList.add('hidden');
+  document.getElementById('search-timing').classList.add('hidden');
+  document.getElementById('input-search').focus();
+}
+
+function closeRepoSearch() {
+  currentSearchRepo = null;
+  document.getElementById('search-page').classList.add('hidden');
+  document.getElementById('main-content').classList.remove('hidden');
+}
+
+document.getElementById('btn-search-back').addEventListener('click', closeRepoSearch);
+
+async function runSearch() {
+  const input = document.getElementById('input-search');
+  const btn = document.getElementById('btn-search');
+  const errorEl = document.getElementById('search-error');
+  const resultsEl = document.getElementById('search-results');
+  const emptyEl = document.getElementById('search-empty');
+  const timingEl = document.getElementById('search-timing');
+
+  const q = input.value.trim();
+  if (!q) return;
+
+  btn.disabled = true;
+  btn.textContent = 'Searching…';
+  errorEl.classList.add('hidden');
+  resultsEl.innerHTML = '';
+  emptyEl.classList.add('hidden');
+  timingEl.classList.add('hidden');
+
+  try {
+    const payload = { query: q, top_k: 30 };
+    if (currentSearchRepo) payload.repo = currentSearchRepo;
+    const res = await fetch('/api/query', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      errorEl.textContent = data.error || `Search failed (HTTP ${res.status})`;
+      errorEl.classList.remove('hidden');
+      return;
+    }
+    renderSearchResults(data.results);
+    if (data.timing) {
+      timingEl.textContent =
+        `embed ${data.timing.embed_ms}ms · search ${data.timing.search_ms}ms · ` +
+        `graph ${data.timing.graph_ms}ms · merge ${data.timing.merge_ms}ms · ` +
+        `total ${data.timing.total_ms}ms`;
+      timingEl.classList.remove('hidden');
+    }
+  } catch (err) {
+    errorEl.textContent = 'Network error: ' + err.message;
+    errorEl.classList.remove('hidden');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Search';
+  }
+}
+
+function renderSearchResults(results) {
+  const container = document.getElementById('search-results');
+  const emptyEl = document.getElementById('search-empty');
+  container.innerHTML = '';
+
+  if (!results || results.length === 0) {
+    emptyEl.classList.remove('hidden');
+    return;
+  }
+  emptyEl.classList.add('hidden');
+
+  results.forEach((r) => {
+    const card = document.createElement('div');
+    card.className = 'border border-gray-200 dark:border-wiki-border rounded bg-white dark:bg-wiki-surface overflow-hidden';
+
+    const header = document.createElement('div');
+    header.className = 'flex items-center justify-between px-3 py-2 border-b border-gray-100 dark:border-wiki-border';
+
+    const loc = document.createElement('span');
+    loc.className = 'font-mono text-xs text-gray-600 dark:text-wiki-link truncate mr-2 select-all';
+    let displayPath = r.file;
+    if (currentSearchRepo && displayPath.startsWith(currentSearchRepo)) {
+      displayPath = displayPath.slice(currentSearchRepo.length).replace(/^[\/\\]/, '');
+    }
+    loc.textContent = displayPath + '#L' + r.line_start + '-' + r.line_end;
+
+    const score = document.createElement('span');
+    score.className = 'text-xs px-2 py-0.5 rounded-full bg-blue-100 dark:bg-wiki-border text-blue-700 dark:text-wiki-link whitespace-nowrap';
+    score.textContent = (r.score * 100).toFixed(0) + '%';
+
+    header.appendChild(loc);
+    header.appendChild(score);
+
+    const pre = document.createElement('pre');
+    pre.className = 'text-xs p-3 overflow-x-auto text-gray-800 dark:text-wiki-text font-mono leading-relaxed';
+    pre.textContent = r.content || '';
+
+    card.appendChild(header);
+    card.appendChild(pre);
+    container.appendChild(card);
+  });
+}
+
+document.getElementById('form-search').addEventListener('submit', runSearch);
+document.getElementById('btn-search').addEventListener('click', runSearch);
+document.getElementById('input-search').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') { e.preventDefault(); runSearch(); }
+});
+
 // ─── Init ─────────────────────────────────────────────────────────────────
 loadConfig();
+startIndexPolling();
+
+// Index All button.
+document.getElementById('btn-index-all').addEventListener('click', async () => {
+  const btn = document.getElementById('btn-index-all');
+  btn.disabled = true;
+  btn.textContent = 'Indexing…';
+  try {
+    await fetch('/api/index-all', { method: 'POST' });
+    await pollIndexStatus();
+  } catch (e) {
+    /* ignore */
+  }
+  btn.disabled = false;
+  btn.textContent = 'Index All';
+});
 </script>
 </body>
 </html>
