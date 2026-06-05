@@ -80,5 +80,88 @@ pub fn chunk_file(file: &str, source: &str, symbols: &[Symbol]) -> Vec<Chunk> {
         window_start += STRIDE;
     }
 
+    // Guard: never emit a chunk whose content is empty or whitespace-only.
+    // This mirrors the Python reference implementation in
+    // local-context-engine/corbell/core/embeddings/extractor.py:187.
+    // The fix MUST live here (not in embed_all_chunks) because the pipeline
+    // relies on a strict 1:1 positional alignment between the chunk list and
+    // the returned embedding vectors; filtering at the embed layer would desync
+    // that zip and corrupt stored data.
     chunks
+        .into_iter()
+        .filter(|c| !c.content.trim().is_empty())
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parsing::symbols::{QualifiedSymbol, Symbol, SymbolKind};
+
+    fn make_symbol(file: &str, name: &str, line_start: u32, line_end: u32) -> Symbol {
+        Symbol {
+            qualified: QualifiedSymbol {
+                file: file.to_string(),
+                scope_path: vec![],
+                name: name.to_string(),
+            },
+            kind: SymbolKind::Function,
+            line_start,
+            line_end,
+            signature: None,
+            parent_fqn: None,
+        }
+    }
+
+    /// A sliding window that lands entirely on blank lines must not produce a
+    /// chunk with empty/whitespace content.  Construct a source string where a
+    /// real function at the top and a real statement at the bottom are separated
+    /// by 60+ blank lines, so at least one 50-line window falls entirely inside
+    /// the blank region.
+    #[test]
+    fn no_blank_content_chunks_from_blank_line_regions() {
+        let mut source = String::from("void foo() {\n    return;\n}\n");
+        // 60 blank lines — enough to guarantee a full window of blanks
+        for _ in 0..60 {
+            source.push('\n');
+        }
+        source.push_str("int x = 1;\n");
+
+        let chunks = chunk_file("test.cpp", &source, &[]);
+
+        for chunk in &chunks {
+            assert!(
+                !chunk.content.trim().is_empty(),
+                "chunk at lines {}-{} has blank/empty content",
+                chunk.line_start,
+                chunk.line_end,
+            );
+        }
+    }
+
+    /// A completely blank / whitespace-only file must yield an empty chunk vec.
+    #[test]
+    fn blank_file_yields_no_chunks() {
+        let source = "\n   \n\t\n\n";
+        let chunks = chunk_file("empty.cpp", source, &[]);
+        assert!(
+            chunks.is_empty(),
+            "expected no chunks for a blank file, got {}",
+            chunks.len()
+        );
+    }
+
+    /// A symbol whose body is entirely whitespace must not produce a symbol chunk.
+    #[test]
+    fn blank_symbol_body_yields_no_chunk() {
+        // Source has a "symbol" on lines 1-3 but the body is all blank lines.
+        let source = "\n\n\n";
+        let sym = make_symbol("blank_sym.cpp", "blank_fn", 1, 3);
+        let chunks = chunk_file("blank_sym.cpp", source, &[sym]);
+        assert!(
+            chunks.is_empty(),
+            "expected no chunks for a symbol with blank body, got {}",
+            chunks.len()
+        );
+    }
 }
