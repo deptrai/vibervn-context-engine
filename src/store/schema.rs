@@ -39,8 +39,12 @@ DEFINE TABLE IF NOT EXISTS calls TYPE RELATION IN symbol OUT symbol;
 DEFINE FIELD OVERWRITE line     ON calls TYPE int;
 DEFINE FIELD OVERWRITE in_file  ON calls TYPE string;
 DEFINE FIELD OVERWRITE out_file ON calls TYPE string;
-DEFINE INDEX IF NOT EXISTS idx_calls_in_file ON calls FIELDS in_file;
+DEFINE FIELD OVERWRITE in_name  ON calls TYPE option<string>;
+DEFINE FIELD OVERWRITE out_name ON calls TYPE option<string>;
+DEFINE INDEX IF NOT EXISTS idx_calls_in_file  ON calls FIELDS in_file;
 DEFINE INDEX IF NOT EXISTS idx_calls_out_file ON calls FIELDS out_file;
+DEFINE INDEX IF NOT EXISTS idx_calls_in_name  ON calls FIELDS in_name;
+DEFINE INDEX IF NOT EXISTS idx_calls_out_name ON calls FIELDS out_name;
 
 DEFINE TABLE IF NOT EXISTS uses TYPE RELATION IN symbol OUT symbol;
 DEFINE FIELD OVERWRITE in_file  ON uses TYPE string;
@@ -67,14 +71,23 @@ DEFINE INDEX IF NOT EXISTS idx_implements_in_file ON implements FIELDS in_file;
 DEFINE INDEX IF NOT EXISTS idx_implements_out_file ON implements FIELDS out_file;
 
 DEFINE TABLE IF NOT EXISTS file_meta SCHEMAFULL;
-DEFINE FIELD OVERWRITE path  ON file_meta TYPE string;
-DEFINE FIELD OVERWRITE mtime ON file_meta TYPE int;
-DEFINE FIELD OVERWRITE size  ON file_meta TYPE int;
-DEFINE FIELD OVERWRITE repo  ON file_meta TYPE string;
+DEFINE FIELD OVERWRITE path        ON file_meta TYPE string;
+DEFINE FIELD OVERWRITE mtime       ON file_meta TYPE int;
+DEFINE FIELD OVERWRITE size        ON file_meta TYPE int;
+DEFINE FIELD OVERWRITE repo        ON file_meta TYPE string;
+DEFINE FIELD OVERWRITE chunk_count ON file_meta TYPE int;
 DEFINE INDEX IF NOT EXISTS idx_filemeta_path ON file_meta FIELDS path UNIQUE;
 
 DEFINE TABLE IF NOT EXISTS index_meta SCHEMAFULL;
 DEFINE FIELD OVERWRITE key   ON index_meta TYPE string;
 DEFINE FIELD OVERWRITE value ON index_meta TYPE string;
 DEFINE INDEX IF NOT EXISTS idx_meta_key ON index_meta FIELDS key UNIQUE;
+
+DEFINE TABLE IF NOT EXISTS raw_edge SCHEMAFULL;
+DEFINE FIELD OVERWRITE from_file ON raw_edge TYPE string;
+DEFINE FIELD OVERWRITE from_name ON raw_edge TYPE string;
+DEFINE FIELD OVERWRITE to_name   ON raw_edge TYPE string;
+DEFINE FIELD OVERWRITE kind      ON raw_edge TYPE string;
+DEFINE FIELD OVERWRITE line      ON raw_edge TYPE int;
+DEFINE INDEX IF NOT EXISTS idx_raw_edge_from_file ON raw_edge FIELDS from_file;
 "#;

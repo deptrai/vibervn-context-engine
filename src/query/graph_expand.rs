@@ -51,27 +51,26 @@ const MAX_BONUS_CHUNKS: usize = 30;
 /// callers (score × 0.6) and callees (score × 0.5) up to 2 levels deep.
 /// Returns up to MAX_BONUS_CHUNKS additional chunks.
 ///
-/// `db_for_file` maps repo path → DB handle so we can look up chunks by file.
+/// `schema_version`: when >= 2, uses indexed `WHERE out_name=$name` queries.
+/// When < 2 (migration in progress), falls back to the old link-deref query.
 pub async fn graph_expand(
     base_chunks: &[MergeChunk],
     db_map: &HashMap<String, Surreal<Db>>,
+    schema_version: u32,
 ) -> Vec<ExpandedChunk> {
-    // We need any db — pick the first available. For multi-repo, we check all.
     if db_map.is_empty() {
         return vec![];
     }
 
     let mut all_expanded: Vec<ExpandedChunk> = Vec::new();
-    let mut global_seen: HashSet<String> = HashSet::new(); // FQN strings already visited
+    let mut global_seen: HashSet<String> = HashSet::new();
 
-    // Track files already present in base_chunks so we don't re-fetch identical ranges.
     let base_keys: HashSet<(String, u32, u32)> = base_chunks
         .iter()
         .map(|c| (c.file.clone(), c.line_start, c.line_end))
         .collect();
 
     'outer: for base_chunk in base_chunks {
-        // Find overlapping symbols in the DB that owns this file.
         let db = match find_db_for_file(db_map, &base_chunk.file) {
             Some(db) => db,
             None => continue,
@@ -96,7 +95,6 @@ pub async fn graph_expand(
             continue;
         }
 
-        // BFS queue: (fqn_string, score, depth)
         let mut queue: Vec<(String, f32, usize)> = overlapping
             .iter()
             .map(|s| (build_fqn(&s.file, &s.name), base_chunk.score, 0))
@@ -113,7 +111,7 @@ pub async fn graph_expand(
             // Expand callers.
             let caller_score = score * CALLER_SCORE_FACTOR;
             if caller_score >= SCORE_FLOOR {
-                let callers = query_callers(db, &fqn).await.unwrap_or_default();
+                let callers = query_callers(db, &fqn, schema_version).await.unwrap_or_default();
                 for caller_fqn in callers {
                     if global_seen.contains(&caller_fqn) {
                         continue;
@@ -133,7 +131,7 @@ pub async fn graph_expand(
             // Expand callees.
             let callee_score = score * CALLEE_SCORE_FACTOR;
             if callee_score >= SCORE_FLOOR {
-                let callees = query_callees(db, &fqn).await.unwrap_or_default();
+                let callees = query_callees(db, &fqn, schema_version).await.unwrap_or_default();
                 for callee_fqn in callees {
                     if global_seen.contains(&callee_fqn) {
                         continue;
@@ -157,8 +155,6 @@ pub async fn graph_expand(
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
 
-/// Build a FQN string that matches what's stored as record IDs.
-/// Format: "{file}::{name}" — used only for deduplication, not as a SurrealDB record ID.
 fn build_fqn(file: &str, name: &str) -> String {
     format!("{}::{}", file, name)
 }
@@ -182,27 +178,33 @@ async fn query_overlapping_symbols(
     Ok(rows)
 }
 
-async fn query_callers(db: &Surreal<Db>, fqn: &str) -> Result<Vec<String>> {
-    // Extract name from fqn (format: "file::name").
+/// Query callers of the symbol identified by `fqn`.
+///
+/// Version gate:
+///   - schema_version >= 2: uses indexed `WHERE out_name = $name` (fast).
+///   - schema_version < 2: uses link-deref `WHERE out.name = $name` (correct but unindexed).
+async fn query_callers(db: &Surreal<Db>, fqn: &str, schema_version: u32) -> Result<Vec<String>> {
     let name = fqn.rsplit("::").next().unwrap_or(fqn);
 
     #[derive(Deserialize)]
     struct Row {
         in_file: String,
-        // The caller is the `in` side of the calls relation.
     }
 
-    // We query by looking for calls edges where the out (callee) has the given name.
-    // Since record IDs use the FQN, we need to find by symbol name across files.
-    let rows: Vec<Row> = db
-        .query(
-            "SELECT in_file FROM calls WHERE out.name = $name LIMIT 20",
-        )
-        .bind(("name", name.to_string()))
-        .await?
-        .take(0)?;
+    let rows: Vec<Row> = if schema_version >= 2 {
+        // Fast path: indexed column added in v2.
+        db.query("SELECT in_file FROM calls WHERE out_name = $name LIMIT 20")
+            .bind(("name", name.to_string()))
+            .await?
+            .take(0)?
+    } else {
+        // Slow path: link-deref (correct on all rows, just unindexed).
+        db.query("SELECT in_file FROM calls WHERE out.name = $name LIMIT 20")
+            .bind(("name", name.to_string()))
+            .await?
+            .take(0)?
+    };
 
-    // Return unique file::name pairs from caller side.
     let callers: Vec<String> = rows
         .into_iter()
         .map(|r| format!("{}::{}", r.in_file, name))
@@ -210,7 +212,10 @@ async fn query_callers(db: &Surreal<Db>, fqn: &str) -> Result<Vec<String>> {
     Ok(callers)
 }
 
-async fn query_callees(db: &Surreal<Db>, fqn: &str) -> Result<Vec<String>> {
+/// Query callees of the symbol identified by `fqn`.
+///
+/// Version gate: same as `query_callers`.
+async fn query_callees(db: &Surreal<Db>, fqn: &str, schema_version: u32) -> Result<Vec<String>> {
     let name = fqn.rsplit("::").next().unwrap_or(fqn);
 
     #[derive(Deserialize)]
@@ -218,13 +223,19 @@ async fn query_callees(db: &Surreal<Db>, fqn: &str) -> Result<Vec<String>> {
         out_file: String,
     }
 
-    let rows: Vec<Row> = db
-        .query(
-            "SELECT out_file FROM calls WHERE in.name = $name LIMIT 20",
-        )
-        .bind(("name", name.to_string()))
-        .await?
-        .take(0)?;
+    let rows: Vec<Row> = if schema_version >= 2 {
+        // Fast path: indexed column added in v2.
+        db.query("SELECT out_file FROM calls WHERE in_name = $name LIMIT 20")
+            .bind(("name", name.to_string()))
+            .await?
+            .take(0)?
+    } else {
+        // Slow path: link-deref (correct on all rows).
+        db.query("SELECT out_file FROM calls WHERE in.name = $name LIMIT 20")
+            .bind(("name", name.to_string()))
+            .await?
+            .take(0)?
+    };
 
     let callees: Vec<String> = rows
         .into_iter()
@@ -242,7 +253,6 @@ async fn fetch_chunk_for_fqn(
     score: f32,
     base_keys: &HashSet<(String, u32, u32)>,
 ) -> Option<ExpandedChunk> {
-    // First find the symbol to get its location.
     let name = fqn.rsplit("::").next().unwrap_or(fqn);
     let file_prefix = &fqn[..fqn.rfind("::").unwrap_or(fqn.len())];
 
@@ -260,7 +270,6 @@ async fn fetch_chunk_for_fqn(
 
     let sym = sym_rows.into_iter().next()?;
 
-    // Find the overlapping chunk.
     let chunk_rows: Vec<ChunkRow> = db
         .query(
             "SELECT file, line_start, line_end, content FROM chunk \
@@ -279,7 +288,6 @@ async fn fetch_chunk_for_fqn(
     let ls = row.line_start as u32;
     let le = row.line_end as u32;
 
-    // Skip if this range was already in the base results.
     if base_keys.contains(&(row.file.clone(), ls, le)) {
         return None;
     }

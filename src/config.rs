@@ -21,11 +21,23 @@ pub const MIGRATIONS: &[MigrationFn] = &[];
 
 // ─── Settings ──────────────────────────────────────────────────────────────
 
+fn default_embed_concurrency() -> usize {
+    // Default: 1 API key × 4 concurrent batches. Callers that have multiple
+    // keys set this to api_keys.len() * 4 at runtime when not explicitly
+    // configured. This field lets users override via CORBELL_EMBED_CONCURRENCY.
+    4
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct EmbeddingConfig {
     pub provider: String,
     pub model: String,
     pub api_keys: Vec<String>,
+    /// Maximum number of embedding batches in-flight concurrently.
+    /// Defaults to 4 (or api_keys.len() × 4 when computed at runtime).
+    /// Override via CORBELL_EMBED_CONCURRENCY env var (via Settings reload).
+    #[serde(default = "default_embed_concurrency")]
+    pub embed_concurrency: usize,
 }
 
 impl Default for EmbeddingConfig {
@@ -34,6 +46,7 @@ impl Default for EmbeddingConfig {
             provider: "voyage".to_owned(),
             model: "voyage-4-lite".to_owned(),
             api_keys: Vec::new(),
+            embed_concurrency: default_embed_concurrency(),
         }
     }
 }

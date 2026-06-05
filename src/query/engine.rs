@@ -146,7 +146,19 @@ pub async fn run_query(
 
     // ── Step 4: Graph expansion ───────────────────────────────────────────
     let graph_start = Instant::now();
-    let expanded = graph_expand(&base_chunks, &db_map).await;
+
+    // Read db_schema_version from any available DB (cached after migration).
+    // If no DB available, default to 1 (safe: uses unindexed but correct path).
+    let schema_version = {
+        let db_map_guard = repo_dbs.read().await;
+        if let Some(db) = db_map_guard.values().next() {
+            crate::store::read_db_schema_version(db).await
+        } else {
+            1
+        }
+    };
+
+    let expanded = graph_expand(&base_chunks, &db_map, schema_version).await;
     let graph_ms = graph_start.elapsed().as_millis() as u64;
 
     // Merge base + expanded into a single pool.

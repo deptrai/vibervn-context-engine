@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use rayon::prelude::*;
 use surrealdb::Surreal;
 use surrealdb::engine::local::Db;
 use tracing::info;
@@ -31,17 +32,18 @@ pub struct SearchResult {
 /// All vectors are L2-normalized at insert time, so cosine similarity reduces
 /// to a plain dot product at query time (no division per candidate).
 ///
-/// At 500 K chunks × 1024 dims, LLVM auto-vectorizes the inner loop to SIMD,
-/// giving ~50-100 ms per query on a modern CPU — acceptable until an HNSW
-/// implementation is available.
+/// Storage is a single contiguous `Vec<f32>` in row-major order: row i occupies
+/// `embeddings[i*dim .. (i+1)*dim]`. This gives better cache locality than
+/// `Vec<Vec<f32>>` and enables rayon parallel iteration over fixed-size rows.
+///
+/// At 500 K chunks × 1024 dims, rayon + SIMD give sub-100 ms per query.
 pub struct VectorIndex {
-    /// Row-major storage: entry i holds the normalized embedding for chunk i.
-    embeddings: Vec<Vec<f32>>,
-    /// Parallel array: chunk_ids[i] corresponds to embeddings[i].
+    /// Contiguous row-major flat storage. Length = len * dim.
+    embeddings: Vec<f32>,
+    /// Parallel array: chunk_ids[i] corresponds to row i.
     chunk_ids: Vec<ChunkId>,
-    /// Dimensionality of the first inserted vector; all subsequent inserts
-    /// must match. `None` until the first insert.
-    dimension: Option<usize>,
+    /// Dimensionality of every vector. `None` until the first insert.
+    dim: usize,
 }
 
 impl VectorIndex {
@@ -50,100 +52,125 @@ impl VectorIndex {
         Self {
             embeddings: Vec::new(),
             chunk_ids: Vec::new(),
-            dimension: None,
+            dim: 0,
         }
+    }
+
+    /// Number of indexed vectors.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.chunk_ids.len()
+    }
+
+    /// Returns `true` if the index contains no vectors.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.chunk_ids.is_empty()
     }
 
     /// Insert a batch of (ChunkId, embedding) pairs.
     ///
     /// Each embedding is L2-normalized before storage. Zero-length or
-    /// zero-magnitude vectors are stored as-is (they will score 0 against
-    /// everything, which is correct).
+    /// zero-magnitude vectors are skipped (they carry no information).
     pub fn insert(&mut self, chunks: &[(ChunkId, Vec<f32>)]) {
         for (id, raw_emb) in chunks {
             if raw_emb.is_empty() {
-                // Skip zero-length embeddings — they carry no information.
                 continue;
             }
             // Record dimension on first insert; skip mismatches.
-            match self.dimension {
-                None => self.dimension = Some(raw_emb.len()),
-                Some(d) if d != raw_emb.len() => {
-                    tracing::warn!(
-                        expected = d,
-                        got = raw_emb.len(),
-                        file = %id.file,
-                        "embedding dimension mismatch — skipping chunk"
-                    );
-                    continue;
-                }
-                _ => {}
+            if self.dim == 0 {
+                self.dim = raw_emb.len();
+            } else if self.dim != raw_emb.len() {
+                tracing::warn!(
+                    expected = self.dim,
+                    got = raw_emb.len(),
+                    file = %id.file,
+                    "embedding dimension mismatch — skipping chunk"
+                );
+                continue;
             }
 
             let normalized = l2_normalize(raw_emb);
-            self.embeddings.push(normalized);
+            self.embeddings.extend_from_slice(&normalized);
             self.chunk_ids.push(id.clone());
         }
     }
 
     /// Remove all embeddings whose `file` field matches `file`.
     ///
-    /// Uses swap-remove to avoid O(n) shifts; rebuilds both parallel arrays.
+    /// Uses swap-remove to avoid O(n) shifts; moves whole `dim`-sized rows.
     pub fn remove_file(&mut self, file: &str) {
         let mut i = 0;
         while i < self.chunk_ids.len() {
             if self.chunk_ids[i].file == file {
                 self.chunk_ids.swap_remove(i);
-                self.embeddings.swap_remove(i);
+                // Swap the flat rows: row i ↔ last row.
+                let last = self.chunk_ids.len(); // after swap_remove, len is already decremented
+                if i < last {
+                    // Copy last row into slot i.
+                    let src_start = last * self.dim;
+                    let dst_start = i * self.dim;
+                    // Safety: src and dst are non-overlapping (i < last).
+                    let src: Vec<f32> = self.embeddings[src_start..src_start + self.dim].to_vec();
+                    self.embeddings[dst_start..dst_start + self.dim].copy_from_slice(&src);
+                }
+                self.embeddings.truncate(last * self.dim);
                 // Don't advance i — the swapped element now lives at i.
             } else {
                 i += 1;
             }
         }
+        if self.chunk_ids.is_empty() {
+            self.dim = 0;
+        }
     }
 
     /// Remove all embeddings belonging to a repo.
     ///
-    /// Uses [`path_in_repo`] for boundary-safe matching (no `/foo` vs `/foobar`
-    /// collision). O(n) swap-remove pass over the parallel arrays — same pattern
-    /// as [`remove_file`].
+    /// Uses [`path_in_repo`] for boundary-safe matching. O(n) swap-remove pass.
     pub fn remove_repo(&mut self, repo: &str) {
         let mut i = 0;
         while i < self.chunk_ids.len() {
             if path_in_repo(&self.chunk_ids[i].file, repo) {
                 self.chunk_ids.swap_remove(i);
-                self.embeddings.swap_remove(i);
+                let last = self.chunk_ids.len();
+                if i < last {
+                    let src_start = last * self.dim;
+                    let dst_start = i * self.dim;
+                    let src: Vec<f32> = self.embeddings[src_start..src_start + self.dim].to_vec();
+                    self.embeddings[dst_start..dst_start + self.dim].copy_from_slice(&src);
+                }
+                self.embeddings.truncate(last * self.dim);
             } else {
                 i += 1;
             }
+        }
+        if self.chunk_ids.is_empty() {
+            self.dim = 0;
         }
     }
 
     /// Merge another `VectorIndex` into this one, consuming it.
     ///
-    /// O(m) where m = other.len(). Vectors from `other` are already normalized
-    /// (they went through `insert` or `load_from_db`), so no re-normalization
-    /// is needed — they are moved directly into the parallel arrays.
-    ///
-    /// Dimension compatibility: if `self` has no dimension yet, adopts `other`'s.
-    /// If both have a dimension and they differ, logs a warning and skips the merge.
+    /// Vectors from `other` are already normalized; they are moved directly into
+    /// the flat storage. Dimension compatibility: if `self` has no dimension yet,
+    /// adopts `other`'s. If both have a dimension and they differ, logs a warning
+    /// and skips the merge.
     pub fn merge(&mut self, other: VectorIndex) {
         if other.is_empty() {
             return;
         }
-        match (self.dimension, other.dimension) {
-            (None, dim) => self.dimension = dim,
-            (Some(a), Some(b)) if a != b => {
-                tracing::warn!(
-                    self_dim = a,
-                    other_dim = b,
-                    "VectorIndex merge dimension mismatch — skipping"
-                );
-                return;
-            }
-            _ => {}
+        if self.dim == 0 {
+            self.dim = other.dim;
+        } else if self.dim != other.dim {
+            tracing::warn!(
+                self_dim = self.dim,
+                other_dim = other.dim,
+                "VectorIndex merge dimension mismatch — skipping"
+            );
+            return;
         }
-        self.embeddings.extend(other.embeddings);
+        self.embeddings.extend_from_slice(&other.embeddings);
         self.chunk_ids.extend(other.chunk_ids);
     }
 
@@ -151,19 +178,20 @@ impl VectorIndex {
     ///
     /// `query` is normalized internally so the caller need not pre-normalize.
     /// Returns results sorted by descending score, capped at `top_k`.
+    /// Uses rayon for parallel dot-product computation.
     pub fn search(&self, query: &[f32], top_k: usize) -> Vec<SearchResult> {
-        if self.embeddings.is_empty() || query.is_empty() || top_k == 0 {
+        if self.is_empty() || query.is_empty() || top_k == 0 || self.dim == 0 {
             return vec![];
         }
 
         let q_norm = l2_normalize(query);
 
-        // Score every vector.
+        // Parallel dot product over rows. Each row is exactly `self.dim` floats.
         let mut scored: Vec<(usize, f32)> = self
             .embeddings
-            .iter()
+            .par_chunks(self.dim)
             .enumerate()
-            .map(|(i, emb)| (i, dot_product(&q_norm, emb)))
+            .map(|(i, row)| (i, dot_product(&q_norm, row)))
             .collect();
 
         // Partial sort: bring the top-k largest scores to the front.
@@ -231,17 +259,7 @@ impl VectorIndex {
     pub fn clear(&mut self) {
         self.embeddings.clear();
         self.chunk_ids.clear();
-        self.dimension = None;
-    }
-
-    /// Number of indexed vectors.
-    pub fn len(&self) -> usize {
-        self.embeddings.len()
-    }
-
-    /// Returns `true` if the index contains no vectors.
-    pub fn is_empty(&self) -> bool {
-        self.embeddings.is_empty()
+        self.dim = 0;
     }
 }
 
@@ -255,13 +273,13 @@ impl Default for VectorIndex {
 
 /// Compute the dot product of two equal-length slices.
 #[inline]
-fn dot_product(a: &[f32], b: &[f32]) -> f32 {
+pub(crate) fn dot_product(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
 }
 
 /// Return a copy of `v` normalized to unit L2 length.
 /// Returns `v` unchanged if its magnitude is zero (avoids NaN).
-fn l2_normalize(v: &[f32]) -> Vec<f32> {
+pub(crate) fn l2_normalize(v: &[f32]) -> Vec<f32> {
     let mag: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
     if mag == 0.0 {
         return v.to_vec();
@@ -289,8 +307,6 @@ mod tests {
 
     #[test]
     fn remove_repo_no_prefix_collision() {
-        // Two repos where one path PREFIXES the other:
-        // /foo and /foobar — removing /foo must NOT evict /foobar entries.
         let mut index = VectorIndex::new();
 
         let foo_chunks: Vec<(ChunkId, Vec<f32>)> = vec![
@@ -306,11 +322,9 @@ mod tests {
         index.insert(&foobar_chunks);
         assert_eq!(index.len(), 4);
 
-        // Remove /foo — only /foo entries should be evicted.
         index.remove_repo("/foo");
         assert_eq!(index.len(), 2);
 
-        // Verify the remaining entries all belong to /foobar.
         for cid in &index.chunk_ids {
             assert!(
                 cid.file.starts_with("/foobar/"),
@@ -322,7 +336,6 @@ mod tests {
 
     #[test]
     fn remove_repo_windows_paths_no_collision() {
-        // Windows variant: D:\proj\foo vs D:\proj\foobar
         let mut index = VectorIndex::new();
 
         let foo_chunks: Vec<(ChunkId, Vec<f32>)> = vec![
@@ -343,9 +356,6 @@ mod tests {
 
     #[test]
     fn full_rebuild_one_repo_preserves_other() {
-        // Simulate: index has repo A + repo B vectors.
-        // Full rebuild of A: remove_repo(A) then insert(new A vectors).
-        // Assert B is untouched and A is refreshed.
         let mut index = VectorIndex::new();
 
         let repo_a_old: Vec<(ChunkId, Vec<f32>)> = vec![
@@ -362,9 +372,8 @@ mod tests {
         index.insert(&repo_b);
         assert_eq!(index.len(), 5);
 
-        // Simulate full rebuild of repo A.
         index.remove_repo("/repo_a");
-        assert_eq!(index.len(), 3); // Only B remains.
+        assert_eq!(index.len(), 3);
 
         let repo_a_new: Vec<(ChunkId, Vec<f32>)> = vec![
             (chunk("/repo_a/new1.rs", 1, 15), emb(4, 6.0)),
@@ -372,9 +381,8 @@ mod tests {
             (chunk("/repo_a/new3.rs", 1, 50), emb(4, 8.0)),
         ];
         index.insert(&repo_a_new);
-        assert_eq!(index.len(), 6); // 3 B + 3 new A
+        assert_eq!(index.len(), 6);
 
-        // Verify B is untouched.
         let b_files: Vec<&str> = index
             .chunk_ids
             .iter()
@@ -386,7 +394,6 @@ mod tests {
         assert!(b_files.contains(&"/repo_b/file2.rs"));
         assert!(b_files.contains(&"/repo_b/file3.rs"));
 
-        // Verify A is refreshed.
         let a_files: Vec<&str> = index
             .chunk_ids
             .iter()
@@ -420,7 +427,6 @@ mod tests {
         b.insert(&[(chunk("/b/g.rs", 1, 5), emb(8, 2.0))]);
 
         a.merge(b);
-        // Merge skipped — a should still have only 1 entry.
         assert_eq!(a.len(), 1);
     }
 
@@ -430,8 +436,81 @@ mod tests {
         index.insert(&[(chunk("/repo/file.rs", 1, 10), emb(4, 1.0))]);
         assert_eq!(index.len(), 1);
 
-        // Repo path with trailing slash — should still match.
         index.remove_repo("/repo/");
         assert_eq!(index.len(), 0);
+    }
+
+    /// ❻ NEW: flat storage parity — search results must be identical to a
+    /// reference dot-product computation on the same normalized inputs.
+    #[test]
+    fn flat_search_parity_with_reference() {
+        let dim = 8;
+        let pairs: Vec<(ChunkId, Vec<f32>)> = (0..10_usize)
+            .map(|i| {
+                let v: Vec<f32> = (0..dim).map(|j| i as f32 * 0.1 + j as f32 * 0.01).collect();
+                (chunk(&format!("/f{i}.rs", ), 1, 10), v)
+            })
+            .collect();
+
+        let mut index = VectorIndex::new();
+        index.insert(&pairs);
+
+        let query: Vec<f32> = (0..dim).map(|j| 0.5 + j as f32 * 0.05).collect();
+        let results = index.search(&query, 5);
+
+        // Reference: manually normalize all inserted vecs + query, dot product.
+        let q_norm = l2_normalize(&query);
+        let mut ref_scored: Vec<(usize, f32)> = pairs
+            .iter()
+            .enumerate()
+            .map(|(i, (_, v))| {
+                let n = l2_normalize(v);
+                (i, dot_product(&q_norm, &n))
+            })
+            .collect();
+        ref_scored.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        ref_scored.truncate(5);
+
+        assert_eq!(results.len(), ref_scored.len());
+        for (r, (ref_i, ref_score)) in results.iter().zip(ref_scored.iter()) {
+            assert_eq!(
+                r.chunk_id.file,
+                format!("/f{ref_i}.rs"),
+                "chunk_id order must match reference"
+            );
+            let diff = (r.score - ref_score).abs();
+            assert!(diff < 1e-5, "score diff {diff} exceeds tolerance");
+        }
+    }
+
+    /// ❻ NEW: remove_file with flat storage — after removal, remaining rows must
+    /// give the same search results as if the removed file was never inserted.
+    #[test]
+    fn remove_file_flat_consistency() {
+        let dim = 4;
+        let mut index = VectorIndex::new();
+        let c1 = (chunk("/a/f1.rs", 1, 10), emb(dim, 1.0));
+        let c2 = (chunk("/a/f2.rs", 1, 10), emb(dim, 2.0));
+        let c3 = (chunk("/b/f3.rs", 1, 10), emb(dim, 3.0));
+        index.insert(&[c1, c2, c3]);
+        assert_eq!(index.len(), 3);
+        assert_eq!(index.embeddings.len(), 3 * dim);
+
+        index.remove_file("/a/f1.rs");
+        assert_eq!(index.len(), 2);
+        assert_eq!(index.embeddings.len(), 2 * dim);
+
+        // All remaining files should NOT be /a/f1.rs
+        for cid in &index.chunk_ids {
+            assert_ne!(cid.file, "/a/f1.rs");
+        }
+
+        // Search should still return results from remaining files.
+        let query = emb(dim, 2.0);
+        let results = index.search(&query, 2);
+        assert_eq!(results.len(), 2);
+        for r in &results {
+            assert_ne!(r.chunk_id.file, "/a/f1.rs");
+        }
     }
 }

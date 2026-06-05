@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use clap::Parser;
@@ -59,21 +58,10 @@ async fn main() {
         }
     };
 
-    // Eagerly open SurrealDB handles for all configured repos.
-    let mut repo_db_map = HashMap::new();
-    for repo in &settings.repos {
-        match store::open_db(&home_dir, repo).await {
-            Ok(db) => {
-                info!(repo = %repo, "opened repo DB");
-                repo_db_map.insert(repo.clone(), db);
-            }
-            Err(e) => {
-                // Log but don't exit — repo may not be indexed yet.
-                tracing::warn!(repo = %repo, error = %e, "failed to open repo DB at startup");
-            }
-        }
-    }
-    let repo_dbs = Arc::new(RwLock::new(repo_db_map));
+    // Shared per-repo DB map — starts empty; `get_or_open` populates lazily.
+    // The eager open loop has been removed: SurrealDB handles are expensive to
+    // open and the consumer + query paths already cache them via `get_or_open`.
+    let repo_dbs: store::RepoDbMap = Arc::new(RwLock::new(std::collections::HashMap::new()));
 
     // Start IndexEngine — spawns watchers for all configured repos.
     // It shares `repo_dbs` so indexer writes land in the handles the server reads.

@@ -158,10 +158,17 @@ impl IndexEngine {
     pub async fn start(home_dir: PathBuf, settings: &Settings, repo_dbs: RepoDbMap) -> Arc<Self> {
         let (trigger_tx, trigger_rx) = tokio::sync::mpsc::channel::<IndexTrigger>(256);
 
-        // Load the vector index from ALL configured repo DBs, merging into one index.
-        let vector_index = Arc::new(RwLock::new(
-            load_repos_vector_index(&repo_dbs, &home_dir, &settings.repos).await,
-        ));
+        // Start with an empty index so the server can bind immediately. The full
+        // load happens in a background task below and writes into this same Arc
+        // once complete — queries issued before the load completes return no
+        // results rather than blocking startup.
+        let vector_index = Arc::new(RwLock::new(VectorIndex::new()));
+
+        // Clone handles needed by the background vector-load task BEFORE they
+        // are moved into the engine struct.
+        let repo_dbs_bg = repo_dbs.clone();
+        let home_dir_bg = home_dir.clone();
+        let repos_bg = settings.repos.clone();
 
         let engine = Arc::new(IndexEngine {
             home_dir: home_dir.clone(),
@@ -178,6 +185,30 @@ impl IndexEngine {
             for repo in &settings.repos {
                 statuses.insert(repo.clone(), RepoStatus::default());
             }
+        }
+
+        // Spawn a background task that loads the full vector index from all repo
+        // DBs and replaces the initially-empty index once the load is complete.
+        // This lets the HTTP server bind and accept requests immediately.
+        {
+            let vector_index_bg = Arc::clone(&engine.vector_index);
+            tokio::spawn(async move {
+                let loaded =
+                    load_repos_vector_index(&repo_dbs_bg, &home_dir_bg, &repos_bg).await;
+                let mut vi = vector_index_bg.write().await;
+                if vi.is_empty() {
+                    let count = loaded.len();
+                    *vi = loaded;
+                    tracing::info!(count, "background vector index load complete");
+                } else {
+                    // A watcher-triggered pipeline run already populated the index;
+                    // merging the DB snapshot would duplicate those rows, so skip the
+                    // wholesale install. The pipeline's own writes are the source of truth.
+                    tracing::info!(
+                        "background vector index load skipped — index already populated by an indexing run"
+                    );
+                }
+            });
         }
 
         // Start watcher for each repo.
@@ -353,7 +384,13 @@ async fn run_consumer(
             }
         };
 
-        let pipeline = IndexPipeline::new(repo.clone(), voyage_client);
+        let pipeline = {
+            // embed_concurrency = max(configured, api_keys.len() * 4).
+            let n_keys = settings_ref.embedding.api_keys.len().max(1);
+            let configured = settings_ref.embedding.embed_concurrency;
+            let embed_concurrency = configured.max(n_keys * 4);
+            IndexPipeline::new_with_concurrency(repo.clone(), voyage_client, embed_concurrency)
+        };
 
         match pipeline
             .run(&db, trigger.changes, force_rebuild, Some(&engine_ref.vector_index), Some(progress))
