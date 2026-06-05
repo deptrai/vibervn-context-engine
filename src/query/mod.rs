@@ -1,8 +1,9 @@
 pub mod engine;
 pub mod graph_expand;
 pub mod merger;
+pub mod reranker;
 
-pub use engine::{CodeResult, QueryResult, QueryTiming, run_query};
+pub use engine::{CodeResult, QueryResult, QueryTiming, RerankInfo, run_query};
 
 use std::collections::HashMap;
 use surrealdb::Surreal;

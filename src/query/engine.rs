@@ -10,10 +10,12 @@ use tracing::warn;
 
 use crate::embedding::voyage::VoyageClient;
 use crate::indexing::IndexEngine;
+use crate::llm::LlmClient;
 use crate::path_in_repo;
 use crate::query::find_db_for_file;
 use crate::query::graph_expand::graph_expand;
 use crate::query::merger::{MergeChunk, merge_chunks};
+use crate::query::reranker;
 
 // ─── Output types ─────────────────────────────────────────────────────────
 
@@ -34,13 +36,23 @@ pub struct QueryTiming {
     pub search_ms: u64,
     pub graph_ms: u64,
     pub merge_ms: u64,
+    pub rerank_ms: u64,
     pub total_ms: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RerankInfo {
+    pub raw_response: String,
+    pub fallback_used: bool,
+    pub skip_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct QueryResult {
     pub results: Vec<CodeResult>,
+    pub pre_rerank_results: Vec<CodeResult>,
     pub timing: QueryTiming,
+    pub rerank: Option<RerankInfo>,
 }
 
 // ─── DB row types ─────────────────────────────────────────────────────────
@@ -54,9 +66,10 @@ struct ChunkContentRow {
 // ─── Pipeline ─────────────────────────────────────────────────────────────
 
 /// Execute the full query pipeline:
-/// embed → vector search → graph expand → merge → format.
+/// embed → vector search → graph expand → merge → rerank → format.
 ///
 /// `repo_filter`: if Some, only return results from that repo path prefix.
+/// `llm_client`: if None, rerank step is skipped.
 pub async fn run_query(
     query: &str,
     top_k: usize,
@@ -64,6 +77,7 @@ pub async fn run_query(
     voyage_client: &VoyageClient,
     index_engine: &Arc<IndexEngine>,
     repo_dbs: &Arc<RwLock<HashMap<String, Surreal<Db>>>>,
+    llm_client: Option<&LlmClient>,
 ) -> Result<QueryResult> {
     let total_start = Instant::now();
 
@@ -85,13 +99,16 @@ pub async fn run_query(
     if raw_results.is_empty() {
         return Ok(QueryResult {
             results: vec![],
+            pre_rerank_results: vec![],
             timing: QueryTiming {
                 embed_ms,
                 search_ms,
                 graph_ms: 0,
                 merge_ms: 0,
+                rerank_ms: 0,
                 total_ms: total_start.elapsed().as_millis() as u64,
             },
+            rerank: None,
         });
     }
 
@@ -150,32 +167,70 @@ pub async fn run_query(
     let merged = merge_chunks(all_chunks, top_k);
     let merge_ms = merge_start.elapsed().as_millis() as u64;
 
-    // ── Step 6: Format — re-read from filesystem ──────────────────────────
-    let mut results: Vec<CodeResult> = Vec::with_capacity(merged.len());
-    for chunk in merged {
+    // ── Step 6: Rerank ────────────────────────────────────────────────────
+    // Clone merged so we can preserve pre-rerank order for the response.
+    let pre_rerank_merged = merged.clone();
+
+    let rerank_start = Instant::now();
+    let rerank_output = reranker::rerank(query, &merged, llm_client).await;
+    let rerank_ms = rerank_start.elapsed().as_millis() as u64;
+
+    // Reorder merged according to reranked_indices.
+    let reranked_merged: Vec<MergeChunk> = rerank_output
+        .reranked_indices
+        .iter()
+        .filter_map(|&idx| merged.get(idx).cloned())
+        .collect();
+
+    // ── Step 7: Format — re-read from filesystem ──────────────────────────
+    let mut results: Vec<CodeResult> = Vec::with_capacity(reranked_merged.len());
+    for chunk in &reranked_merged {
         let content = read_lines_from_fs(&chunk.file, chunk.line_start, chunk.line_end)
             .unwrap_or_else(|_| chunk.content.clone());
         results.push(CodeResult {
-            file: chunk.file,
+            file: chunk.file.clone(),
             line_start: chunk.line_start,
             line_end: chunk.line_end,
             score: chunk.score,
             content,
-            symbol: chunk.symbol,
+            symbol: chunk.symbol.clone(),
+        });
+    }
+
+    let mut pre_rerank_results: Vec<CodeResult> = Vec::with_capacity(pre_rerank_merged.len());
+    for chunk in &pre_rerank_merged {
+        let content = read_lines_from_fs(&chunk.file, chunk.line_start, chunk.line_end)
+            .unwrap_or_else(|_| chunk.content.clone());
+        pre_rerank_results.push(CodeResult {
+            file: chunk.file.clone(),
+            line_start: chunk.line_start,
+            line_end: chunk.line_end,
+            score: chunk.score,
+            content,
+            symbol: chunk.symbol.clone(),
         });
     }
 
     let total_ms = total_start.elapsed().as_millis() as u64;
 
+    let rerank_info = RerankInfo {
+        raw_response: rerank_output.raw_response,
+        fallback_used: rerank_output.fallback_used,
+        skip_reason: rerank_output.skip_reason,
+    };
+
     Ok(QueryResult {
         results,
+        pre_rerank_results,
         timing: QueryTiming {
             embed_ms,
             search_ms,
             graph_ms,
             merge_ms,
+            rerank_ms,
             total_ms,
         },
+        rerank: Some(rerank_info),
     })
 }
 

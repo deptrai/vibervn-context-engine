@@ -27,6 +27,7 @@ tree-sitter-go = "0.23"
 tree-sitter-java = "0.23"
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
+regex = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

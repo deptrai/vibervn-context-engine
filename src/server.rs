@@ -22,6 +22,7 @@ use crate::config::{
 };
 use crate::embedding::voyage::VoyageClient;
 use crate::indexing::IndexEngine;
+use crate::llm::LlmClient;
 use crate::path_in_repo;
 use crate::store;
 use crate::query;
@@ -442,10 +443,16 @@ struct QueryRequest {
     #[serde(default = "default_top_k")]
     top_k: usize,
     repo: Option<String>,
+    #[serde(default = "default_rerank")]
+    rerank: bool,
 }
 
 fn default_top_k() -> usize {
     30
+}
+
+fn default_rerank() -> bool {
+    true
 }
 
 /// POST /api/query — run the query pipeline and return results.
@@ -484,6 +491,13 @@ async fn post_query(
         }
     };
 
+    // Build LLM client for reranking (None if no keys configured or rerank disabled).
+    let llm_client = if req.rerank {
+        LlmClient::new(&state.settings.llm)
+    } else {
+        None
+    };
+
     let top_k = req.top_k.max(1);
     let repo_filter = req.repo.as_deref();
 
@@ -494,6 +508,7 @@ async fn post_query(
         &voyage_client,
         &state.index_engine,
         &state.repo_dbs,
+        llm_client.as_ref(),
     )
     .await
     {

@@ -342,8 +342,51 @@
         </button>
       </form>
       <div id="search-error" class="hidden mb-3 text-sm text-red-600 dark:text-red-400"></div>
-      <div id="search-results" class="space-y-4"></div>
-      <div id="search-empty" class="hidden text-gray-400 dark:text-wiki-text-muted text-sm">No results found.</div>
+
+      <!-- Result sub-tabs: Results / Pre-rerank / LLM Response -->
+      <div id="search-result-tabs" class="hidden">
+        <div role="tablist" id="tablist-results" class="flex border-b border-gray-200 dark:border-wiki-border mb-4">
+          <button role="tab" id="rtab-results" aria-selected="true" aria-controls="rpanel-results"
+                  class="rtab-btn px-3 py-1.5 text-xs border-b-2 border-blue-600 dark:border-wiki-border-active text-gray-900 dark:text-wiki-heading
+                         focus:outline-none focus:ring-2 focus:ring-blue-400">
+            Results
+          </button>
+          <button role="tab" id="rtab-prererank" aria-selected="false" aria-controls="rpanel-prererank"
+                  class="rtab-btn px-3 py-1.5 text-xs border-b-2 border-transparent text-gray-500 dark:text-wiki-text-muted
+                         hover:text-gray-900 dark:hover:text-wiki-heading hover:border-gray-300 dark:hover:border-wiki-border
+                         focus:outline-none focus:ring-2 focus:ring-blue-400">
+            Pre-rerank
+          </button>
+          <button role="tab" id="rtab-llm" aria-selected="false" aria-controls="rpanel-llm"
+                  class="rtab-btn px-3 py-1.5 text-xs border-b-2 border-transparent text-gray-500 dark:text-wiki-text-muted
+                         hover:text-gray-900 dark:hover:text-wiki-heading hover:border-gray-300 dark:hover:border-wiki-border
+                         focus:outline-none focus:ring-2 focus:ring-blue-400">
+            LLM Response
+          </button>
+        </div>
+
+        <!-- Results tab -->
+        <div role="tabpanel" id="rpanel-results">
+          <div id="search-rerank-badge" class="hidden mb-3 text-xs text-gray-400 dark:text-wiki-text-muted"></div>
+          <div id="search-results" class="space-y-4"></div>
+          <div id="search-empty" class="hidden text-gray-400 dark:text-wiki-text-muted text-sm">No results found.</div>
+        </div>
+
+        <!-- Pre-rerank tab -->
+        <div role="tabpanel" id="rpanel-prererank" class="hidden">
+          <div id="search-prererank-results" class="space-y-4"></div>
+          <div id="search-prererank-empty" class="hidden text-gray-400 dark:text-wiki-text-muted text-sm">No results found.</div>
+        </div>
+
+        <!-- LLM Response tab -->
+        <div role="tabpanel" id="rpanel-llm" class="hidden">
+          <pre id="search-llm-response"
+               class="text-xs p-3 border border-gray-200 dark:border-wiki-border rounded bg-white dark:bg-wiki-surface
+                      text-gray-800 dark:text-wiki-text font-mono leading-relaxed overflow-x-auto whitespace-pre-wrap max-h-[600px] overflow-y-auto"></pre>
+          <div id="search-llm-empty" class="hidden text-gray-400 dark:text-wiki-text-muted text-sm">No LLM response available.</div>
+        </div>
+      </div>
+
       <div id="search-timing" class="hidden mt-3 text-xs text-gray-400 dark:text-wiki-text-muted"></div>
     </div>
   </div><!-- /search-page -->
@@ -771,9 +814,12 @@ function openRepoSearch(repo) {
   document.getElementById('search-repo-name').textContent = repo;
   document.getElementById('input-search').value = '';
   document.getElementById('search-results').innerHTML = '';
+  document.getElementById('search-prererank-results').innerHTML = '';
   document.getElementById('search-error').classList.add('hidden');
   document.getElementById('search-empty').classList.add('hidden');
+  document.getElementById('search-prererank-empty').classList.add('hidden');
   document.getElementById('search-timing').classList.add('hidden');
+  document.getElementById('search-result-tabs').classList.add('hidden');
   // Default to the Index Explorer so index status is visible on entry.
   activateSubTab(0);
   loadExplorer();
@@ -823,6 +869,7 @@ async function runSearch() {
   const resultsEl = document.getElementById('search-results');
   const emptyEl = document.getElementById('search-empty');
   const timingEl = document.getElementById('search-timing');
+  const resultTabsEl = document.getElementById('search-result-tabs');
 
   const q = input.value.trim();
   if (!q) return;
@@ -833,6 +880,7 @@ async function runSearch() {
   resultsEl.innerHTML = '';
   emptyEl.classList.add('hidden');
   timingEl.classList.add('hidden');
+  resultTabsEl.classList.add('hidden');
 
   try {
     const payload = { query: q, top_k: 30 };
@@ -848,12 +896,56 @@ async function runSearch() {
       errorEl.classList.remove('hidden');
       return;
     }
-    renderSearchResults(data.results);
+
+    // Show result tabs
+    resultTabsEl.classList.remove('hidden');
+    activateResultTab(0);
+
+    // Render post-rerank results
+    renderSearchResults(data.results, 'search-results', 'search-empty');
+
+    // Render pre-rerank results
+    renderSearchResults(data.pre_rerank_results, 'search-prererank-results', 'search-prererank-empty');
+
+    // Render LLM response
+    const llmPre = document.getElementById('search-llm-response');
+    const llmEmpty = document.getElementById('search-llm-empty');
+    if (data.rerank && data.rerank.raw_response) {
+      llmPre.textContent = data.rerank.raw_response;
+      llmPre.classList.remove('hidden');
+      llmEmpty.classList.add('hidden');
+    } else {
+      llmPre.textContent = '';
+      llmPre.classList.add('hidden');
+      llmEmpty.classList.remove('hidden');
+    }
+
+    // Render rerank status badge
+    const badgeEl = document.getElementById('search-rerank-badge');
+    if (data.rerank) {
+      let badgeText = '';
+      if (data.rerank.skip_reason && !data.rerank.fallback_used && data.rerank.raw_response === '') {
+        badgeText = 'Rerank: skipped — ' + data.rerank.skip_reason;
+      } else if (data.rerank.fallback_used) {
+        badgeText = 'Rerank: fallback — ' + (data.rerank.skip_reason || 'unknown reason');
+      }
+      if (badgeText) {
+        badgeEl.textContent = badgeText;
+        badgeEl.classList.remove('hidden');
+      } else {
+        badgeEl.classList.add('hidden');
+      }
+    } else {
+      badgeEl.classList.add('hidden');
+    }
+
     if (data.timing) {
+      const rerankPart = data.timing.rerank_ms != null ? ` · rerank ${data.timing.rerank_ms}ms` : '';
       timingEl.textContent =
         `embed ${data.timing.embed_ms}ms · search ${data.timing.search_ms}ms · ` +
-        `graph ${data.timing.graph_ms}ms · merge ${data.timing.merge_ms}ms · ` +
-        `total ${data.timing.total_ms}ms`;
+        `graph ${data.timing.graph_ms}ms · merge ${data.timing.merge_ms}ms` +
+        rerankPart +
+        ` · total ${data.timing.total_ms}ms`;
       timingEl.classList.remove('hidden');
     }
   } catch (err) {
@@ -865,9 +957,38 @@ async function runSearch() {
   }
 }
 
-function renderSearchResults(results) {
-  const container = document.getElementById('search-results');
-  const emptyEl = document.getElementById('search-empty');
+// ─── Result tab switching ──────────────────────────────────────────────────
+const RESULT_TABS = [
+  { btn: 'rtab-results',   panel: 'rpanel-results' },
+  { btn: 'rtab-prererank', panel: 'rpanel-prererank' },
+  { btn: 'rtab-llm',       panel: 'rpanel-llm' },
+];
+
+function activateResultTab(idx) {
+  RESULT_TABS.forEach((t, i) => {
+    const btn = document.getElementById(t.btn);
+    const panel = document.getElementById(t.panel);
+    if (i === idx) {
+      btn.setAttribute('aria-selected', 'true');
+      btn.classList.remove('border-transparent', 'text-gray-500', 'dark:text-wiki-text-muted');
+      btn.classList.add('border-blue-600', 'dark:border-wiki-border-active', 'text-gray-900', 'dark:text-wiki-heading');
+      panel.classList.remove('hidden');
+    } else {
+      btn.setAttribute('aria-selected', 'false');
+      btn.classList.add('border-transparent', 'text-gray-500', 'dark:text-wiki-text-muted');
+      btn.classList.remove('border-blue-600', 'dark:border-wiki-border-active', 'text-gray-900', 'dark:text-wiki-heading');
+      panel.classList.add('hidden');
+    }
+  });
+}
+
+RESULT_TABS.forEach((t, i) => {
+  document.getElementById(t.btn).addEventListener('click', () => activateResultTab(i));
+});
+
+function renderSearchResults(results, containerId, emptyId) {
+  const container = document.getElementById(containerId || 'search-results');
+  const emptyEl = document.getElementById(emptyId || 'search-empty');
   container.innerHTML = '';
 
   if (!results || results.length === 0) {

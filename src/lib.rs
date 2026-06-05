@@ -2,6 +2,7 @@
 pub mod config;
 pub mod embedding;
 pub mod indexing;
+pub mod llm;
 pub mod parsing;
 pub mod query;
 pub mod server;

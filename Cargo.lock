@@ -874,6 +874,7 @@ dependencies = [
  "notify",
  "notify-debouncer-full",
  "rayon",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",
