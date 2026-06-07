@@ -1,5 +1,7 @@
 # vibervn-context-engine
 
+**English** · [Tiếng Việt](README-vi.md) · [中文](README-zh.md)
+
 ## Install & Run
 
 Run the latest release directly with npx — no manual download, the correct
