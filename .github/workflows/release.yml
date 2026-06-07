@@ -97,6 +97,9 @@ jobs:
     # Only on pushes to master — never on PRs, so fork PRs can't read NPM_TOKEN.
     if: github.event_name == 'push' && github.ref == 'refs/heads/master'
     runs-on: ubuntu-latest
+    # contents: write so the version bump can be committed back to master.
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
@@ -123,19 +126,30 @@ jobs:
           test -f "$win" || { echo "::error::missing $win"; exit 1; }
 
       - name: Publish packages
+        id: publish
         shell: bash
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           set -e
 
-          # Strategy C: Cargo.toml is the single source of truth for the version.
-          VERSION=$(grep -m1 '^version' Cargo.toml | sed -E 's/version *= *"([^"]+)".*/\1/')
-          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
-            echo "::error::Invalid version from Cargo.toml: '$VERSION'"
+          # Strategy B: Cargo.toml is the FLOOR. If its version isn't yet on npm,
+          # publish it as-is (respects a manual minor/major bump). If it's already
+          # taken, auto-bump the patch until we find a free version.
+          BASE=$(grep -m1 '^version' Cargo.toml | sed -E 's/version *= *"([^"]+)".*/\1/')
+          if [[ ! "$BASE" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Cargo.toml version must be plain X.Y.Z for auto-bump, got: '$BASE'"
             exit 1
           fi
-          echo "Releasing version $VERSION"
+
+          MAJOR="${BASE%%.*}"; REST="${BASE#*.}"; MINOR="${REST%%.*}"; PATCH="${REST#*.}"
+          VERSION="$BASE"
+          while npm view "vibervn-context-engine@$VERSION" version >/dev/null 2>&1; do
+            PATCH=$((PATCH + 1))
+            VERSION="$MAJOR.$MINOR.$PATCH"
+          done
+          echo "Cargo.toml floor=$BASE → releasing version $VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
           # Stamp $VERSION into a package.json (and pin optionalDependencies for the main pkg).
           stamp() {
@@ -152,6 +166,7 @@ jobs:
           }
 
           # Idempotent publish: skip-green if this exact version is already on npm.
+          # (Belt-and-suspenders for re-runs; the loop above already picked a free version.)
           publish_if_new() {
             DIR="$1"
             NAME=$(node -p "require('./$DIR/package.json').name")
@@ -173,3 +188,36 @@ jobs:
           # ...main package LAST.
           stamp "npm/vibervn-context-engine"
           publish_if_new "npm/vibervn-context-engine"
+
+      - name: Commit version bump back to master
+        if: steps.publish.outputs.version != ''
+        shell: bash
+        env:
+          VERSION: ${{ steps.publish.outputs.version }}
+        run: |
+          set -e
+          # Sync Cargo.toml to the published version. Only the [package] version
+          # (first `version =` in the file), not any dependency versions.
+          sed -i -E '0,/^version = ".*"/s//version = "'"$VERSION"'"/' Cargo.toml
+
+          # Keep Cargo.lock in sync so `cargo build --locked` keeps working.
+          # Edit the lock entry directly (no cargo/network needed on this runner):
+          # bump the `version` line that immediately follows our package's name.
+          awk -v ver="$VERSION" '
+            /^name = "context-engine-rs"$/ {
+              print; getline
+              sub(/version = ".*"/, "version = \"" ver "\"")
+            }
+            { print }
+          ' Cargo.lock > Cargo.lock.tmp && mv Cargo.lock.tmp Cargo.lock
+
+          if git diff --quiet Cargo.toml Cargo.lock; then
+            echo "No version change to commit."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock
+          git commit -m "chore(release): v$VERSION [skip ci]"
+          git push origin HEAD:master
