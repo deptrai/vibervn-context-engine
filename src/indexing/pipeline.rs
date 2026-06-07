@@ -8,7 +8,7 @@ use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use surrealdb::Surreal;
 use surrealdb::engine::local::Db;
-use surrealdb::sql::{Array as SqlArray, Id as SqlId, Object as SqlObject, Thing as SqlThing, Value as SqlValue};
+use surrealdb::sql::{Array as SqlArray, Bytes as SqlBytes, Id as SqlId, Object as SqlObject, Thing as SqlThing, Value as SqlValue};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -53,16 +53,23 @@ const PARSE_CHANNEL_CAP: usize = 64;
 /// Embed-output channel capacity (from embed stage to writer).
 const EMBED_CHANNEL_CAP: usize = 64;
 
-/// A chunk row ready for bulk INSERT via native SurrealDB parameter binding.
-/// Using `Vec<f32>` (not a text-formatted string) means the driver serialises
-/// the embedding as a CBOR array — no float-token parsing by the query engine.
-#[derive(Serialize)]
+/// A chunk row ready for bulk INSERT via native SurrealDB value construction.
+///
+/// `embedding` is a **packed little-endian f32 byte blob** (4 bytes/element),
+/// stored on disk as `Value::Bytes` (DB schema v5+). The prior representation
+/// was `array<float>`, which forced SurrealDB to encode ~1024 floats/row as
+/// individual `Value::Number` enums — measured (ablation) at ~12.3s of the
+/// ~13s chunk-write for spec-ade (94%), all on a single thread. Packed bytes
+/// eliminate those ~21M enum allocations: a 4096-byte blob per row, encoded
+/// with a memcpy. `flush_chunk_batch` builds the row natively (no serde) so
+/// the field reaches the engine as `Value::Bytes`, not an array-of-ints.
 struct ChunkRecord {
     file: String,
     line_start: i64,
     line_end: i64,
     content: String,
-    embedding: Vec<f32>,
+    /// Packed little-endian f32 bytes (see `store::ops::pack_embedding`).
+    embedding: Vec<u8>,
     symbol_ref: Option<String>,
 }
 
@@ -632,6 +639,7 @@ impl IndexPipeline {
     /// to the `raw_edge` DB table and Phase 2 falls back to the keyset scan path.
     /// For incremental builds: raw_edges always go to the `raw_edge` DB table for
     /// crash-safe Phase 2 replay.
+    #[allow(clippy::too_many_arguments)]
     async fn streaming_index(
         &self,
         files: &[String],
@@ -703,8 +711,10 @@ impl IndexPipeline {
                 let stream = futures::stream::unfold(parse_rx, move |mut rx| {
                     let ct = ct_for_stream.clone();
                     async move {
-                        if let Some(ref ct) = ct {
-                            if ct.is_cancelled() { return None; }
+                        if let Some(ref ct) = ct
+                            && ct.is_cancelled()
+                        {
+                            return None;
                         }
                         rx.recv().await.map(|item| (item, rx))
                     }
@@ -721,8 +731,10 @@ impl IndexPipeline {
                         let ct_ref = cancel_clone.clone();
                         async move {
                             // Short-circuit if cancelled — skip the expensive embed call.
-                            if let Some(ref ct) = ct_ref {
-                                if ct.is_cancelled() { return None; }
+                            if let Some(ref ct) = ct_ref
+                                && ct.is_cancelled()
+                            {
+                                return None;
                             }
                             match output {
                                 ParseOutput::Skipped { file, reason } => {
@@ -870,12 +882,12 @@ impl IndexPipeline {
 
         while let Some(ef) = embed_rx.recv().await {
             // Check cancellation before processing each file.
-            if let Some(ct) = cancel_token {
-                if ct.is_cancelled() {
-                    info!(repo = %self.repo, "indexing cancelled — stopping pipeline");
-                    cancelled = true;
-                    break;
-                }
+            if let Some(ct) = cancel_token
+                && ct.is_cancelled()
+            {
+                info!(repo = %self.repo, "indexing cancelled — stopping pipeline");
+                cancelled = true;
+                break;
             }
             // Measure queue wait: time from when EmbeddedFile was created in Stage 2
             // to when Stage 3 picks it up.
@@ -954,20 +966,25 @@ impl IndexPipeline {
             ) {
                 // (a) CPU: construct ChunkRecord and push to vector index accumulator.
                 let t_cpu = Instant::now();
+                // Pack the f32 embedding into a little-endian byte blob for storage
+                // (DB schema v5). Done here, on the writer thread, before the f32
+                // copy is moved into the vector-index accumulator. This is the
+                // memcpy that replaces ~1024 Value::Number enum allocations/row.
+                let packed = crate::store::ops::pack_embedding(&emb);
                 all_chunk_vectors.push((
                     ChunkId {
                         file: chunk.file.clone(),
                         line_start: chunk.line_start,
                         line_end: chunk.line_end,
                     },
-                    emb.clone(),
+                    emb,
                 ));
                 pending_chunk_batch.push(ChunkRecord {
                     file: chunk.file.clone(),
                     line_start: chunk.line_start as i64,
                     line_end: chunk.line_end as i64,
                     content: chunk.content.clone(),
-                    embedding: emb,
+                    embedding: packed,
                     symbol_ref: chunk.symbol_ref.as_ref().map(|fqn| format!("symbol:⟨{fqn}⟩")),
                 });
                 chunk_cpu_ns += t_cpu.elapsed().as_nanos() as u64;
@@ -2206,13 +2223,44 @@ async fn embed_parsed_file(
 
 // ─── Flush helpers ────────────────────────────────────────────────────────
 
-/// Flush a batch of chunk records via a native-bind INSERT.
+/// Flush a batch of chunk records via a native value-construction INSERT.
+///
+/// Builds each row as a `sql::Object` directly — bypassing serde — so the
+/// `embedding` field reaches the engine as `Value::Bytes` (a packed
+/// little-endian f32 blob), NOT an `array<int>`. A `#[derive(Serialize)]`
+/// struct with a `Vec<u8>` field would serialize as an integer array, which
+/// would (a) defeat the whole optimisation by re-introducing per-element
+/// Number enums and (b) break the dual-format reader's byte path. The native
+/// `SqlValue::Bytes` path is the same fast-lane `flush_symbol_batch_native`
+/// and `flush_edge_batch` use.
 async fn flush_chunk_batch(db: &Surreal<Db>, batch: Vec<ChunkRecord>) -> Result<()> {
     if batch.is_empty() {
         return Ok(());
     }
+    use std::collections::BTreeMap;
+
+    let records: Vec<SqlValue> = batch
+        .into_iter()
+        .map(|rec| {
+            let mut map: BTreeMap<String, SqlValue> = BTreeMap::new();
+            map.insert("file".to_string(), SqlValue::from(rec.file));
+            map.insert("line_start".to_string(), SqlValue::from(rec.line_start));
+            map.insert("line_end".to_string(), SqlValue::from(rec.line_end));
+            map.insert("content".to_string(), SqlValue::from(rec.content));
+            // Packed embedding → Value::Bytes (single memcpy, no per-float enum).
+            map.insert("embedding".to_string(), SqlValue::Bytes(SqlBytes::from(rec.embedding)));
+            match rec.symbol_ref {
+                Some(s) => map.insert("symbol_ref".to_string(), SqlValue::from(s)),
+                None => map.insert("symbol_ref".to_string(), SqlValue::None),
+            };
+            SqlValue::Object(SqlObject::from(map))
+        })
+        .collect();
+
+    let data = SqlArray::from(records);
+
     db.query("INSERT INTO chunk $data RETURN NONE")
-        .bind(("data", batch))
+        .bind(("data", data))
         .await
         .context("flush_chunk_batch")?;
     Ok(())

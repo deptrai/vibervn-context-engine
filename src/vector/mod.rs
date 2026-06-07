@@ -227,6 +227,12 @@ impl VectorIndex {
             file: String,
             line_start: i64,
             line_end: i64,
+            // Dual-format reader: tolerates BOTH the old `array<float>` rows
+            // (≤ schema v4) and the new packed `bytes` rows (≥ v5). This is the
+            // keystone that decouples query correctness from migration
+            // completion — a half-migrated DB loads every shard correctly,
+            // mixing old and new rows, because both decode to Vec<f32> here.
+            #[serde(deserialize_with = "crate::store::ops::de_embedding_dual")]
             embedding: Vec<f32>,
         }
 

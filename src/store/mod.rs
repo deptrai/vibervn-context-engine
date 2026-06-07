@@ -21,7 +21,7 @@ use crate::store::schema::SCHEMA_DDL;
 ///      (which writes parent as a plain string) is not rejected by an existing
 ///      SCHEMAFULL symbol.parent definition (older DBs declared it as
 ///      option<record<symbol>>, which silently rolled back the whole batch → 0 symbols).
-pub const DB_SCHEMA_VERSION: u32 = 4;
+pub const DB_SCHEMA_VERSION: u32 = 5;
 
 /// key in index_meta for the DB schema version.
 pub const DB_SCHEMA_VERSION_KEY: &str = "db_schema_version";
@@ -129,6 +129,9 @@ pub fn maybe_spawn_migration(repo_dbs: RepoDbMap, repo: String, stored_version: 
             }
             if stored_version < 4 {
                 run_migration_v3_to_v4(&db).await.context("v3→v4")?;
+            }
+            if stored_version < 5 {
+                run_migration_v4_to_v5(&db).await.context("v4→v5")?;
             }
             Ok(())
         }
@@ -372,8 +375,14 @@ pub async fn run_migration_v2_to_v3(db: &Surreal<Db>) -> Result<()> {
     .context("migration v2→v3: flip chunk to SCHEMALESS + remove fields")?;
 
     // Step 2: gating readback — verify existing embeddings survive the flip.
+    // Uses the dual-format reader defensively: when this v2→v3 migration runs,
+    // rows are still `array<float>` (the v4→v5 bytes conversion happens later),
+    // but reading through the tolerant deserializer is correct regardless of
+    // which format a row is in, so it stays correct even if migrations are
+    // somehow reordered or replayed on a partially-converted DB.
     #[derive(Deserialize)]
     struct ProbeRow {
+        #[serde(deserialize_with = "ops::de_embedding_dual")]
         embedding: Vec<f32>,
     }
     let probe: Vec<ProbeRow> = db
@@ -445,6 +454,118 @@ pub async fn run_migration_v3_to_v4(db: &Surreal<Db>) -> Result<()> {
         .context("migration v3→v4: stamp db_schema_version=4")?;
 
     info!("migration v3→v4 complete");
+    Ok(())
+}
+
+/// Paged v4→v5 migration: convert `chunk.embedding` from `array<float>` to a
+/// packed little-endian `bytes` blob. Must be idempotent and crash-resumable.
+///
+/// WHY: storing 1024 floats/row as `array<float>` forces SurrealDB to encode
+/// ~21M `Value::Number` enums per full rebuild (measured: 94% of chunk-write
+/// time). Packed `bytes` is a 4096-byte blob/row written with a memcpy. The
+/// new writer (`flush_chunk_batch`) already emits bytes; this migration brings
+/// pre-v5 rows up to the same format so their shard warm-loads are fast too.
+///
+/// SAFETY — correctness does NOT depend on this migration completing. The
+/// embedding read path (`de_embedding_dual`) tolerates BOTH formats, so a
+/// half-migrated DB returns correct query results; this is purely a storage/
+/// warm-load optimisation. That is what makes a background, resumable run safe.
+///
+/// Keyset pagination (mirrors run_migration_v1_to_v2):
+///   - Cursor: `type::string(id) AS id_str` over chunk's random record ids.
+///     `WHERE type::string(id) > $cursor ORDER BY id_str` visits every row
+///     exactly once, skips none. `type::string(id)` avoids Thing-serde and
+///     gives stable lexicographic order. ORDER BY uses the projected alias
+///     (`id_str`) — a bare `type::string(id)` in ORDER BY fails in 2.6.5.
+///   - Cursor persisted to `index_meta` each page for crash resume.
+///   - Memory: one page (512 rows) + its re-encoded bytes in flight — O(page),
+///     independent of chunk count. No OFFSET (would be O(N²)).
+///
+/// Idempotent: each page reads `embedding` via `de_embedding_dual` (so an
+/// already-`bytes` row decodes correctly) and rewrites it with `pack_embedding`.
+/// Re-encoding an already-converted row reproduces byte-identical content
+/// (`pack(decode(bytes)) == bytes`), so resuming/replaying any page is a no-op
+/// in effect. Empty embeddings (`[]` or empty bytes) round-trip to empty bytes.
+///
+/// `db_schema_version=5` is stamped ONLY after the full scan completes, so an
+/// interrupted run leaves the version at 4 and the next `open_db` resumes from
+/// the persisted cursor.
+pub async fn run_migration_v4_to_v5(db: &Surreal<Db>) -> Result<()> {
+    use serde::Deserialize;
+
+    info!("migration v4→v5: packing chunk.embedding array<float> → bytes");
+
+    let page_size: i64 = 512;
+    let cursor_key = "migration_v5_chunk_cursor";
+    let mut cursor: String = ops::get_meta(db, cursor_key)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+
+    loop {
+        #[derive(Deserialize)]
+        struct ChunkRow {
+            id_str: String,
+            // Dual reader: old rows are array<float>, already-migrated rows are
+            // bytes; both decode to Vec<f32> so re-encoding is idempotent.
+            #[serde(deserialize_with = "ops::de_embedding_dual")]
+            embedding: Vec<f32>,
+        }
+
+        let batch: Vec<ChunkRow> = db
+            .query(
+                "SELECT type::string(id) AS id_str, embedding \
+                 FROM chunk \
+                 WHERE type::string(id) > $cursor \
+                 ORDER BY id_str \
+                 LIMIT $page",
+            )
+            .bind(("cursor", cursor.clone()))
+            .bind(("page", page_size))
+            .await
+            .context("migration v4→v5: scan chunk page")?
+            .take(0)?;
+
+        if batch.is_empty() {
+            break;
+        }
+
+        // Advance cursor to the last id_str in this page.
+        cursor = batch.last().map(|r| r.id_str.clone()).unwrap_or(cursor.clone());
+
+        // Re-encode each row's embedding as packed bytes, updating by its OWN id.
+        for row in &batch {
+            let packed = ops::pack_embedding(&row.embedding);
+            db.query("UPDATE type::thing($id) SET embedding = $embedding")
+                .bind(("id", row.id_str.clone()))
+                .bind(("embedding", surrealdb::sql::Bytes::from(packed)))
+                .await
+                .context("migration v4→v5: update chunk embedding by id")?;
+        }
+
+        // Persist cursor for crash resume.
+        ops::set_meta(db, cursor_key, &cursor)
+            .await
+            .context("migration v4→v5: persist chunk cursor")?;
+
+        let batch_len = batch.len() as i64;
+        if batch_len < page_size {
+            break;
+        }
+    }
+
+    // Clean up cursor key.
+    let _ = db.query("DELETE FROM index_meta WHERE key = $k")
+        .bind(("k", cursor_key))
+        .await;
+
+    // Stamp version ONLY after the full scan completes (crash-resume anchor).
+    ops::set_meta(db, DB_SCHEMA_VERSION_KEY, "5")
+        .await
+        .context("migration v4→v5: stamp db_schema_version=5")?;
+
+    info!("migration v4→v5 complete");
     Ok(())
 }
 
@@ -1243,5 +1364,240 @@ mod schemaless_tests {
             "VectorIndex must contain only 2 real-embedding rows, got {}",
             index.len()
         );
+    }
+
+    // ─── v4→v5 packed-bytes embedding tests ──────────────────────────────
+
+    /// pack/unpack round-trip: decode(pack(v)) == v exactly for f32 values,
+    /// including the values that show up in real embeddings (negatives, zero,
+    /// small fractional). Bit-exact because to_le_bytes/from_le_bytes is a
+    /// lossless reinterpretation, not a numeric conversion.
+    #[test]
+    fn pack_unpack_roundtrip_exact() {
+        use crate::store::ops::{pack_embedding, de_embedding_dual};
+        use serde::de::value::{BytesDeserializer, Error as ValueError};
+
+        let original = emb_1024(7.0);
+        let packed = pack_embedding(&original);
+        assert_eq!(packed.len(), original.len() * 4, "4 bytes per f32");
+
+        // Decode through the SAME deserializer used on the read path, via its
+        // visit_bytes arm (BytesDeserializer drives visit_bytes).
+        let de: BytesDeserializer<ValueError> = BytesDeserializer::new(&packed);
+        let decoded = de_embedding_dual(de).expect("decode packed bytes");
+        assert_eq!(decoded, original, "decode(pack(v)) must equal v bit-exactly");
+    }
+
+    /// IDEMPOTENCY (the contract): re-encoding an already-`bytes` row reproduces
+    /// byte-identical content. This is what makes the v4→v5 migration safe to
+    /// resume or replay — a second pass over a converted row is a no-op in effect.
+    #[test]
+    fn reencode_already_bytes_is_byte_identical() {
+        use crate::store::ops::{pack_embedding, de_embedding_dual};
+        use serde::de::value::{BytesDeserializer, Error as ValueError};
+
+        let original = emb_1024(3.5);
+        let packed_once = pack_embedding(&original);
+
+        // Simulate the migration reading an already-bytes row and re-packing it.
+        let de: BytesDeserializer<ValueError> = BytesDeserializer::new(&packed_once);
+        let decoded = de_embedding_dual(de).expect("decode bytes");
+        let packed_twice = pack_embedding(&decoded);
+
+        assert_eq!(
+            packed_once, packed_twice,
+            "re-encoding an already-bytes embedding must reproduce identical bytes"
+        );
+    }
+
+    /// Empty embeddings round-trip to empty: pack([]) == [] and decoding empty
+    /// bytes yields []. Confirms the empty-embedding sentinel survives the format
+    /// change (VectorIndex::insert skips zero-length vectors downstream).
+    #[test]
+    fn empty_embedding_roundtrips_empty() {
+        use crate::store::ops::{pack_embedding, de_embedding_dual};
+        use serde::de::value::{BytesDeserializer, Error as ValueError};
+
+        let packed = pack_embedding(&[]);
+        assert!(packed.is_empty(), "pack([]) must be empty bytes");
+
+        let de: BytesDeserializer<ValueError> = BytesDeserializer::new(&packed);
+        let decoded = de_embedding_dual(de).expect("decode empty bytes");
+        assert!(decoded.is_empty(), "decode(empty bytes) must be empty Vec");
+    }
+
+    /// Dual-format READ: a chunk stored as packed `bytes` loads correctly through
+    /// VectorIndex::load_from_db (the new-format arm of de_embedding_dual), and a
+    /// search for the exact embedding returns score ≈ 1.0.
+    #[tokio::test]
+    async fn bytes_format_chunk_loads_and_searches() {
+        use crate::vector::VectorIndex;
+        use crate::store::ops::pack_embedding;
+        use surrealdb::sql::Value;
+
+        let home = TempDir::new().unwrap();
+        let repo = "/test/bytes_format_read";
+        let db = open_db(home.path(), repo).await.unwrap();
+
+        // Insert a chunk with embedding stored as Value::Bytes (the v5 format),
+        // built natively exactly like flush_chunk_batch does.
+        let emb = emb_1024(9.0);
+        let packed = pack_embedding(&emb);
+        let mut map: std::collections::BTreeMap<String, Value> = std::collections::BTreeMap::new();
+        map.insert("file".into(), Value::from("/repo/bytes.rs"));
+        map.insert("line_start".into(), Value::from(1i64));
+        map.insert("line_end".into(), Value::from(10i64));
+        map.insert("content".into(), Value::from("x"));
+        map.insert("embedding".into(), Value::Bytes(surrealdb::sql::Bytes::from(packed)));
+        map.insert("symbol_ref".into(), Value::None);
+        let data = surrealdb::sql::Array::from(vec![Value::Object(surrealdb::sql::Object::from(map))]);
+        db.query("INSERT INTO chunk $data RETURN NONE")
+            .bind(("data", data))
+            .await
+            .expect("insert bytes chunk");
+
+        // Load via the production read path — exercises the visit_bytes arm.
+        let index = VectorIndex::load_from_db(&db).await.unwrap();
+        assert_eq!(index.len(), 1, "bytes-format chunk must load into the index");
+
+        let results = index.search(&emb, 1);
+        assert_eq!(results.len(), 1);
+        let diff = (results[0].score - 1.0_f32).abs();
+        assert!(diff < 1e-4, "exact-embedding search must score ≈ 1.0, got {}", results[0].score);
+        assert_eq!(results[0].chunk_id.file, "/repo/bytes.rs");
+    }
+
+    /// Mixed-format READ (the half-migrated DB): one row in old `array<float>`
+    /// form and one in new `bytes` form load TOGETHER through the same
+    /// load_from_db scan, both searchable. This is the keystone guarantee — a
+    /// DB mid-migration returns correct results.
+    #[tokio::test]
+    async fn mixed_old_and_new_format_load_together() {
+        use crate::vector::VectorIndex;
+        use crate::store::ops::pack_embedding;
+        use surrealdb::sql::Value;
+
+        let home = TempDir::new().unwrap();
+        let repo = "/test/mixed_format";
+        let db = open_db(home.path(), repo).await.unwrap();
+
+        // Old-format row: array<float> via literal INSERT.
+        let old_emb = emb_1024(1.0);
+        let old_str: String = old_emb.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(", ");
+        db.query(&format!(
+            "INSERT INTO chunk {{ file: '/repo/old.rs', line_start: 1, line_end: 5, \
+             content: 'old', embedding: [{}], symbol_ref: NONE }}",
+            old_str
+        )).await.expect("insert old-format chunk");
+
+        // New-format row: packed bytes.
+        let new_emb = emb_1024(2.0);
+        let mut map: std::collections::BTreeMap<String, Value> = std::collections::BTreeMap::new();
+        map.insert("file".into(), Value::from("/repo/new.rs"));
+        map.insert("line_start".into(), Value::from(1i64));
+        map.insert("line_end".into(), Value::from(5i64));
+        map.insert("content".into(), Value::from("new"));
+        map.insert("embedding".into(), Value::Bytes(surrealdb::sql::Bytes::from(pack_embedding(&new_emb))));
+        map.insert("symbol_ref".into(), Value::None);
+        let data = surrealdb::sql::Array::from(vec![Value::Object(surrealdb::sql::Object::from(map))]);
+        db.query("INSERT INTO chunk $data RETURN NONE").bind(("data", data)).await.expect("insert new-format chunk");
+
+        // Both must load through the one dual-tolerant scan.
+        let index = VectorIndex::load_from_db(&db).await.unwrap();
+        assert_eq!(index.len(), 2, "both old and new format rows must load");
+
+        // Both must be searchable to their exact vectors.
+        let r_old = index.search(&old_emb, 1);
+        assert_eq!(r_old[0].chunk_id.file, "/repo/old.rs");
+        assert!((r_old[0].score - 1.0).abs() < 1e-4);
+        let r_new = index.search(&new_emb, 1);
+        assert_eq!(r_new[0].chunk_id.file, "/repo/new.rs");
+        assert!((r_new[0].score - 1.0).abs() < 1e-4);
+    }
+
+    /// v4→v5 migration: converts array<float> rows to bytes, is idempotent, and
+    /// stamps version=5 only on completion. Re-running is a no-op that keeps the
+    /// embeddings bit-exact and the version at 5.
+    #[tokio::test]
+    async fn migration_v4_to_v5_converts_and_is_idempotent() {
+        let home = TempDir::new().unwrap();
+        let repo = "/test/v4_to_v5";
+        let db = open_db(home.path(), repo).await.unwrap();
+
+        // Seed rows in OLD array<float> format.
+        let seeds = [11.0_f32, 22.0, 33.0];
+        for (i, s) in seeds.iter().enumerate() {
+            let emb = emb_1024(*s);
+            let emb_str: String = emb.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(", ");
+            db.query(&format!(
+                "INSERT INTO chunk {{ file: '/repo/m_{i}.rs', line_start: 1, line_end: 5, \
+                 content: 'c', embedding: [{}], symbol_ref: NONE }}",
+                emb_str
+            )).await.expect("seed old-format chunk");
+        }
+
+        // Run the migration.
+        run_migration_v4_to_v5(&db).await.expect("v4→v5");
+        assert_eq!(read_db_schema_version(&db).await, 5, "version must be 5 after migration");
+
+        // All embeddings must still load and search exactly (now from bytes).
+        let index = crate::vector::VectorIndex::load_from_db(&db).await.unwrap();
+        assert_eq!(index.len(), 3, "all 3 rows present post-migration");
+        for s in seeds {
+            let emb = emb_1024(s);
+            let r = index.search(&emb, 1);
+            assert!((r[0].score - 1.0).abs() < 1e-4, "post-migration exact search must score ≈ 1.0");
+        }
+
+        // Idempotent: re-run completes, version stays 5, embeddings unchanged.
+        run_migration_v4_to_v5(&db).await.expect("v4→v5 re-run");
+        assert_eq!(read_db_schema_version(&db).await, 5, "version stays 5 on re-run");
+        let index2 = crate::vector::VectorIndex::load_from_db(&db).await.unwrap();
+        assert_eq!(index2.len(), 3, "re-run must not lose or duplicate rows");
+        for s in seeds {
+            let emb = emb_1024(s);
+            let r = index2.search(&emb, 1);
+            assert!((r[0].score - 1.0).abs() < 1e-4, "embeddings bit-stable across re-run");
+        }
+    }
+
+    /// v4→v5 crash/resume: a persisted cursor lets a re-run finish the remaining
+    /// rows. We simulate an interruption by stamping a partial cursor + leaving
+    /// version at 4, then re-run and assert all rows convert and version → 5.
+    #[tokio::test]
+    async fn migration_v4_to_v5_resumes_from_cursor() {
+        let home = TempDir::new().unwrap();
+        let repo = "/test/v4_to_v5_resume";
+        let db = open_db(home.path(), repo).await.unwrap();
+
+        // Seed old-format rows.
+        for i in 0..5_usize {
+            let emb = emb_1024(i as f32 + 1.0);
+            let emb_str: String = emb.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(", ");
+            db.query(&format!(
+                "INSERT INTO chunk {{ file: '/repo/r_{i}.rs', line_start: 1, line_end: 5, \
+                 content: 'c', embedding: [{}], symbol_ref: NONE }}",
+                emb_str
+            )).await.expect("seed");
+        }
+
+        // Run once to convert everything and reach version 5.
+        run_migration_v4_to_v5(&db).await.expect("first run");
+        assert_eq!(read_db_schema_version(&db).await, 5);
+
+        // Simulate a crash BEFORE completion of a hypothetical replay: reset the
+        // version to 4 and re-run. Because every row is already bytes, the re-run
+        // re-encodes them idempotently and re-stamps 5 — proving resume safety
+        // even when the cursor key is absent (fresh scan from "").
+        let _ = db.query("DELETE FROM index_meta WHERE key = $k")
+            .bind(("k", DB_SCHEMA_VERSION_KEY)).await;
+        ops::set_meta(&db, DB_SCHEMA_VERSION_KEY, "4").await.unwrap();
+        assert_eq!(read_db_schema_version(&db).await, 4);
+
+        run_migration_v4_to_v5(&db).await.expect("resume run");
+        assert_eq!(read_db_schema_version(&db).await, 5, "resume must complete to version 5");
+
+        let index = crate::vector::VectorIndex::load_from_db(&db).await.unwrap();
+        assert_eq!(index.len(), 5, "all rows intact after resume");
     }
 }

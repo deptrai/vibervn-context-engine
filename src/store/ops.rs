@@ -5,7 +5,6 @@ use surrealdb::engine::local::Db;
 
 use crate::parsing::symbols::{QualifiedSymbol, Symbol, SymbolKind};
 use crate::parsing::relations::EdgeKind;
-use crate::parsing::chunker::Chunk;
 
 // ─── Null-tolerant integer deserializer ───────────────────────────────────
 //
@@ -26,6 +25,109 @@ where
     D: serde::Deserializer<'de>,
 {
     Ok(Option::<i64>::deserialize(deserializer)?.unwrap_or(0))
+}
+
+// ─── Dual-format embedding deserializer (DB schema v4 → v5) ────────────────
+//
+// The `chunk.embedding` field has two on-disk representations that MUST both
+// read correctly, because the v4→v5 migration converts rows lazily/in the
+// background and the dual-tolerant reader is what decouples correctness from
+// migration completion (a half-migrated DB is correct-but-unoptimized):
+//
+//   - OLD (≤ v4): `array<float>` — SurrealDB returns a Value::Array of numbers.
+//     serde drives `visit_seq`; we collect each element as f32.
+//   - NEW (≥ v5): packed `bytes` — a little-endian f32 blob (4 bytes/elem).
+//     serde drives `visit_bytes` / `visit_byte_buf`; we decode 4-byte LE chunks.
+//
+// Both arms yield `Vec<f32>`, so a row in *either* format reads without panic
+// or garbage. Empty arrays and empty byte blobs both decode to an empty Vec
+// (treated as "no embedding" downstream by VectorIndex::insert, which skips
+// zero-length vectors).
+//
+// `deserialize_any` is required: the field type is decided by the stored
+// value, not by the struct, so we must let the data drive which visitor arm
+// runs. The local SurrealDB (RocksDB) engine reports the concrete value type,
+// so `deserialize_any` dispatches to the correct arm.
+pub(crate) fn de_embedding_dual<'de, D>(deserializer: D) -> Result<Vec<f32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use std::fmt;
+
+    struct EmbeddingVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for EmbeddingVisitor {
+        type Value = Vec<f32>;
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("an array<float> or a packed little-endian f32 byte blob")
+        }
+
+        // NEW format: packed bytes. Decode 4-byte little-endian f32 chunks.
+        // A trailing partial chunk (len % 4 != 0) is ignored defensively —
+        // the writer always emits whole f32s, so this never happens in practice.
+        fn visit_bytes<E>(self, v: &[u8]) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(v.chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect())
+        }
+
+        fn visit_byte_buf<E>(self, v: Vec<u8>) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            self.visit_bytes(&v)
+        }
+
+        // OLD format: array<float>. Collect each element as f32.
+        // Note: a packed-bytes value can also surface as a seq of u8 through
+        // some serde data models; collecting as f32 there would be wrong, so
+        // we disambiguate by element type — seq elements deserialize as f64
+        // (SurrealDB numbers), which is the array<float> case. The byte path
+        // is handled exclusively by visit_bytes/visit_byte_buf above.
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            let mut out = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+            while let Some(x) = seq.next_element::<f32>()? {
+                out.push(x);
+            }
+            Ok(out)
+        }
+
+        // A present-null embedding (corrupted/manual row) → empty Vec.
+        fn visit_none<E>(self) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(Vec::new())
+        }
+
+        fn visit_unit<E>(self) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(Vec::new())
+        }
+    }
+
+    deserializer.deserialize_any(EmbeddingVisitor)
+}
+
+/// Pack a `&[f32]` embedding into a little-endian byte blob (4 bytes/element).
+/// The inverse of the NEW-format arm of [`de_embedding_dual`]. Round-trips
+/// exactly: `pack(decode(bytes)) == bytes` for any whole-f32 blob, which is
+/// what makes the v4→v5 migration idempotent on already-converted rows.
+pub(crate) fn pack_embedding(embedding: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(embedding.len() * 4);
+    for &f in embedding {
+        out.extend_from_slice(&f.to_le_bytes());
+    }
+    out
 }
 
 // ─── FileMeta ─────────────────────────────────────────────────────────────
@@ -320,26 +422,12 @@ pub async fn insert_edge(
     Ok(())
 }
 
-/// Insert a chunk with its embedding.
-pub async fn insert_chunk(db: &Surreal<Db>, chunk: &Chunk, embedding: Vec<f32>) -> Result<()> {
-    let symbol_ref = chunk.symbol_ref.as_ref().map(|fqn| format!("symbol:⟨{}⟩", fqn));
-
-    db.query(
-        "CREATE chunk SET \
-         file = $file, line_start = $line_start, line_end = $line_end, \
-         content = $content, embedding = $embedding, symbol_ref = $symbol_ref",
-    )
-    .bind(("file", chunk.file.clone()))
-    .bind(("line_start", chunk.line_start as i64))
-    .bind(("line_end", chunk.line_end as i64))
-    .bind(("content", chunk.content.clone()))
-    .bind(("embedding", embedding))
-    .bind(("symbol_ref", symbol_ref))
-    .await
-    .context("insert chunk")?;
-
-    Ok(())
-}
+// NOTE (DB schema v5): the former `insert_chunk` single-row helper was removed.
+// The only production write path is the batched `flush_chunk_batch` in
+// `indexing::pipeline`, which packs embeddings as a little-endian `bytes` blob.
+// `insert_chunk` had zero callers crate-wide (verified by grep) and wrote
+// `embedding` as `array<float>`, so keeping it risked re-introducing the slow
+// old format on a future call site.
 
 /// Upsert file metadata (including chunk_count).
 pub async fn upsert_file_meta(db: &Surreal<Db>, meta: &FileMeta) -> Result<()> {
@@ -555,16 +643,27 @@ pub async fn count_symbols(db: &Surreal<Db>) -> Result<u64> {
 }
 
 /// Sample one stored embedding's dimensionality, or 0 if none embedded yet.
+///
+/// Reads the embedding via the dual-format reader and measures its length in
+/// Rust. `array::len(embedding)` (the pre-v5 approach) returns NONE on a packed
+/// `bytes` value, so after the v4→v5 format change it would silently report a
+/// dimension of 0 — a latent-corruption read. Computing the length from the
+/// decoded `Vec<f32>` is format-agnostic and correct for both representations.
 pub async fn sample_embedding_dim(db: &Surreal<Db>) -> Result<u64> {
-    let rows: Vec<CountRow> = db
+    #[derive(Deserialize)]
+    struct EmbRow {
+        #[serde(deserialize_with = "de_embedding_dual")]
+        embedding: Vec<f32>,
+    }
+    let rows: Vec<EmbRow> = db
         .query(
-            "SELECT array::len(embedding) AS count FROM chunk \
+            "SELECT embedding FROM chunk \
              WHERE embedding IS NOT NONE LIMIT 1",
         )
         .await
         .context("sample embedding dim")?
         .take(0)?;
-    Ok(rows.first().map(|r| r.count.max(0) as u64).unwrap_or(0))
+    Ok(rows.first().map(|r| r.embedding.len() as u64).unwrap_or(0))
 }
 
 /// One row in the file browser: path, language-agnostic metadata, and chunk count.
@@ -640,13 +739,19 @@ pub async fn chunks_for_file(
         line_start: i64,
         line_end: i64,
         content: String,
-        embedding_dim: i64,
+        // Read the raw embedding via the dual-format reader and derive the
+        // dimension in Rust. `array::len(embedding)` returns NONE on a packed
+        // `bytes` value (v5+), which would silently report dim 0 in the chunk
+        // browser. Decoding to Vec<f32> is correct for both array<float> and
+        // bytes representations.
+        #[serde(deserialize_with = "de_embedding_dual")]
+        embedding: Vec<f32>,
         symbol_ref: Option<String>,
     }
     let rows: Vec<Row> = db
         .query(
             "SELECT line_start, line_end, content, \
-             array::len(embedding) AS embedding_dim, symbol_ref \
+             embedding, symbol_ref \
              FROM chunk WHERE file = $file ORDER BY line_start LIMIT $limit",
         )
         .bind(("file", file.to_string()))
@@ -661,7 +766,7 @@ pub async fn chunks_for_file(
             line_start: r.line_start,
             line_end: r.line_end,
             content: r.content,
-            embedding_dim: r.embedding_dim.max(0) as u64,
+            embedding_dim: r.embedding.len() as u64,
             symbol: r.symbol_ref.as_deref().and_then(strip_symbol_ref),
         })
         .collect())
