@@ -30,6 +30,7 @@ use crate::config::{
     ConfigError, CURRENT_VERSION, Settings, ensure_dir_and_load, write_settings_atomic,
     config_path,
 };
+use crate::defender;
 use crate::embedding::voyage::VoyageClient;
 use crate::indexing::IndexEngine;
 use crate::llm::LlmClient;
@@ -137,6 +138,7 @@ pub fn build_router(
         .route("/api/config", put(put_config))
         .route("/api/repos/:repo_id/index", post(post_index_repo).delete(delete_repo_index))
         .route("/api/repos/:repo_id/rebuild", post(post_rebuild_repo))
+        .route("/api/repos/:repo_id/cancel-index", post(post_cancel_index))
         .route("/api/repos/:repo_id/status", get(get_repo_status))
         .route("/api/repos/:repo_id/index-stats", get(get_index_stats))
         .route("/api/repos/:repo_id/files", get(get_repo_files))
@@ -148,6 +150,8 @@ pub fn build_router(
         .route("/api/query", post(post_query))
         .route("/api/mcp-tool", post(post_mcp_tool))
         .route("/api/embedding-cache", delete(delete_embedding_cache))
+        .route("/api/defender-status", get(get_defender_status))
+        .route("/api/defender-exclude", post(post_defender_exclude))
         .merge(Router::new().nest_service("/mcp", mcp_service))
         .with_state(state)
 }
@@ -166,11 +170,16 @@ fn decode_repo_id(repo_id: &str) -> Result<String, Response> {
         })
 }
 
-/// Acquire the shared SurrealDB handle for `repo`. Delegates to
-/// [`store::get_or_open`] so the server reads through the *same* datastore
-/// instance the indexer writes through (see [`store::RepoDbMap`]).
-async fn acquire_repo_db(state: &AppState, repo: &str) -> Result<Surreal<Db>, Response> {
-    store::get_or_open(&state.repo_dbs, &state.home_dir, repo)
+/// Acquire the shared SurrealDB handle for `repo`, or `None` if the repo has no
+/// index on disk yet. Read-only browse endpoints use this so an unindexed repo
+/// renders an empty state instead of erroring (and without materializing a
+/// phantom DB directory as a side effect of a read). Delegates to
+/// [`store::open_if_indexed`].
+async fn acquire_repo_db_if_indexed(
+    state: &AppState,
+    repo: &str,
+) -> Result<Option<Surreal<Db>>, Response> {
+    store::open_if_indexed(&state.repo_dbs, &state.home_dir, repo)
         .await
         .map_err(|e| {
             let body = json!({ "error": format!("failed to open index DB: {e}") });
@@ -320,6 +329,20 @@ async fn post_rebuild_repo(
     }
 }
 
+/// POST /api/repos/:repo_id/cancel-index — cancel an in-progress index run.
+async fn post_cancel_index(
+    State(state): State<AppState>,
+    Path(repo_id): Path<String>,
+) -> Response {
+    let repo = match decode_repo_id(&repo_id) {
+        Ok(r) => r,
+        Err(r) => return r,
+    };
+
+    let cancelled = state.index_engine.cancel_index(&repo).await;
+    Json(json!({ "cancelled": cancelled })).into_response()
+}
+
 /// DELETE /api/repos/:repo_id/index — remove the index DB folder for a repo.
 async fn delete_repo_index(
     State(state): State<AppState>,
@@ -330,32 +353,56 @@ async fn delete_repo_index(
         Err(r) => return r,
     };
 
-    // Close the DB handle if it's open so the directory can be removed.
-    {
-        let mut map = state.repo_dbs.write().await;
-        map.remove(&repo);
-    }
+    // Cancel any in-progress indexing, wait for it to finish, then drop the
+    // cached DB handle. This guarantees no pipeline holds a RocksDB lock on
+    // the directory when we attempt to remove it.
+    state.index_engine.close_repo_db(&repo).await;
+
+    // Clear in-memory state immediately — the index is functionally gone from
+    // the user's perspective regardless of whether the directory removal succeeds.
+    state.index_engine.clear_repo_index(&repo).await;
 
     let db_dir = store::db_path(&state.home_dir, &repo);
     if !db_dir.exists() {
-        state.index_engine.clear_repo_index(&repo).await;
         return Json(json!({ "status": "ok", "message": "no index to remove" })).into_response();
     }
 
-    match tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&db_dir)).await {
-        Ok(Ok(())) => {
-            state.index_engine.clear_repo_index(&repo).await;
-            Json(json!({ "status": "ok" })).into_response()
+    // SurrealDB's background router task releases the RocksDB lock asynchronously
+    // after the last Surreal<Db> clone drops (the spawned task must flush memtables
+    // and shut down internal engine tasks). On Windows, file handles are not
+    // released until the background task completes — which can take unbounded time.
+    //
+    // Strategy: attempt removal with retries. If it still fails (background task
+    // hasn't shut down yet), spawn a detached cleanup task that keeps retrying in
+    // the background and return success to the caller — the index is already
+    // logically removed (handle closed, status cleared, vector shard evicted).
+    let db_dir_bg = db_dir.clone();
+    let removed = tokio::task::spawn_blocking(move || {
+        for i in 0..10 {
+            if std::fs::remove_dir_all(&db_dir_bg).is_ok() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(100 * (i + 1)));
         }
-        Ok(Err(e)) => {
-            let body = json!({ "error": format!("failed to remove index directory: {e}") });
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(body)).into_response()
-        }
-        Err(e) => {
-            let body = json!({ "error": format!("internal error: {e}") });
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(body)).into_response()
-        }
+        false
+    })
+    .await
+    .unwrap_or(false);
+
+    if !removed {
+        // Detached background cleanup — keeps trying until the OS releases the lock.
+        tokio::task::spawn_blocking(move || {
+            for i in 0..60 {
+                std::thread::sleep(Duration::from_secs(1 + i / 10));
+                if std::fs::remove_dir_all(&db_dir).is_ok() {
+                    return;
+                }
+            }
+            tracing::warn!(path = ?db_dir, "could not remove index directory after extended retry");
+        });
     }
+
+    Json(json!({ "status": "ok" })).into_response()
 }
 
 /// POST /api/index-all — trigger index for all repos.
@@ -401,8 +448,27 @@ async fn get_index_stats(
         Ok(r) => r,
         Err(r) => return r,
     };
-    let db = match acquire_repo_db(&state, &repo).await {
-        Ok(d) => d,
+    let db = match acquire_repo_db_if_indexed(&state, &repo).await {
+        Ok(Some(d)) => d,
+        // Never indexed → zeroed stats with a "not_indexed" state instead of an
+        // error. The explorer renders this cleanly (counts show 0 / Status reads
+        // from index status), and no phantom DB is created by a read.
+        Ok(None) => {
+            let embedding_model = state.settings.read().await.embedding.model.clone();
+            let db_dir = store::db_path(&state.home_dir, &repo);
+            return Json(json!({
+                "repo": repo,
+                "files": 0,
+                "chunks": 0,
+                "symbols": 0,
+                "embedding_model": embedding_model,
+                "embedding_dim": null,
+                "db_path": db_dir.to_string_lossy(),
+                "state": "not_indexed",
+                "last_indexed_at": null,
+            }))
+            .into_response();
+        }
         Err(r) => return r,
     };
 
@@ -460,8 +526,13 @@ async fn get_repo_files(
         Ok(r) => r,
         Err(r) => return r,
     };
-    let db = match acquire_repo_db(&state, &repo).await {
-        Ok(d) => d,
+    let db = match acquire_repo_db_if_indexed(&state, &repo).await {
+        Ok(Some(d)) => d,
+        // Never indexed → empty file list, not an error. The UI shows its
+        // "no files / not indexed" empty state.
+        Ok(None) => {
+            return Json(json!({ "files": [], "truncated": false })).into_response();
+        }
         Err(r) => return r,
     };
 
@@ -484,8 +555,12 @@ async fn get_repo_graph(
         Ok(r) => r,
         Err(r) => return r,
     };
-    let db = match acquire_repo_db(&state, &repo).await {
-        Ok(d) => d,
+    let db = match acquire_repo_db_if_indexed(&state, &repo).await {
+        Ok(Some(d)) => d,
+        // Never indexed → empty graph, not an error.
+        Ok(None) => {
+            return Json(json!({ "nodes": [], "edges": [], "truncated": false })).into_response();
+        }
         Err(r) => return r,
     };
 
@@ -519,8 +594,12 @@ async fn get_repo_chunks(
         return (StatusCode::BAD_REQUEST, Json(body)).into_response();
     }
 
-    let db = match acquire_repo_db(&state, &repo).await {
-        Ok(d) => d,
+    let db = match acquire_repo_db_if_indexed(&state, &repo).await {
+        Ok(Some(d)) => d,
+        // Never indexed → no chunks, not an error.
+        Ok(None) => {
+            return Json(json!({ "file": file, "chunks": [] })).into_response();
+        }
         Err(r) => return r,
     };
 
@@ -718,6 +797,7 @@ async fn get_index_events(
                         crate::indexing::events::IndexEvent::Phase2Done { repo, .. } => *repo == repo_filter,
                         crate::indexing::events::IndexEvent::Completed { repo, .. } => *repo == repo_filter,
                         crate::indexing::events::IndexEvent::Failed { repo, .. } => *repo == repo_filter,
+                        crate::indexing::events::IndexEvent::Cancelled { repo } => *repo == repo_filter,
                     };
                     if matches {
                         let data = serde_json::to_string(&event).unwrap_or_default();
@@ -781,6 +861,55 @@ async fn delete_embedding_cache(
         Ok(pr) => Json(json!({ "deleted": pr.deleted, "errors": pr.errors })).into_response(),
         Err(e) => {
             let body = json!({ "error": format!("purge task failed: {e}") });
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(body)).into_response()
+        }
+    }
+}
+
+// ─── Windows Defender exclusion management ────────────────────────────────
+
+async fn get_defender_status(State(state): State<AppState>) -> Response {
+    let data_dir = state
+        .home_dir
+        .join(".vibervn")
+        .join("context-engine")
+        .to_string_lossy()
+        .to_string();
+
+    let status =
+        tokio::task::spawn_blocking(move || defender::check_status(&data_dir)).await;
+
+    match status {
+        Ok(s) => Json(json!(s)).into_response(),
+        Err(e) => {
+            let body = json!({ "error": format!("defender check failed: {e}") });
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(body)).into_response()
+        }
+    }
+}
+
+async fn post_defender_exclude(State(state): State<AppState>) -> Response {
+    let data_dir = state
+        .home_dir
+        .join(".vibervn")
+        .join("context-engine")
+        .to_string_lossy()
+        .to_string();
+
+    let result =
+        tokio::task::spawn_blocking(move || defender::add_exclusions(&data_dir)).await;
+
+    match result {
+        Ok(r) => {
+            let code = if r.success {
+                StatusCode::OK
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (code, Json(json!(r))).into_response()
+        }
+        Err(e) => {
+            let body = json!({ "error": format!("defender exclude failed: {e}") });
             (StatusCode::INTERNAL_SERVER_ERROR, Json(body)).into_response()
         }
     }

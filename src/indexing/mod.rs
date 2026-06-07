@@ -13,6 +13,7 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use crate::config::Settings;
@@ -123,6 +124,9 @@ pub struct IndexEngine {
     repo_dbs: RepoDbMap,
     /// Broadcast channel for streaming indexing events to SSE clients.
     pub event_bus: IndexEventBus,
+    /// Per-repo cancellation tokens. The consumer checks this before each file in
+    /// the pipeline. A cancelled token triggers graceful early exit.
+    cancel_tokens: Mutex<HashMap<String, CancellationToken>>,
 }
 
 #[derive(Debug)]
@@ -265,6 +269,7 @@ impl IndexEngine {
             warm_locks: Mutex::new(HashMap::new()),
             repo_dbs,
             event_bus: IndexEventBus::new(),
+            cancel_tokens: Mutex::new(HashMap::new()),
         });
 
         // Initialise status entries.
@@ -386,6 +391,65 @@ impl IndexEngine {
             }
         }
         self.vector_index.write().await.remove_repo(repo);
+    }
+
+    /// Cancel indexing, wait for the pipeline to finish, then remove the cached
+    /// DB handle from `repo_dbs`. The per-repo serialisation lock guarantees that
+    /// no pipeline iteration is mid-flight when the handle is removed — the
+    /// consumer holds this lock for the entire iteration (open → run → emit).
+    ///
+    /// Returns once the handle has been removed and no pipeline holds it.
+    pub async fn close_repo_db(&self, repo: &str) {
+        // 1. Cancel any in-progress run so it exits early.
+        self.cancel_index(repo).await;
+
+        // 2. Acquire the per-repo lock — blocks until the consumer's current
+        //    iteration for this repo finishes (including dropping its `db` clone).
+        let lock = self.get_repo_lock(repo).await;
+        let _guard = lock.lock().await;
+
+        // 3. Under the lock, remove the cached handle. No one else can open a
+        //    new one for this repo while we hold the lock (the consumer is the
+        //    only other caller of get_or_open, and it needs this same lock).
+        let mut map = self.repo_dbs.write().await;
+        map.remove(repo);
+    }
+
+    /// Cancel an in-progress indexing run for a repo. Returns true if the repo
+    /// was actively indexing and the cancellation signal was sent.
+    pub async fn cancel_index(&self, repo: &str) -> bool {
+        // Only cancel if the repo is actually in 'indexing' state — avoids a
+        // TOCTOU race where the pipeline finishes between Ok(stats) and
+        // clear_cancel_token, making the token still present but the run done.
+        let is_indexing = {
+            let statuses = self.statuses.read().await;
+            statuses.get(repo).map(|s| s.state == IndexState::Indexing).unwrap_or(false)
+        };
+        if !is_indexing {
+            return false;
+        }
+        let mut tokens = self.cancel_tokens.lock().await;
+        if let Some(token) = tokens.remove(repo) {
+            token.cancel();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Get or create a fresh cancellation token for a repo run.
+    /// Called at the start of each consumer iteration.
+    async fn new_cancel_token(&self, repo: &str) -> CancellationToken {
+        let token = CancellationToken::new();
+        let mut tokens = self.cancel_tokens.lock().await;
+        tokens.insert(repo.to_string(), token.clone());
+        token
+    }
+
+    /// Remove the cancellation token for a repo (run finished).
+    async fn clear_cancel_token(&self, repo: &str) {
+        let mut tokens = self.cancel_tokens.lock().await;
+        tokens.remove(repo);
     }
 
     async fn get_repo_lock(&self, repo: &str) -> Arc<Mutex<()>> {
@@ -534,6 +598,9 @@ async fn run_consumer(
         let lock = engine_ref.get_repo_lock(&repo).await;
         let _guard = lock.lock().await;
 
+        // Create a fresh cancellation token for this run.
+        let cancel_token = engine_ref.new_cancel_token(&repo).await;
+
         // Mark indexing. Reset progress counters so the UI shows the
         // indeterminate pulse (total_files == 0) until the pipeline reports a total.
         {
@@ -565,6 +632,7 @@ async fn run_consumer(
                         repo: repo.clone(),
                         error: e.to_string(),
                     });
+                    engine_ref.clear_cancel_token(&repo).await;
                     continue;
                 }
             }
@@ -590,6 +658,7 @@ async fn run_consumer(
                     repo: repo.clone(),
                     error: e.to_string(),
                 });
+                engine_ref.clear_cancel_token(&repo).await;
                 continue;
             }
         };
@@ -648,6 +717,7 @@ async fn run_consumer(
                 Some(progress),
                 Some(&engine_ref.event_bus),
                 &key_hints,
+                Some(cancel_token),
             )
             .await
         {
@@ -676,20 +746,31 @@ async fn run_consumer(
                 });
             }
             Err(e) => {
-                // `{e:#}` prints the full anyhow context chain on one line
-                // (outer context + the underlying SurrealDB per-statement error),
-                // not just the outermost message — essential for diagnosing rollbacks.
-                error!(repo = %repo, error = %format!("{e:#}"), "indexing failed");
-                let mut statuses = engine_ref.statuses.write().await;
-                let s = statuses.entry(repo.clone()).or_default();
-                s.state = IndexState::Error;
-                s.error = Some(format!("{e:#}"));
-                engine_ref.event_bus.emit(IndexEvent::Failed {
-                    repo: repo.clone(),
-                    error: format!("{e:#}"),
-                });
+                let err_str = format!("{e:#}");
+                let is_cancelled = err_str.contains("cancelled");
+                if is_cancelled {
+                    info!(repo = %repo, "indexing cancelled by user");
+                    let mut statuses = engine_ref.statuses.write().await;
+                    let s = statuses.entry(repo.clone()).or_default();
+                    s.state = IndexState::Idle;
+                    s.error = None;
+                    engine_ref.event_bus.emit(IndexEvent::Cancelled {
+                        repo: repo.clone(),
+                    });
+                } else {
+                    error!(repo = %repo, error = %err_str, "indexing failed");
+                    let mut statuses = engine_ref.statuses.write().await;
+                    let s = statuses.entry(repo.clone()).or_default();
+                    s.state = IndexState::Error;
+                    s.error = Some(err_str.clone());
+                    engine_ref.event_bus.emit(IndexEvent::Failed {
+                        repo: repo.clone(),
+                        error: err_str,
+                    });
+                }
             }
         }
+        engine_ref.clear_cancel_token(&repo).await;
     }
 }
 

@@ -1,5 +1,6 @@
 /// Public library interface — exposes internal modules for integration tests.
 pub mod config;
+pub mod defender;
 pub mod embedding;
 pub mod indexing;
 pub mod llm;

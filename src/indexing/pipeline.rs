@@ -10,6 +10,7 @@ use surrealdb::Surreal;
 use surrealdb::engine::local::Db;
 use surrealdb::sql::{Array as SqlArray, Id as SqlId, Object as SqlObject, Thing as SqlThing, Value as SqlValue};
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::embedding::InputType;
@@ -284,6 +285,7 @@ impl IndexPipeline {
         progress: Option<ProgressHandle>,
         event_bus: Option<&IndexEventBus>,
         key_hints: &[String],
+        cancel_token: Option<CancellationToken>,
     ) -> Result<IndexPipelineStats> {
         // Check if first run (no file_meta at all).
         let stored_meta = get_all_file_meta(db, &self.repo).await?;
@@ -308,7 +310,7 @@ impl IndexPipeline {
                     is_rebuild: force_rebuild,
                 });
             }
-            let (new_vectors, stage_stats) = self.full_rebuild(db, progress.as_ref(), event_bus, key_hints).await?;
+            let (new_vectors, stage_stats) = self.full_rebuild(db, progress.as_ref(), event_bus, key_hints, cancel_token.as_ref()).await?;
             if let Some(vi) = vector_index {
                 let mut guard = vi.write().await;
                 // Empty active set: the cap may evict LRU shards to honor the
@@ -418,7 +420,7 @@ impl IndexPipeline {
                         "RAM-path crash detected (edges_resolved absent, raw_edge empty, file_meta present) \
                          — forcing full rebuild to recover calls edges"
                     );
-                    let (new_vectors, stage_stats) = self.full_rebuild(db, None, event_bus, key_hints).await?;
+                    let (new_vectors, stage_stats) = self.full_rebuild(db, None, event_bus, key_hints, cancel_token.as_ref()).await?;
                     if let Some(vi) = vector_index {
                         let mut guard = vi.write().await;
                         guard.replace_repo(&self.repo, &new_vectors, &[]);
@@ -455,7 +457,7 @@ impl IndexPipeline {
                 is_rebuild: false,
             });
         }
-        let (removed_files, new_vectors) = self.incremental_run(db, file_changes, progress.as_ref(), event_bus, key_hints).await?;
+        let (removed_files, new_vectors) = self.incremental_run(db, file_changes, progress.as_ref(), event_bus, key_hints, cancel_token.as_ref()).await?;
 
         if let Some(vi) = vector_index {
             let mut guard = vi.write().await;
@@ -476,6 +478,7 @@ impl IndexPipeline {
         progress: Option<&ProgressHandle>,
         event_bus: Option<&IndexEventBus>,
         key_hints: &[String],
+        cancel_token: Option<&CancellationToken>,
     ) -> Result<(Vec<(ChunkId, Vec<f32>)>, IndexPipelineStats)> {
         let all_files = walk_repo(&self.repo);
         info!(repo = %self.repo, file_count = all_files.len(), "walking repo for full rebuild");
@@ -495,7 +498,7 @@ impl IndexPipeline {
         // If the repo exceeds MAX_RAM_EDGES, edges overflow to the DB and Phase 2
         // falls back to the keyset scan path (same as before).
         let (chunk_vectors, mut stats, ram_raw_edges, ram_edges_overflowed) = self
-            .streaming_index(&all_files, db, progress, event_bus, key_hints, true)
+            .streaming_index(&all_files, db, progress, event_bus, key_hints, true, cancel_token)
             .await
             .context("full_rebuild: streaming_index")?;
 
@@ -536,6 +539,7 @@ impl IndexPipeline {
         progress: Option<&ProgressHandle>,
         event_bus: Option<&IndexEventBus>,
         key_hints: &[String],
+        cancel_token: Option<&CancellationToken>,
     ) -> Result<(Vec<String>, Vec<(ChunkId, Vec<f32>)>)> {
         let to_process: Vec<String> = changes
             .iter()
@@ -584,7 +588,7 @@ impl IndexPipeline {
         // Stream parse → embed → write.
         // Raw edges go to DB (crash-safe incremental path).
         let (chunk_vectors, _stage_stats, _ram_edges, _overflowed) = self
-            .streaming_index(&to_process, db, progress, event_bus, key_hints, false)
+            .streaming_index(&to_process, db, progress, event_bus, key_hints, false, cancel_token)
             .await
             .context("incremental_run: streaming_index")?;
 
@@ -636,6 +640,7 @@ impl IndexPipeline {
         event_bus: Option<&IndexEventBus>,
         key_hints: &[String],
         is_full_rebuild: bool,
+        cancel_token: Option<&CancellationToken>,
     ) -> Result<(Vec<(ChunkId, Vec<f32>)>, IndexPipelineStats, Vec<RawEdgeRecord>, bool)> {
         if files.is_empty() {
             if let Some(ph) = progress {
@@ -690,11 +695,19 @@ impl IndexPipeline {
             let cache_clone = cache_arc.clone();
             let bus_clone = event_bus_clone.clone();
             let hints_clone = key_hints_owned.clone();
+            let cancel_clone = cancel_token.cloned();
 
             tokio::spawn(async move {
-                // Convert mpsc receiver to a stream.
-                let stream = futures::stream::unfold(parse_rx, |mut rx| async move {
-                    rx.recv().await.map(|item| (item, rx))
+                // Convert mpsc receiver to a stream that stops on cancel.
+                let ct_for_stream = cancel_clone.clone();
+                let stream = futures::stream::unfold(parse_rx, move |mut rx| {
+                    let ct = ct_for_stream.clone();
+                    async move {
+                        if let Some(ref ct) = ct {
+                            if ct.is_cancelled() { return None; }
+                        }
+                        rx.recv().await.map(|item| (item, rx))
+                    }
                 });
 
                 stream
@@ -705,7 +718,12 @@ impl IndexPipeline {
                         let progress_ref = progress_clone.clone();
                         let bus_ref = bus_clone.clone();
                         let hints_ref = hints_clone.clone();
+                        let ct_ref = cancel_clone.clone();
                         async move {
+                            // Short-circuit if cancelled — skip the expensive embed call.
+                            if let Some(ref ct) = ct_ref {
+                                if ct.is_cancelled() { return None; }
+                            }
                             match output {
                                 ParseOutput::Skipped { file, reason } => {
                                     // Emit skip event and count it — no EmbeddedFile produced.
@@ -848,8 +866,17 @@ impl IndexPipeline {
         };
         // Once the RAM buffer overflows, all subsequent raw_edges go to DB.
         let mut ram_edges_overflowed = false;
+        let mut cancelled = false;
 
         while let Some(ef) = embed_rx.recv().await {
+            // Check cancellation before processing each file.
+            if let Some(ct) = cancel_token {
+                if ct.is_cancelled() {
+                    info!(repo = %self.repo, "indexing cancelled — stopping pipeline");
+                    cancelled = true;
+                    break;
+                }
+            }
             // Measure queue wait: time from when EmbeddedFile was created in Stage 2
             // to when Stage 3 picks it up.
             let queue_wait_ms = ef.created_at.elapsed().as_millis() as u64;
@@ -1003,6 +1030,12 @@ impl IndexPipeline {
                     status: status.to_string(),
                 });
             }
+        }
+
+        // If cancelled, drop remaining channel items and return early.
+        if cancelled {
+            drop(embed_rx);
+            anyhow::bail!("indexing cancelled");
         }
 
         // ── Flush tail: remaining symbols + chunks + file_metas ─────────
@@ -2403,7 +2436,7 @@ mod end_to_end_persist {
         let db = open_db(home.path(), &repo).await.expect("open db");
         let pipeline = IndexPipeline::new(repo.clone(), None);
 
-        let result = pipeline.run(&db, None, true, None, None, None, &[]).await;
+        let result = pipeline.run(&db, None, true, None, None, None, &[], None).await;
         println!("REAL-TREE PROBE: result = {:?}", result.as_ref().map(|s| (s.indexed_files, s.total_files)));
 
         let chunks = count_chunks(&db).await.unwrap();
@@ -2428,7 +2461,7 @@ mod end_to_end_persist {
         let pipeline = IndexPipeline::new(repo.clone(), None);
 
         let stats = pipeline
-            .run(&db, None, true, None, None, None, &[])
+            .run(&db, None, true, None, None, None, &[], None)
             .await
             .expect("full_rebuild must succeed");
 
@@ -2459,7 +2492,7 @@ mod end_to_end_persist {
 
         let db = open_db(home.path(), &repo).await.expect("open db");
         let pipeline = IndexPipeline::new(repo.clone(), None);
-        pipeline.run(&db, None, true, None, None, None, &[]).await.expect("rebuild");
+        pipeline.run(&db, None, true, None, None, None, &[], None).await.expect("rebuild");
 
         // Check that file_meta.chunk_count > 0 for the test file.
         use serde::Deserialize;
@@ -2491,7 +2524,7 @@ mod end_to_end_persist {
 
         let db = open_db(home.path(), &repo).await.expect("open db");
         let pipeline = IndexPipeline::new(repo.clone(), None);
-        pipeline.run(&db, None, true, None, None, None, &[]).await.expect("rebuild");
+        pipeline.run(&db, None, true, None, None, None, &[], None).await.expect("rebuild");
 
         let marker = get_meta(&db, EDGES_RESOLVED_KEY).await.unwrap();
         assert!(marker.is_some(), "edges_resolved marker must be set after full_rebuild");
@@ -3833,7 +3866,7 @@ mod perf_fix_tests {
         // First, do a full build so all four files are indexed.
         let pipeline = IndexPipeline::new(repo.clone(), None);
         pipeline
-            .run(&db, None, true, None, None, None, &[])
+            .run(&db, None, true, None, None, None, &[], None)
             .await
             .expect("full build must succeed");
 
@@ -3852,7 +3885,7 @@ mod perf_fix_tests {
 
         // Run the incremental pipeline with changes = Some(...) — the watcher path.
         let stats = pipeline
-            .run(&db, Some(changes), false, None, None, None, &[])
+            .run(&db, Some(changes), false, None, None, None, &[], None)
             .await
             .expect("incremental run must succeed");
 

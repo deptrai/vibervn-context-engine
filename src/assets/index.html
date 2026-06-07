@@ -32,6 +32,17 @@
   </script>
   <style>
     .font-wiki { font-family: 'Linux Libertine', 'Georgia', 'Times', serif; }
+    .cancel-state {
+      border-color: #ef4444 !important;
+      color: #ef4444 !important;
+    }
+    .dark .cancel-state {
+      border-color: #f87171 !important;
+      color: #f87171 !important;
+    }
+    .cancel-state:hover {
+      background-color: rgba(239, 68, 68, 0.1) !important;
+    }
   </style>
 </head>
 <body class="bg-gray-50 dark:bg-wiki-bg text-gray-900 dark:text-wiki-text min-h-screen transition-colors duration-200">
@@ -68,6 +79,32 @@
              hover:bg-orange-100 dark:hover:bg-orange-900/40 focus:outline-none focus:ring-2 focus:ring-orange-400">
         Retry
       </button>
+    </div>
+  </div>
+
+  <!-- Windows Defender exclusion banner -->
+  <div id="banner-defender" class="hidden mb-6 p-4 border border-amber-400/40 dark:border-amber-700/50 bg-amber-50 dark:bg-amber-900/20 rounded text-sm">
+    <div class="flex items-start gap-3">
+      <svg class="w-5 h-5 mt-0.5 text-amber-600 dark:text-amber-400 shrink-0" fill="currentColor" viewBox="0 0 24 24">
+        <path d="M12 2L3 7v5c0 5.55 3.84 10.74 9 12 5.16-1.26 9-6.45 9-12V7l-9-5zm1 15h-2v-2h2v2zm0-4h-2V8h2v5z"/>
+      </svg>
+      <div class="flex-1">
+        <p class="text-amber-800 dark:text-amber-300 font-medium mb-1">Windows Defender is scanning indexed files</p>
+        <p class="text-amber-700 dark:text-amber-400/80 text-xs mb-2">
+          Real-time protection slows indexing significantly. Add an exclusion for the data directory and process to fix this.
+        </p>
+        <div class="flex gap-2">
+          <button id="btn-defender-fix" class="px-3 py-1 text-xs rounded border border-amber-500 dark:border-amber-600 text-amber-700 dark:text-amber-300
+                 bg-amber-100 dark:bg-amber-900/40 hover:bg-amber-200 dark:hover:bg-amber-900/60
+                 focus:outline-none focus:ring-2 focus:ring-amber-400 disabled:opacity-50 disabled:cursor-not-allowed">
+            Add exclusion
+          </button>
+          <button id="btn-defender-dismiss" class="px-3 py-1 text-xs rounded text-amber-600 dark:text-amber-400
+                 hover:bg-amber-100 dark:hover:bg-amber-900/30 focus:outline-none focus:ring-2 focus:ring-amber-400">
+            Dismiss
+          </button>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -584,9 +621,16 @@
     <!-- Header -->
     <div class="flex items-center justify-between px-4 py-3 border-b border-gray-200 dark:border-wiki-border">
       <h3 class="text-sm font-medium text-gray-900 dark:text-wiki-heading">Indexing Progress</h3>
-      <button id="btn-close-index-modal" class="text-gray-400 dark:text-wiki-text-muted hover:text-gray-700 dark:hover:text-wiki-text focus:outline-none focus:ring-2 focus:ring-blue-400 rounded p-1">
-        <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M6 18L18 6M6 6l12 12"/></svg>
-      </button>
+      <div class="flex items-center gap-2">
+        <button id="btn-cancel-index-modal"
+                class="text-xs px-2 py-1 rounded border border-red-400 text-red-500 hover:bg-red-50 dark:hover:bg-red-900/20
+                       focus:outline-none focus:ring-2 focus:ring-red-300">
+          Cancel
+        </button>
+        <button id="btn-close-index-modal" class="text-gray-400 dark:text-wiki-text-muted hover:text-gray-700 dark:hover:text-wiki-text focus:outline-none focus:ring-2 focus:ring-blue-400 rounded p-1">
+          <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M6 18L18 6M6 6l12 12"/></svg>
+        </button>
+      </div>
     </div>
     <!-- Overview stats -->
     <div id="index-modal-stats" class="px-4 py-2 border-b border-gray-100 dark:border-wiki-border text-xs text-gray-500 dark:text-wiki-text-muted flex gap-4 flex-wrap">
@@ -667,12 +711,14 @@ function updateRepoIndexUI() {
   cfg.repos.forEach((repo) => {
     const statusEl = document.getElementById('repo-status-' + encodeRepoId(repo));
     const btnEl = document.getElementById('repo-index-btn-' + encodeRepoId(repo));
+    const showBtn = document.getElementById('repo-show-btn-' + encodeRepoId(repo));
     if (!statusEl || !btnEl) return;
     const s = indexStatuses[repo];
     statusEl.className = 'text-xs text-gray-400 dark:text-wiki-text-muted whitespace-nowrap';
     if (!s) {
       statusEl.textContent = '';
       btnEl.disabled = false;
+      if (showBtn) showBtn.classList.add('hidden');
       return;
     }
     if (s.state === 'indexing') {
@@ -689,11 +735,15 @@ function updateRepoIndexUI() {
         statusEl.innerHTML = '<span class="animate-pulse text-blue-500 dark:text-wiki-link">Indexing…</span>';
       }
       btnEl.disabled = false;
-      btnEl.textContent = 'Show';
+      btnEl.textContent = 'Cancel';
+      btnEl.classList.add('cancel-state');
+      if (showBtn) showBtn.classList.remove('hidden');
     } else if (s.state === 'error') {
       statusEl.innerHTML = '<span class="text-red-500 dark:text-red-400" title="' + escHtml(s.error || '') + '">Error</span>';
       btnEl.disabled = false;
       btnEl.textContent = 'Index';
+      btnEl.classList.remove('cancel-state');
+      if (showBtn) showBtn.classList.add('hidden');
     } else {
       const count = s.indexed_files || 0;
       if (count > 0) {
@@ -704,8 +754,19 @@ function updateRepoIndexUI() {
       }
       btnEl.disabled = false;
       btnEl.textContent = 'Index';
+      btnEl.classList.remove('cancel-state');
+      if (showBtn) showBtn.classList.add('hidden');
     }
   });
+  updateIndexAllButton();
+}
+
+function updateIndexAllButton() {
+  const btn = document.getElementById('btn-index-all');
+  if (!btn) return;
+  const anyIndexing = Object.values(indexStatuses).some(s => s.state === 'indexing');
+  btn.textContent = anyIndexing ? 'Cancel All' : 'Index All';
+  btn.classList.toggle('cancel-state', anyIndexing);
 }
 
 // ─── Utility ──────────────────────────────────────────────────────────────
@@ -801,6 +862,13 @@ function renderRepos() {
     row.innerHTML = `
       <button data-repo="${escHtml(repo)}" class="btn-open-search font-mono text-gray-800 dark:text-wiki-link truncate flex-1 mr-1 text-left hover:underline focus:outline-none focus:ring-2 focus:ring-blue-400 rounded">${escHtml(repo)}</button>
       <span id="repo-status-${repoId}" class="text-xs text-gray-400 dark:text-wiki-text-muted whitespace-nowrap"></span>
+      <button id="repo-show-btn-${repoId}" data-repo="${escHtml(repo)}"
+              class="btn-show-progress hidden text-xs px-2 py-1 rounded border border-gray-300 dark:border-wiki-border
+                     text-gray-600 dark:text-wiki-text-muted hover:bg-gray-100 dark:hover:bg-wiki-surface/60
+                     hover:text-gray-900 dark:hover:text-wiki-text
+                     focus:outline-none focus:ring-2 focus:ring-blue-400">
+        Show
+      </button>
       <button id="repo-index-btn-${repoId}" data-repo="${escHtml(repo)}"
               class="btn-index-repo text-xs px-2 py-1 rounded border border-gray-300 dark:border-wiki-border
                      text-gray-600 dark:text-wiki-text-muted hover:bg-gray-100 dark:hover:bg-wiki-surface/60
@@ -828,13 +896,23 @@ function renderRepos() {
     btn.addEventListener('click', () => openRepoSearch(btn.dataset.repo));
   });
 
+  list.querySelectorAll('.btn-show-progress').forEach(btn => {
+    btn.addEventListener('click', () => openIndexModal(btn.dataset.repo));
+  });
+
   list.querySelectorAll('.btn-index-repo').forEach(btn => {
     btn.addEventListener('click', async () => {
       const repo = btn.dataset.repo;
       const repoId = encodeRepoId(repo);
       const s = indexStatuses[repo];
       if (s && s.state === 'indexing') {
-        openIndexModal(repo);
+        btn.disabled = true;
+        btn.textContent = 'Cancelling…';
+        try {
+          await fetch('/api/repos/' + repoId + '/cancel-index', { method: 'POST' });
+          await pollIndexStatus();
+        } catch (_) {}
+        btn.disabled = false;
         return;
       }
       btn.disabled = true;
@@ -2166,25 +2244,83 @@ function watchIndexingThenReload() {
 // ─── Init ─────────────────────────────────────────────────────────────────
 loadConfig();
 startIndexPolling();
+checkDefenderStatus();
+
+// ─── Windows Defender exclusion check ────────────────────────────────────
+// Backend is the single source of truth: a durable marker file written by the
+// elevated add-exclusions process drives `data_dir_excluded`/`process_excluded`.
+// We only keep a session "dismissed" flag client-side; we deliberately do NOT
+// cache an "excluded" flag here (that dual source of truth caused a stuck banner).
+
+async function checkDefenderStatus() {
+  if (sessionStorage.getItem('defender-dismissed')) return;
+  try {
+    const r = await fetch('/api/defender-status');
+    if (!r.ok) return;
+    const s = await r.json();
+    if (!s.applicable) return;
+    if (s.data_dir_excluded && s.process_excluded) return;
+    document.getElementById('banner-defender').classList.remove('hidden');
+    // Always render the default actionable state — the "Failed — retry" text is
+    // transient (set only by a click handler) and must never survive a reload.
+    const btn = document.getElementById('btn-defender-fix');
+    btn.textContent = 'Add exclusion';
+    btn.disabled = false;
+  } catch (_) {}
+}
+
+document.getElementById('btn-defender-fix').addEventListener('click', async () => {
+  const btn = document.getElementById('btn-defender-fix');
+  btn.disabled = true;
+  btn.textContent = 'Adding…';
+  try {
+    const r = await fetch('/api/defender-exclude', { method: 'POST' });
+    const data = await r.json();
+    if (data.success) {
+      document.getElementById('banner-defender').classList.add('hidden');
+      showToast();
+    } else {
+      btn.textContent = 'Failed — retry';
+      btn.disabled = false;
+    }
+  } catch (_) {
+    btn.textContent = 'Failed — retry';
+    btn.disabled = false;
+  }
+});
+
+document.getElementById('btn-defender-dismiss').addEventListener('click', () => {
+  document.getElementById('banner-defender').classList.add('hidden');
+  sessionStorage.setItem('defender-dismissed', '1');
+});
 
 // Close remove dropdowns on outside click.
 document.addEventListener('click', () => {
   document.querySelectorAll('.remove-dropdown').forEach(d => d.classList.add('hidden'));
 });
 
-// Index All button.
+// Index All / Cancel All button.
 document.getElementById('btn-index-all').addEventListener('click', async () => {
   const btn = document.getElementById('btn-index-all');
+  const anyIndexing = Object.values(indexStatuses).some(s => s.state === 'indexing');
   btn.disabled = true;
-  btn.textContent = 'Indexing…';
-  try {
-    await fetch('/api/index-all', { method: 'POST' });
-    await pollIndexStatus();
-  } catch (e) {
-    /* ignore */
+  if (anyIndexing) {
+    btn.textContent = 'Cancelling…';
+    const repos = Object.entries(indexStatuses)
+      .filter(([, s]) => s.state === 'indexing')
+      .map(([repo]) => repo);
+    await Promise.all(repos.map(repo =>
+      fetch('/api/repos/' + encodeRepoId(repo) + '/cancel-index', { method: 'POST' }).catch(() => {})
+    ));
+  } else {
+    btn.textContent = 'Indexing…';
+    try {
+      await fetch('/api/index-all', { method: 'POST' });
+    } catch (_) {}
   }
+  await pollIndexStatus();
   btn.disabled = false;
-  btn.textContent = 'Index All';
+  updateIndexAllButton();
 });
 
 // ─── Index Progress Modal + SSE ──────────────────────────────────────────
@@ -2221,6 +2357,9 @@ function openIndexModal(repo) {
   terminal.innerHTML = '';
   document.getElementById('index-stat-active-calls').textContent = 'Embed: —';
   document.getElementById('index-stat-progress').textContent = 'Progress: —';
+  const cancelBtn = document.getElementById('btn-cancel-index-modal');
+  const s = indexStatuses[repo];
+  cancelBtn.classList.toggle('hidden', !(s && s.state === 'indexing'));
   connectIndexSSE(repo);
 }
 
@@ -2241,6 +2380,18 @@ function closeIndexModal() {
 }
 
 document.getElementById('btn-close-index-modal').addEventListener('click', closeIndexModal);
+document.getElementById('btn-cancel-index-modal').addEventListener('click', async () => {
+  if (!indexModalRepo) return;
+  const btn = document.getElementById('btn-cancel-index-modal');
+  btn.disabled = true;
+  btn.textContent = 'Cancelling…';
+  try {
+    await fetch('/api/repos/' + encodeRepoId(indexModalRepo) + '/cancel-index', { method: 'POST' });
+    await pollIndexStatus();
+  } catch (_) {}
+  btn.disabled = false;
+  btn.textContent = 'Cancel';
+});
 document.getElementById('modal-index-progress').addEventListener('click', (e) => {
   if (e.target === e.currentTarget) closeIndexModal();
 });
@@ -2316,10 +2467,18 @@ function handleIndexEvent(event) {
     case 'completed':
       line = `<span class="text-blue-400">[${ts}]</span> <span class="text-green-500 font-bold">Completed</span> — ${event.indexed_files} files indexed in ${formatDuration(event.elapsed_ms)}`;
       indexPendingProgress = 'Done: ' + event.indexed_files + ' / ' + event.total_files;
+      document.getElementById('btn-cancel-index-modal').classList.add('hidden');
       break;
 
     case 'failed':
       line = `<span class="text-blue-400">[${ts}]</span> <span class="text-red-500 font-bold">Failed</span>: ${escHtml(event.error)}`;
+      document.getElementById('btn-cancel-index-modal').classList.add('hidden');
+      break;
+
+    case 'cancelled':
+      line = `<span class="text-blue-400">[${ts}]</span> <span class="text-yellow-500 font-bold">Cancelled</span> by user`;
+      indexPendingProgress = 'Cancelled';
+      document.getElementById('btn-cancel-index-modal').classList.add('hidden');
       break;
 
     default:

@@ -174,7 +174,7 @@ async fn repro_full_rebuild_notepad_ade_fresh_db() {
     let pipeline = IndexPipeline::new(repo.clone(), None);
 
     let start = Instant::now();
-    let res = pipeline.run(&db, None, true, None, None, None, &[]).await;
+    let res = pipeline.run(&db, None, true, None, None, None, &[], None).await;
     let wall = start.elapsed();
 
     match res {
@@ -423,7 +423,7 @@ async fn repro_full_rebuild_notepad_ade_warm_cache() {
     let pipeline = IndexPipeline::new_with_concurrency(repo.clone(), None, 4, Some(cache));
 
     let start = Instant::now();
-    let res = pipeline.run(&db, None, true, None, None, None, &[]).await;
+    let res = pipeline.run(&db, None, true, None, None, None, &[], None).await;
     let wall = start.elapsed();
 
     match res {

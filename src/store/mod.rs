@@ -3,12 +3,12 @@ pub mod schema;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 
 use anyhow::{Context, Result};
 use surrealdb::Surreal;
 use surrealdb::engine::local::{Db, RocksDb};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tracing::{info, warn};
 
 use crate::store::schema::SCHEMA_DDL;
@@ -103,7 +103,7 @@ pub async fn open_db(home_dir: &Path, repo_path: &str) -> Result<Surreal<Db>> {
 ///
 /// If both migrations are needed, they run in a single chained task so v1→v2
 /// always completes before v2→v3 starts.
-pub fn maybe_spawn_migration(db: Surreal<Db>, stored_version: u32) {
+pub fn maybe_spawn_migration(repo_dbs: RepoDbMap, repo: String, stored_version: u32) {
     if stored_version >= DB_SCHEMA_VERSION {
         return;
     }
@@ -111,7 +111,15 @@ pub fn maybe_spawn_migration(db: Surreal<Db>, stored_version: u32) {
     // Run all needed migrations in one chained task so each completes before the
     // next starts. A failed step aborts the chain via `?` (the version stamp is only
     // written on success, so the next open retries from the same point).
+    //
+    // The handle is acquired from the shared map rather than held as an owned clone
+    // so that `close_repo_db` (which removes the entry) causes the migration to
+    // abort gracefully instead of keeping the RocksDB lock alive indefinitely.
     tokio::spawn(async move {
+        let db = match repo_dbs.read().await.get(&repo) {
+            Some(db) => db.clone(),
+            None => return, // repo was removed before migration started
+        };
         let result: Result<()> = async {
             if stored_version < 2 {
                 run_migration_v1_to_v2(&db).await.context("v1→v2")?;
@@ -442,26 +450,91 @@ pub async fn run_migration_v3_to_v4(db: &Surreal<Db>) -> Result<()> {
 
 /// Return the shared `Surreal<Db>` handle for `repo`, opening and caching it on
 /// first use. Spawns background migration if stored schema version < current.
+/// Per-repo open gate. RocksDB takes an EXCLUSIVE per-directory lock, so two
+/// concurrent `open_db` calls on the same path race: the loser fails on the
+/// `LOCK` file with "open surrealdb". The plain read-then-write double-check in
+/// `get_or_open` only dedupes the *insert* — both callers can still pass the
+/// read miss and call `open_db` simultaneously (e.g. the indexer's first warm
+/// racing a browse request's first DB access). This gate serializes the
+/// open critical section *per repo* so exactly one `open_db` runs per path; the
+/// loser waits, then re-checks the cache and gets the winner's handle. Distinct
+/// repos still open concurrently (one gate each). The map only ever grows by one
+/// tiny `Arc<Mutex<()>>` per distinct repo — bounded by repo count, not repo size.
+static OPEN_GATES: LazyLock<StdMutex<HashMap<String, Arc<Mutex<()>>>>> =
+    LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+fn open_gate(repo: &str) -> Arc<Mutex<()>> {
+    let mut gates = OPEN_GATES.lock().unwrap();
+    gates
+        .entry(repo.to_string())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
+}
+
 pub async fn get_or_open(
     repo_dbs: &RepoDbMap,
     home_dir: &Path,
     repo: &str,
 ) -> Result<Surreal<Db>> {
+    // Fast path: already cached.
     if let Some(db) = repo_dbs.read().await.get(repo) {
         return Ok(db.clone());
     }
+
+    // Slow path: serialize the open per repo so concurrent first-opens can't both
+    // call `open_db` and collide on RocksDB's exclusive directory lock. The gate
+    // is acquired BEFORE any repo_dbs lock is held (the read guard above is already
+    // dropped), so the global lock order (repo_dbs → vector_index) is preserved.
+    let gate = open_gate(repo);
+    let _open_guard = gate.lock().await;
+
+    // Re-check under the gate: a previous holder may have just opened it.
+    if let Some(db) = repo_dbs.read().await.get(repo) {
+        return Ok(db.clone());
+    }
+
     let db = open_db(home_dir, repo).await?;
 
     // Check schema version and spawn migration if needed (non-blocking).
     let stored_version = read_db_schema_version(&db).await;
-    maybe_spawn_migration(db.clone(), stored_version);
 
     let mut map = repo_dbs.write().await;
+    // Final double-check (defensive; the gate already guarantees uniqueness).
     if let Some(existing) = map.get(repo) {
         return Ok(existing.clone());
     }
     map.insert(repo.to_string(), db.clone());
+    drop(map);
+
+    // Spawn migration AFTER the handle is in the map so the migration task can
+    // acquire it from the shared map (not hold an owned clone).
+    maybe_spawn_migration(repo_dbs.clone(), repo.to_string(), stored_version);
+
     Ok(db)
+}
+
+/// Like [`get_or_open`], but returns `Ok(None)` when the repo has **no index on
+/// disk yet** instead of creating one.
+///
+/// `open_db` calls `create_dir_all`, so a bare `get_or_open` on a never-indexed
+/// repo materializes an empty RocksDB directory purely as a side effect of a
+/// read — and can race the indexer's first open. Read-only browse endpoints use
+/// this guard so an unindexed repo reads as "not indexed" (empty state) rather
+/// than erroring or leaving a phantom DB behind. Once a repo has been indexed
+/// (or is mid-indexing) the directory exists and this behaves like `get_or_open`.
+pub async fn open_if_indexed(
+    repo_dbs: &RepoDbMap,
+    home_dir: &Path,
+    repo: &str,
+) -> Result<Option<Surreal<Db>>> {
+    // A cached handle means it's open regardless of the on-disk check below.
+    if let Some(db) = repo_dbs.read().await.get(repo) {
+        return Ok(Some(db.clone()));
+    }
+    if !db_path(home_dir, repo).exists() {
+        return Ok(None);
+    }
+    get_or_open(repo_dbs, home_dir, repo).await.map(Some)
 }
 
 
@@ -522,6 +595,68 @@ mod isolation_repro {
             1,
             "shared handle must see writes made through the same cached instance"
         );
+    }
+}
+
+#[cfg(test)]
+mod open_concurrency {
+    use super::*;
+    use tempfile::TempDir;
+
+    /// Regression: N concurrent first-opens on the SAME repo must NOT race on
+    /// RocksDB's exclusive directory lock. Before the per-repo open gate, two
+    /// callers could both miss the read-cache, both call `open_db`, and the loser
+    /// failed with "open surrealdb" (the symptom behind the "Failed to load files:
+    /// failed to open index DB" UI error). With the gate, exactly one `open_db`
+    /// runs and every caller gets the same handle.
+    #[tokio::test]
+    async fn concurrent_first_opens_do_not_race() {
+        let home = TempDir::new().unwrap();
+        let repo = "/proj/repo_concurrent".to_string();
+        let map: RepoDbMap = Arc::new(RwLock::new(HashMap::new()));
+
+        // Fan out many simultaneous first-opens.
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let map = map.clone();
+            let home = home.path().to_path_buf();
+            let repo = repo.clone();
+            handles.push(tokio::spawn(async move {
+                get_or_open(&map, &home, &repo).await.map(|_| ())
+            }));
+        }
+        for h in handles {
+            h.await.unwrap().expect("every concurrent open must succeed (no lock race)");
+        }
+
+        // Exactly one handle ended up cached.
+        assert_eq!(map.read().await.len(), 1, "exactly one cached handle per repo");
+    }
+
+    /// `open_if_indexed` returns None for a never-indexed repo (no DB directory on
+    /// disk) and does NOT create one as a side effect — so a read-only browse of an
+    /// unindexed repo reads as "not indexed" rather than erroring or leaving a
+    /// phantom DB behind. After a real open the directory exists and it returns Some.
+    #[tokio::test]
+    async fn open_if_indexed_skips_unindexed_repo() {
+        let home = TempDir::new().unwrap();
+        let repo = "/proj/repo_never_indexed";
+        let map: RepoDbMap = Arc::new(RwLock::new(HashMap::new()));
+
+        // Never indexed → None, and no directory materialized.
+        let res = open_if_indexed(&map, home.path(), repo).await.expect("ok");
+        assert!(res.is_none(), "unindexed repo must return None");
+        assert!(
+            !db_path(home.path(), repo).exists(),
+            "open_if_indexed must NOT create the DB directory for an unindexed repo"
+        );
+        assert_eq!(map.read().await.len(), 0, "no handle cached for an unindexed repo");
+
+        // After a real open, the directory exists → Some, and the handle is shared.
+        let _opened = get_or_open(&map, home.path(), repo).await.expect("open");
+        assert!(db_path(home.path(), repo).exists());
+        let res2 = open_if_indexed(&map, home.path(), repo).await.expect("ok");
+        assert!(res2.is_some(), "indexed repo must return Some");
     }
 }
 

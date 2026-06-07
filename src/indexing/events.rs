@@ -59,6 +59,8 @@ pub enum IndexEvent {
     },
     /// Indexing failed.
     Failed { repo: String, error: String },
+    /// Indexing was cancelled by the user.
+    Cancelled { repo: String },
 }
 
 /// Shared event broadcaster for indexing progress.
