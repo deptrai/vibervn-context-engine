@@ -2,6 +2,8 @@
 
 [English](README.md) · **Tiếng Việt** · [中文](README-zh.md)
 
+![Web UI](screenshot.png)
+
 ## Cài đặt & Chạy
 
 Chạy bản phát hành mới nhất trực tiếp bằng npx — không cần tải thủ công, npx

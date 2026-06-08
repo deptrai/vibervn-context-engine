@@ -2,6 +2,8 @@
 
 **English** · [Tiếng Việt](README-vi.md) · [中文](README-zh.md)
 
+![Web UI](screenshot.png)
+
 ## Install & Run
 
 Run the latest release directly with npx — no manual download, the correct

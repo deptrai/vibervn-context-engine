@@ -855,15 +855,28 @@ async fn post_file_retrieval(
 
 // ─── Per-repo MCP endpoint ──────────────────────────────────────────────
 
-/// ANY /mcp-repo/:repo_id — per-repo MCP endpoint (no workspace_full_path needed).
+/// ANY /mcp-repo/:repo_name — per-repo MCP endpoint (no workspace_full_path needed).
+/// `repo_name` is the sanitized repo name (e.g. `D__projects_Python_foo`).
 async fn handle_repo_mcp(
     State(state): State<AppState>,
-    Path(repo_id): Path<String>,
+    Path(repo_name): Path<String>,
     req: Request,
 ) -> Response {
-    let repo = match decode_repo_id(&repo_id) {
-        Ok(r) => r,
-        Err(r) => return r,
+    // Resolve sanitized name back to the full repo path.
+    let settings = state.settings.read().await;
+    let repo = settings
+        .repos
+        .iter()
+        .find(|r| store::sanitize_repo_name(r) == repo_name)
+        .cloned();
+    drop(settings);
+
+    let repo = match repo {
+        Some(r) => r,
+        None => {
+            let body = json!({ "error": format!("unknown repo: {}", repo_name) });
+            return (StatusCode::NOT_FOUND, Json(body)).into_response();
+        }
     };
 
     // Get or create the per-repo MCP service.

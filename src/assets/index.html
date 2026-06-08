@@ -1246,6 +1246,17 @@ function encodeRepoId(path) {
   return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
 }
 
+// Mirrors Rust store::sanitize_repo_name — non-alphanumeric → '_', trim '_', last 64 chars.
+function sanitizeRepoName(path) {
+  let s = '';
+  for (let i = 0; i < path.length; i++) {
+    const c = path[i];
+    s += /[a-zA-Z0-9]/.test(c) ? c : '_';
+  }
+  s = s.replace(/^_+|_+$/g, '');
+  return s.length > 64 ? s.slice(s.length - 64) : s;
+}
+
 // ─── Index status polling ─────────────────────────────────────────────────
 
 // Re-sync only cfg.repos from disk config (cheap; preserves Settings inputs).
@@ -2128,8 +2139,8 @@ SUBTABS.forEach((t, i) => {
 function initRepoMcpTab() {
   if (!currentSearchRepo) return;
   const origin = window.location.origin;
-  const repoId = encodeRepoId(currentSearchRepo);
-  const endpointUrl = origin + '/mcp-repo/' + repoId;
+  const repoName = sanitizeRepoName(currentSearchRepo);
+  const endpointUrl = origin + '/mcp-repo/' + repoName;
   const cmd = 'claude mcp add --scope project --transport http codebase-retrieval ' + endpointUrl;
   document.getElementById('repo-mcp-endpoint-url').textContent = endpointUrl;
   document.getElementById('repo-claude-cmd').textContent = cmd;

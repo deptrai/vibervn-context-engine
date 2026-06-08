@@ -2,6 +2,8 @@
 
 [English](README.md) · [Tiếng Việt](README-vi.md) · **中文**
 
+![Web UI](screenshot.png)
+
 ## 安装与运行
 
 通过 npx 直接运行最新发布版 —— 无需手动下载，npx 会自动获取适合你平台的预编译
