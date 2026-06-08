@@ -1862,6 +1862,14 @@ fn parse_one_file(file: &str) -> ParseOutput {
         }
     };
 
+    if source.contains('\0') {
+        debug!(file = %file, "skipping binary file (contains null byte)");
+        return ParseOutput::Skipped {
+            file: file.to_string(),
+            reason: "binary file (contains null byte)".to_string(),
+        };
+    }
+
     let (mtime, size) = match stat_file(file) {
         Some(s) => (s.mtime, s.size),
         None => {
@@ -4090,6 +4098,40 @@ mod ram_path_fqn_tests {
             Some("/b.cpp::Bar::callee"),
             "out_name must be the full FQN, not the leaf name 'callee'"
         );
+    }
+}
+
+#[cfg(test)]
+mod null_byte_skip_tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    #[test]
+    fn file_with_null_byte_is_skipped() {
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(b"hello\x00world").unwrap();
+        f.flush().unwrap();
+        let path = f.path().to_str().unwrap();
+
+        let output = parse_one_file(path);
+        match output {
+            ParseOutput::Skipped { reason, .. } => {
+                assert!(reason.contains("null byte"), "reason: {reason}");
+            }
+            ParseOutput::Parsed(_) => panic!("expected Skipped for file with null byte"),
+        }
+    }
+
+    #[test]
+    fn file_without_null_byte_is_parsed() {
+        let mut f = NamedTempFile::with_suffix(".rs").unwrap();
+        f.write_all(b"fn main() {}").unwrap();
+        f.flush().unwrap();
+        let path = f.path().to_str().unwrap();
+
+        let output = parse_one_file(path);
+        assert!(matches!(output, ParseOutput::Parsed(_)));
     }
 }
 
