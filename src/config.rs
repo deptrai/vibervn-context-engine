@@ -180,6 +180,13 @@ pub struct LlmConfig {
     /// stops. 0 disables the cap. Defaults to 50000.
     #[serde(default = "default_agentic_rag_max_chunk_chars")]
     pub agentic_rag_max_chunk_chars: u32,
+    /// Custom OpenAI-compatible endpoint (Ollama, LM Studio, OpenRouter, Azure,
+    /// vLLM, etc.). Honored only when `provider == "openai"`. `None` / blank →
+    /// the OpenAI client falls back to `https://api.openai.com/v1/chat/completions`.
+    /// Accepts either the base form (`…/v1`) or the full `…/v1/chat/completions`
+    /// URL — normalization is centralized in `llm::openai::chat_url`.
+    #[serde(default)]
+    pub openai_base_url: Option<String>,
 }
 
 impl Default for LlmConfig {
@@ -193,6 +200,7 @@ impl Default for LlmConfig {
             agentic_rag: false,
             agentic_rag_max_turns: default_agentic_rag_max_turns(),
             agentic_rag_max_chunk_chars: default_agentic_rag_max_chunk_chars(),
+            openai_base_url: None,
         }
     }
 }
@@ -804,5 +812,48 @@ mod tests {
         assert!(!cfg.agentic_rag);
         assert_eq!(cfg.agentic_rag_max_turns, 9);
         assert_eq!(cfg.agentic_rag_max_chunk_chars, 50_000);
+    }
+
+    /// Backward-compat for `openai_base_url`: an existing settings.json whose
+    /// `llm` block predates the field must deserialize cleanly with the field
+    /// defaulted to `None`. Mirrors `test_v6_missing_agentic_rag_fields_default_cleanly`.
+    /// No version bump was needed (additive `Option<String>` with serde default),
+    /// so this test pins that the additive contract still holds.
+    #[test]
+    fn test_llm_config_deserializes_without_openai_base_url() {
+        let json = r#"{"provider":"openai","rerank_model":"gpt-4o-mini","api_keys":["k"]}"#;
+        let cfg: LlmConfig = serde_json::from_str(json).expect("deserialize old llm block");
+        assert!(cfg.openai_base_url.is_none(), "openai_base_url must default to None on old files");
+    }
+
+    /// Round-trip: an explicit `openai_base_url` survives serialize → atomic
+    /// write → migration-aware reload. Uses the same write/load path as the
+    /// running server so we exercise the real persistence logic, not just
+    /// `serde_json::from_str`.
+    #[test]
+    fn test_llm_config_round_trips_openai_base_url() {
+        let home = TempDir::new().expect("tempdir");
+        let path = config_path(home.path());
+        fs::create_dir_all(path.parent().expect("has parent")).expect("create dirs");
+
+        let s = Settings {
+            llm: LlmConfig {
+                provider: "openai".to_owned(),
+                rerank_model: "gpt-4o-mini".to_owned(),
+                api_keys: vec!["k".to_owned()],
+                openai_base_url: Some("http://localhost:11434/v1".to_owned()),
+                ..LlmConfig::default()
+            },
+            ..Settings::default()
+        };
+        write_settings_atomic(&path, &s).expect("write");
+
+        let loaded = ensure_dir_and_load(home.path()).expect("load");
+        assert_eq!(
+            loaded.llm.openai_base_url.as_deref(),
+            Some("http://localhost:11434/v1"),
+            "openai_base_url must round-trip through write+load"
+        );
+        assert_eq!(loaded.version, CURRENT_VERSION);
     }
 }

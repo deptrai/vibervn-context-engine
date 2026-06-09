@@ -104,6 +104,38 @@ struct OpenAIError {
 
 // ─── Public API ──────────────────────────────────────────────────────────
 
+/// Default OpenAI chat-completions URL (used when `base_url` is unset or blank).
+const DEFAULT_OPENAI_URL: &str = "https://api.openai.com/v1/chat/completions";
+
+/// Resolve the chat-completions URL from an optional user-supplied base.
+///
+/// Normalization rules (single source of truth — both `complete()` and
+/// `complete_with_tools()` go through this helper):
+///   * `None`, empty, or whitespace-only → `DEFAULT_OPENAI_URL`.
+///   * Trim whitespace, then strip a trailing `/`.
+///   * If the path already ends in `/chat/completions`, keep it as-is.
+///   * Otherwise append `/chat/completions`.
+///
+/// This means users can paste either the base form (`http://localhost:11434/v1`)
+/// or the full form (`http://localhost:11434/v1/chat/completions`) and either
+/// works — they hit the same endpoint with no double `/chat/completions`
+/// appended and no double slashes.
+fn chat_url(base: Option<&str>) -> String {
+    let raw = match base {
+        Some(s) => s.trim(),
+        None => "",
+    };
+    if raw.is_empty() {
+        return DEFAULT_OPENAI_URL.to_owned();
+    }
+    let trimmed = raw.trim_end_matches('/');
+    if trimmed.ends_with("/chat/completions") {
+        trimmed.to_owned()
+    } else {
+        format!("{trimmed}/chat/completions")
+    }
+}
+
 fn log_cache_metrics(usage: &Option<Usage>) {
     if let Some(u) = usage {
         let prompt = u.prompt_tokens.unwrap_or(0);
@@ -134,6 +166,7 @@ fn ensure_json_token(structured: bool, system: &str, user: &str) -> String {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn complete(
     http: &Client,
     model: &str,
@@ -142,8 +175,9 @@ pub async fn complete(
     user: &str,
     temperature: f32,
     structured: bool,
+    base_url: Option<&str>,
 ) -> Result<String> {
-    let url = "https://api.openai.com/v1/chat/completions";
+    let url = chat_url(base_url);
 
     let system_owned = ensure_json_token(structured, system, user);
 
@@ -161,7 +195,7 @@ pub async fn complete(
     };
 
     let resp = http
-        .post(url)
+        .post(&url)
         .header("Authorization", format!("Bearer {api_key}"))
         .json(&body)
         .send()
@@ -212,8 +246,9 @@ pub async fn complete_with_tools(
     temperature: f32,
     force_tool_use: bool,
     prompt_cache_key: Option<&str>,
+    base_url: Option<&str>,
 ) -> Result<ToolTurnResult> {
-    let url = "https://api.openai.com/v1/chat/completions";
+    let url = chat_url(base_url);
 
     let mut messages: Vec<Message> = Vec::with_capacity(contents.len() + 1);
     messages.push(Message::Standard { role: "system".to_owned(), content: system.to_owned() });
@@ -266,13 +301,19 @@ pub async fn complete_with_tools(
         response_format: None,
         tools: Some(openai_tools),
         // "required" forces a tool call while no chunk is committed; otherwise
-        // omit (model may finish with a text summary).
-        tool_choice: force_tool_use.then(|| "required".to_owned()),
+        // omit (model may finish with a text summary). Non-official endpoints
+        // (custom base_url) often only support "auto"/"none", so downgrade.
+        tool_choice: if force_tool_use {
+            let is_custom = base_url.is_some_and(|u| !u.trim().is_empty());
+            Some(if is_custom { "auto".to_owned() } else { "required".to_owned() })
+        } else {
+            None
+        },
         prompt_cache_key: prompt_cache_key.map(|s| s.to_owned()),
     };
 
     let resp = http
-        .post(url)
+        .post(&url)
         .header("Authorization", format!("Bearer {api_key}"))
         .json(&body)
         .send()
@@ -411,5 +452,58 @@ mod tests {
         };
         let json = serde_json::to_value(&body).expect("serialize");
         assert!(json.get("prompt_cache_key").is_none());
+    }
+
+    // ─── chat_url normalization ──────────────────────────────────────────
+
+    #[test]
+    fn chat_url_default_when_none() {
+        assert_eq!(chat_url(None), DEFAULT_OPENAI_URL);
+    }
+
+    #[test]
+    fn chat_url_default_when_blank() {
+        assert_eq!(chat_url(Some("")), DEFAULT_OPENAI_URL);
+        assert_eq!(chat_url(Some("   ")), DEFAULT_OPENAI_URL);
+        assert_eq!(chat_url(Some("\t\n")), DEFAULT_OPENAI_URL);
+    }
+
+    #[test]
+    fn chat_url_appends_to_base() {
+        assert_eq!(
+            chat_url(Some("http://localhost:11434/v1")),
+            "http://localhost:11434/v1/chat/completions"
+        );
+        assert_eq!(
+            chat_url(Some("https://openrouter.ai/api/v1")),
+            "https://openrouter.ai/api/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn chat_url_strips_trailing_slash() {
+        // Trailing slash on the base form must not produce a double slash.
+        assert_eq!(
+            chat_url(Some("http://localhost:11434/v1/")),
+            "http://localhost:11434/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn chat_url_accepts_full_form() {
+        // User pastes the full URL — return it unchanged (no double append).
+        assert_eq!(
+            chat_url(Some("http://localhost:11434/v1/chat/completions")),
+            "http://localhost:11434/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn chat_url_accepts_full_form_trailing_slash() {
+        // Full URL with a trailing slash is also a no-op (after strip).
+        assert_eq!(
+            chat_url(Some("http://localhost:11434/v1/chat/completions/")),
+            "http://localhost:11434/v1/chat/completions"
+        );
     }
 }

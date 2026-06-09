@@ -318,7 +318,20 @@
                   class="border border-gray-200 dark:border-wiki-border bg-white dark:bg-wiki-surface text-gray-900 dark:text-wiki-text rounded px-3 py-2 text-sm
                          focus:outline-none focus:ring-2 focus:ring-blue-400 focus:border-blue-400 dark:focus:border-wiki-border-active">
             <option value="google">Google</option>
+            <option value="openai">OpenAI</option>
           </select>
+        </div>
+        <div id="llm-openai-base-url-wrapper" class="mb-4 hidden">
+          <label data-i18n="llm.openaiBaseUrl" class="block text-xs font-medium text-gray-500 dark:text-wiki-text-muted mb-1" for="llm-openai-base-url">
+            OpenAI Base URL
+          </label>
+          <input id="llm-openai-base-url" type="text" placeholder="https://api.openai.com/v1" data-i18n-ph="llm.openaiBaseUrlPlaceholder"
+                 class="w-full border border-gray-200 dark:border-wiki-border bg-white dark:bg-wiki-surface text-gray-900 dark:text-wiki-text rounded px-3 py-2 text-sm font-mono
+                        placeholder:text-gray-400 dark:placeholder:text-wiki-text-muted
+                        focus:outline-none focus:ring-2 focus:ring-blue-400 focus:border-blue-400 dark:focus:border-wiki-border-active" />
+          <p data-i18n="llm.openaiBaseUrlHelp" class="mt-1 text-xs text-gray-400 dark:text-wiki-text-muted">
+            Custom OpenAI-compatible endpoint (Ollama, LM Studio, OpenRouter, Azure, vLLM, etc.). Leave blank to use api.openai.com. Accepts either the base form (…/v1) or the full /chat/completions URL.
+          </p>
         </div>
         <div class="mb-4">
           <label data-i18n="llm.rerankModel" class="block text-xs font-medium text-gray-500 dark:text-wiki-text-muted mb-1" for="llm-rerank-model">
@@ -1118,6 +1131,11 @@ const STR = {
   'llm.maxChunkCharsHelp': { en: `Character budget for added chunks. The agent stops once added chunk content reaches this. 0 disables the limit.`,
                          vi: `Character budget cho chunks đã add. Agent dừng khi nội dung chunks đã add đạt mức này. 0 để tắt giới hạn.`,
                          zh: `已添加 chunk 的字符预算。当已添加的 chunk 内容达到此值时代理停止。设为 0 可禁用此限制。` },
+  'llm.openaiBaseUrl': { en: `OpenAI Base URL`, vi: `OpenAI Base URL`, zh: `OpenAI Base URL` },
+  'llm.openaiBaseUrlHelp': { en: `Custom OpenAI-compatible endpoint (Ollama, LM Studio, OpenRouter, Azure, vLLM, etc.). Leave blank to use api.openai.com. Accepts either the base form (…/v1) or the full /chat/completions URL.`,
+                         vi: `Endpoint OpenAI-compatible tùy chỉnh (Ollama, LM Studio, OpenRouter, Azure, vLLM, v.v.). Để trống để dùng api.openai.com. Chấp nhận dạng base (…/v1) hoặc URL /chat/completions đầy đủ.`,
+                         zh: `自定义 OpenAI 兼容 endpoint（Ollama、LM Studio、OpenRouter、Azure、vLLM 等）。留空则使用 api.openai.com。可填 base 形式 (…/v1) 或完整的 /chat/completions URL。` },
+  'llm.openaiBaseUrlPlaceholder': { en: `https://api.openai.com/v1`, vi: `https://api.openai.com/v1`, zh: `https://api.openai.com/v1` },
   'settings.setupHint':{ en: `Add an embedding API key below to start indexing repositories.`, vi: `Thêm embedding API key bên dưới để bắt đầu index repo.`, zh: `在下方添加嵌入 API 密钥即可开始索引仓库。` },
   'settings.mcpTools': { en: `MCP Tools`, vi: `MCP Tools`, zh: `MCP 工具` },
   'settings.mcpToolsHelp': { en: `Choose which MCP tools are exposed to clients. Disabled tools are hidden from tool lists.`, vi: `Chọn MCP tool nào được expose cho client. Tool bị tắt sẽ ẩn khỏi danh sách tool.`, zh: `选择向客户端公开哪些 MCP 工具。禁用的工具将从工具列表中隐藏。` },
@@ -1704,6 +1722,8 @@ function renderAll() {
   document.getElementById('llm-agentic-max-chunk-chars').value = cfg.llm.agentic_rag_max_chunk_chars ?? 50000;
   document.getElementById('llm-agentic-max-turns-wrapper').classList.toggle('hidden', !(cfg.llm.agentic_rag ?? false));
   document.getElementById('llm-agentic-max-chunk-chars-wrapper').classList.toggle('hidden', !(cfg.llm.agentic_rag ?? false));
+  document.getElementById('llm-openai-base-url').value = cfg.llm.openai_base_url || '';
+  document.getElementById('llm-openai-base-url-wrapper').classList.toggle('hidden', (cfg.llm.provider || 'google') !== 'openai');
   renderKeyList('llm-keys-list', cfg.llm.api_keys, (idx) => {
     cfg.llm.api_keys.splice(idx, 1);
     renderAll();
@@ -1994,7 +2014,17 @@ document.getElementById('embedding-provider').addEventListener('change', (e) => 
   if (cfg) { cfg.embedding.provider = e.target.value; saveNow(); }
 });
 document.getElementById('llm-provider').addEventListener('change', (e) => {
-  if (cfg) { cfg.llm.provider = e.target.value; saveNow(); }
+  if (cfg) {
+    cfg.llm.provider = e.target.value;
+    document.getElementById('llm-openai-base-url-wrapper').classList.toggle('hidden', e.target.value !== 'openai');
+    saveNow();
+  }
+});
+document.getElementById('llm-openai-base-url').addEventListener('input', (e) => {
+  if (!cfg) return;
+  const v = e.target.value.trim();
+  cfg.llm.openai_base_url = v === '' ? null : v;
+  saveDebounced();
 });
 
 // ─── Embedding cache purge ─────────────────────────────────────────────────

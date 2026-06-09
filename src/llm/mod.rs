@@ -64,6 +64,11 @@ pub struct LlmClient {
     http: Client,
     key_cursor: std::sync::Arc<AtomicUsize>,
     use_structured_output: bool,
+    /// Custom OpenAI-compatible endpoint. Honored only when `provider ==
+    /// "openai"`; ignored for other providers. `None` / blank → the OpenAI
+    /// client falls back to `api.openai.com`. Normalization (base form vs
+    /// full URL) happens centrally in `openai::chat_url`.
+    openai_base_url: Option<String>,
 }
 
 /// Whether `provider` has a native JSON output mode the reranker can request.
@@ -88,6 +93,7 @@ impl LlmClient {
             http,
             key_cursor: std::sync::Arc::new(AtomicUsize::new(0)),
             use_structured_output: config.use_structured_output,
+            openai_base_url: config.openai_base_url.clone(),
         })
     }
 
@@ -112,7 +118,7 @@ impl LlmClient {
     async fn call_provider(&self, system: &str, user: &str, temperature: f32, structured: bool, key: &str) -> Result<String> {
         match self.provider.as_str() {
             "google" => google::complete(&self.http, &self.model, key, system, user, temperature, structured).await,
-            "openai" => openai::complete(&self.http, &self.model, key, system, user, temperature, structured).await,
+            "openai" => openai::complete(&self.http, &self.model, key, system, user, temperature, structured, self.openai_base_url.as_deref()).await,
             other => bail!("unsupported LLM provider: {other}"),
         }
     }
@@ -184,7 +190,7 @@ impl LlmClient {
                 }
             }
             "openai" => {
-                let r = openai::complete_with_tools(&self.http, &self.model, key, system, contents, tools, temperature, force_tool_use, prompt_cache_key).await?;
+                let r = openai::complete_with_tools(&self.http, &self.model, key, system, contents, tools, temperature, force_tool_use, prompt_cache_key, self.openai_base_url.as_deref()).await?;
                 match r {
                     openai::ToolTurnResult::Text(t) => Ok(ToolTurnResult::Text(t)),
                     openai::ToolTurnResult::ToolCalls(calls) => Ok(ToolTurnResult::ToolCalls(

@@ -78,9 +78,49 @@ pub async fn open_db(data_dir: &Path, repo_path: &str) -> Result<Surreal<Db>> {
     let path = db_path(data_dir, repo_path);
     std::fs::create_dir_all(&path).with_context(|| format!("create db dir {:?}", path))?;
 
-    let db = Surreal::new::<RocksDb>(path.to_str().unwrap())
-        .await
-        .context("open surrealdb")?;
+    // Retry the RocksDB datastore open: when this path was just released by a
+    // prior `Surreal<Db>` clone (e.g. close_repo_db → remove_index_dir gave up,
+    // then a queued re-index slipped through the gate), the previous
+    // datastore's background router can still hold the exclusive LOCK file for
+    // a meaningful window — Windows in particular delays releasing OS handles
+    // past the Rust drop, and with Defender real-time scanning of RocksDB files
+    // the drain on a freshly-indexed repo has been measured at 7s+. Budget ~30s
+    // total — long enough for a Windows+Defender drain after a rapid
+    // remove+rebuild, short enough that a genuinely corrupted directory still
+    // surfaces in a single user retry window.
+    let path_str = path.to_str().unwrap();
+    let mut last_err: Option<surrealdb::Error> = None;
+    let mut db_opt: Option<Surreal<Db>> = None;
+    for attempt in 0..20u32 {
+        match Surreal::new::<RocksDb>(path_str).await {
+            Ok(db) => {
+                db_opt = Some(db);
+                break;
+            }
+            Err(e) => {
+                last_err = Some(e);
+                // Log on first failure and every ~5s thereafter so the user
+                // sees progress during a long drain instead of a silent stall.
+                if attempt == 0 || attempt == 5 || attempt == 10 || attempt == 15 {
+                    info!(
+                        path = ?path,
+                        attempt,
+                        "open surrealdb failed; retrying — likely a stale LOCK from a draining prior handle"
+                    );
+                }
+                // 200ms, 400ms, … capped at 2s — summing to ~30s across 20 tries.
+                let backoff_ms = (200u64 * (attempt as u64 + 1)).min(2000);
+                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+            }
+        }
+    }
+    let db = match db_opt {
+        Some(db) => db,
+        None => {
+            return Err(anyhow::Error::new(last_err.expect("loop sets last_err on failure")))
+                .context("open surrealdb");
+        }
+    };
 
     db.use_ns("context_engine")
         .use_db(sanitize_repo_name(repo_path))
