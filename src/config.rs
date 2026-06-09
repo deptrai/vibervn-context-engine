@@ -144,7 +144,7 @@ fn default_use_structured_output() -> bool {
 }
 
 fn default_agentic_rag_max_turns() -> u32 {
-    3
+    9
 }
 
 fn default_agentic_rag_max_chunk_chars() -> u32 {
@@ -172,7 +172,7 @@ pub struct LlmConfig {
     pub agentic_rag: bool,
     /// Turn budget for the agentic loop, counted as the number of `query` tool
     /// calls. When the agent has issued this many queries, the loop stops.
-    /// Defaults to 3.
+    /// Defaults to 9.
     #[serde(default = "default_agentic_rag_max_turns")]
     pub agentic_rag_max_turns: u32,
     /// Character budget for accumulated chunk content in the agentic loop. Once

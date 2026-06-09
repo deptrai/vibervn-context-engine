@@ -292,7 +292,7 @@
           <label data-i18n="llm.maxTurns" class="block text-xs font-medium text-gray-500 dark:text-wiki-text-muted mb-1" for="llm-agentic-max-turns">
             Max turns
           </label>
-          <input id="llm-agentic-max-turns" type="number" min="1" max="10" step="1" placeholder="3"
+          <input id="llm-agentic-max-turns" type="number" min="1" max="20" step="1" placeholder="9"
                  class="w-full border border-gray-200 dark:border-wiki-border bg-white dark:bg-wiki-surface text-gray-900 dark:text-wiki-text rounded px-3 py-2 text-sm
                         placeholder:text-gray-400 dark:placeholder:text-wiki-text-muted
                         focus:outline-none focus:ring-2 focus:ring-blue-400 focus:border-blue-400 dark:focus:border-wiki-border-active" />
@@ -1700,7 +1700,7 @@ function renderAll() {
   document.getElementById('llm-min-prune-lines').value = cfg.llm.rerank_min_prune_lines ?? 16;
   document.getElementById('llm-use-structured-output').checked = cfg.llm.use_structured_output ?? true;
   document.getElementById('llm-agentic-rag').checked = cfg.llm.agentic_rag ?? false;
-  document.getElementById('llm-agentic-max-turns').value = cfg.llm.agentic_rag_max_turns ?? 3;
+  document.getElementById('llm-agentic-max-turns').value = cfg.llm.agentic_rag_max_turns ?? 9;
   document.getElementById('llm-agentic-max-chunk-chars').value = cfg.llm.agentic_rag_max_chunk_chars ?? 50000;
   document.getElementById('llm-agentic-max-turns-wrapper').classList.toggle('hidden', !(cfg.llm.agentic_rag ?? false));
   document.getElementById('llm-agentic-max-chunk-chars-wrapper').classList.toggle('hidden', !(cfg.llm.agentic_rag ?? false));
@@ -1970,7 +1970,7 @@ document.getElementById('llm-agentic-rag').addEventListener('change', (e) => {
 document.getElementById('llm-agentic-max-turns').addEventListener('input', (e) => {
   if (!cfg) return;
   const n = parseInt(e.target.value, 10);
-  cfg.llm.agentic_rag_max_turns = (Number.isInteger(n) && n >= 1) ? n : 3;
+  cfg.llm.agentic_rag_max_turns = (Number.isInteger(n) && n >= 1) ? n : 9;
   saveDebounced();
 });
 document.getElementById('llm-agentic-max-chunk-chars').addEventListener('input', (e) => {
