@@ -15,8 +15,8 @@ cache cũ:
 npx vibervn-context-engine@latest
 ```
 
-Lệnh này khởi động máy chủ HTTP ở cổng 6699 (giao diện web tại
-http://127.0.0.1:6699, endpoint MCP tại `/mcp`). Mọi cờ CLI đều được chuyển
+Lệnh này khởi động HTTP server ở cổng 6699 (Web UI tại
+http://127.0.0.1:6699, MCP endpoint tại `/mcp`). Mọi cờ CLI đều được chuyển
 tiếp tới binary:
 
 ```bash
@@ -36,22 +36,22 @@ Nền tảng được hỗ trợ: Linux x64/arm64, macOS arm64, Windows x64.
 
 | Tính năng | Mô tả |
 |-----------|-------|
-| Tìm kiếm mã ngữ nghĩa | Tìm mã theo ý nghĩa thông qua embedding, không khớp văn bản thuần |
-| Phân tích đa ngôn ngữ | Trích xuất ký hiệu bằng Tree-sitter cho Python, JavaScript, TypeScript, Rust, Go, Java, C và C++ |
-| Mở rộng đồ thị lời gọi | Phân giải cạnh caller/callee và mở rộng BFS các ký hiệu khớp khi truy vấn |
-| Lập chỉ mục tăng dần | Chỉ lập lại chỉ mục cho tệp đã thay đổi (mtime + watcher), an toàn khi sập nhờ marker commit theo từng tệp |
-| Theo dõi tệp thời gian thực | `notify` (chống dội) tự động kích hoạt lập lại chỉ mục khi tệp thay đổi |
-| Embedding Voyage AI | Client embedding qua HTTP có cache trên đĩa để tránh gọi API thừa |
-| Xếp hạng lại bằng LLM | Sắp xếp lại các đoạn ứng viên bằng LLM (OpenAI / Google); tùy chọn, có thể tắt |
-| SurrealDB nhúng | Lưu các đoạn, ký hiệu và cạnh; một kho dữ liệu cho mỗi repo |
-| HTTP API + Giao diện web | Quản lý cấu hình, trình khám phá chỉ mục và bảng điều khiển thử truy vấn |
-| Máy chủ MCP | Cung cấp một công cụ duy nhất `codebase-retrieval` qua HTTP streamable |
-| Luồng tiến trình SSE | Truyền sự kiện tiến trình lập chỉ mục trực tiếp tới giao diện |
-| Mở rộng repo lớn | Bộ nhớ có giới hạn và không có đường O(n²) — xây dựng cho codebase quy mô Linux/Chromium |
+| Semantic code search | Tìm mã theo ý nghĩa thông qua embedding, không khớp văn bản thuần |
+| Multi-language parsing | Extract symbol bằng Tree-sitter cho Python, JavaScript, TypeScript, Rust, Go, Java, C và C++ |
+| Call-graph expansion | Resolve caller/callee edge và BFS expand các symbol khớp khi query |
+| Incremental indexing | Chỉ re-index các tệp đã thay đổi (mtime + watcher), crash-safe nhờ commit marker theo từng tệp |
+| Real-time file watching | `notify` (debounce) tự động trigger re-index khi tệp thay đổi |
+| Voyage AI embedding | HTTP embedding client có disk cache để tránh gọi API thừa |
+| LLM rerank | Sắp xếp lại các candidate chunk bằng LLM (OpenAI / Google); tùy chọn, có thể tắt |
+| Embedded SurrealDB | Lưu chunk, symbol và edge; một datastore cho mỗi repo |
+| HTTP API + Web UI | Quản lý cấu hình, index explorer và bảng điều khiển thử query |
+| MCP server | Cung cấp một tool duy nhất `codebase-retrieval` qua streamable HTTP |
+| SSE progress stream | Truyền sự kiện indexing progress trực tiếp tới UI |
+| Large-repo scaling | Bounded memory và không có đường O(n²) — xây dựng cho codebase quy mô Linux/Chromium |
 
 ## Ngôn ngữ được hỗ trợ
 
-Việc trích xuất ký hiệu bằng Tree-sitter (hàm, lớp, phương thức và cạnh lời gọi)
+Việc extract symbol bằng Tree-sitter (hàm, lớp, phương thức và call edge)
 được hiện thực riêng cho từng ngôn ngữ. Phần mở rộng tệp được ánh xạ trong
 `detect_language` (`src/parsing/mod.rs`).
 
@@ -67,37 +67,37 @@ Việc trích xuất ký hiệu bằng Tree-sitter (hàm, lớp, phương thức
 | C | `.c` | `tree-sitter-c` |
 | C++ | `.cpp`, `.cc`, `.cxx`, `.h`, `.hpp`, `.hxx`, `.hh` | `tree-sitter-cpp` |
 
-Tệp có phần mở rộng khác vẫn được chia đoạn và embedding để tìm kiếm ngữ nghĩa,
-nhưng không trích xuất ký hiệu hay cạnh lời gọi từ chúng.
+Tệp có phần mở rộng khác vẫn được chia chunk và embedding để tìm kiếm ngữ nghĩa,
+nhưng không extract symbol hay call edge từ chúng.
 
 ## Cách hoạt động
 
 ```mermaid
 flowchart TD
-    Boot([Khởi động máy chủ]) --> Engine[IndexEngine khởi chạy]
-    Engine --> Watchers[Tạo watcher tệp cho từng repo]
-    Engine --> LoadVec[Nạp chỉ mục vector từ SurrealDB]
+    Boot([Server boot]) --> Engine[IndexEngine khởi chạy]
+    Engine --> Watchers[Tạo file watcher cho từng repo]
+    Engine --> LoadVec[Load vector index từ SurrealDB]
 
-    Watchers -->|thay đổi tệp / thủ công / MCP| Trigger[Kích hoạt lập chỉ mục]
-    Trigger --> Detect[Duyệt repo + phát hiện tệp thay đổi]
-    Detect --> Parse[Phân tích: ký hiệu tree-sitter, đoạn, cạnh thô]
-    Parse --> Embed[Embedding các đoạn: Voyage AI + cache trên đĩa]
-    Embed --> Store[Lưu đoạn/ký hiệu vào SurrealDB]
-    Store --> Phase2[Giai đoạn 2: phân giải cạnh thô thành đồ thị lời gọi]
-    Phase2 --> VecIndex[(Chỉ mục vector trong bộ nhớ)]
+    Watchers -->|file change / manual / MCP| Trigger[Trigger indexing]
+    Trigger --> Detect[Walk repo + phát hiện tệp thay đổi]
+    Detect --> Parse[Parse: Tree-sitter symbol, chunk, raw edge]
+    Parse --> Embed[Embed chunk: Voyage AI + disk cache]
+    Embed --> Store[Lưu chunk/symbol vào SurrealDB]
+    Store --> Phase2[Phase 2: resolve raw edge thành call graph]
+    Phase2 --> VecIndex[(Vector index trong bộ nhớ)]
     LoadVec --> VecIndex
 
     subgraph Clients
-        WebUI[Giao diện web]
-        MCP[Công cụ MCP: codebase-retrieval]
+        WebUI[Web UI]
+        MCP[MCP tool: codebase-retrieval]
     end
 
-    Clients --> Q1[Embedding truy vấn]
-    Q1 --> Q2[Tìm kiếm vector: top-k cosine]
-    Q2 -.đọc.-> VecIndex
-    Q2 --> Q3[Mở rộng đồ thị: BFS caller/callee]
-    Q3 --> Q4[Hợp nhất + khử trùng các dải dòng kề nhau]
-    Q4 --> Q5[Xếp hạng lại bằng LLM]
-    Q5 --> Q6[Định dạng: path#Lstart-end + dòng đánh số]
+    Clients --> Q1[Embed query]
+    Q1 --> Q2[Vector search: top-k cosine]
+    Q2 -.reads.-> VecIndex
+    Q2 --> Q3[Graph expand: BFS caller/callee]
+    Q3 --> Q4[Merge + dedup adjacent range]
+    Q4 --> Q5[LLM rerank]
+    Q5 --> Q6[Format: path#Lstart-end + dòng đánh số]
     Q6 --> Result([Kết quả])
 ```
