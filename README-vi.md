@@ -37,15 +37,20 @@ Nền tảng được hỗ trợ: Linux x64/arm64, macOS arm64, Windows x64.
 | Tính năng | Mô tả |
 |-----------|-------|
 | Semantic code search | Tìm mã theo ý nghĩa thông qua embedding, không khớp văn bản thuần |
-| Multi-language parsing | Extract symbol bằng Tree-sitter cho Python, JavaScript, TypeScript, Rust, Go, Java, C và C++ |
+| Multi-language parsing | Extract symbol bằng Tree-sitter cho 22 ngôn ngữ (xem bảng bên dưới) |
 | Call-graph expansion | Resolve caller/callee edge và BFS expand các symbol khớp khi query |
+| Import-path resolution | Trace import tới file thật cho TS/JS, Python, Go, Rust — resolve cross-module call mà name matching bỏ lỡ |
+| Framework-aware resolution | Phát hiện React, Express, Django, Spring, Go Gin và tạo routing/DI/rendering edge tự động |
+| Generated-file detection | Downrank protobuf stub, gRPC scaffolding, mock, codegen output — hand-written code hiển thị trước |
+| Field-qualified search | Filter kết quả bằng prefix `kind:function`, `lang:rust`, `path:src/api`, `name:Handler` trong query |
+| Enriched caller/callee output | Kết quả MCP hiển thị tên symbol `[callers: fn_a, fn_b +N more]` thay vì chỉ số đếm |
 | Incremental indexing | Chỉ re-index các tệp đã thay đổi (mtime + watcher), crash-safe nhờ commit marker theo từng tệp |
 | Real-time file watching | `notify` (debounce) tự động trigger re-index khi tệp thay đổi |
 | Voyage AI embedding | HTTP embedding client có disk cache để tránh gọi API thừa |
 | LLM rerank | Sắp xếp lại các candidate chunk bằng LLM (OpenAI / Google); tùy chọn, có thể tắt |
 | Embedded SurrealDB | Lưu chunk, symbol và edge; một datastore cho mỗi repo |
 | HTTP API + Web UI | Quản lý cấu hình, index explorer và bảng điều khiển thử query |
-| MCP server | Cung cấp một tool duy nhất `codebase-retrieval` qua streamable HTTP |
+| MCP server | Cung cấp `codebase-retrieval` và `file-retrieval` tool qua streamable HTTP |
 | SSE progress stream | Truyền sự kiện indexing progress trực tiếp tới UI |
 | Large-repo scaling | Bounded memory và không có đường O(n²) — xây dựng cho codebase quy mô Linux/Chromium |
 
@@ -66,6 +71,18 @@ Việc extract symbol bằng Tree-sitter (hàm, lớp, phương thức và call 
 | Java | `.java` | `tree-sitter-java` |
 | C | `.c` | `tree-sitter-c` |
 | C++ | `.cpp`, `.cc`, `.cxx`, `.h`, `.hpp`, `.hxx`, `.hh` | `tree-sitter-cpp` |
+| C# | `.cs` | `tree-sitter-c-sharp` |
+| PHP | `.php` | `tree-sitter-php` |
+| Ruby | `.rb` | `tree-sitter-ruby` |
+| Objective-C | `.m`, `.mm` | `tree-sitter-objc` |
+| Swift | `.swift` | `tree-sitter-swift` |
+| Kotlin | `.kt`, `.kts` | `tree-sitter-kotlin` |
+| Dart | `.dart` | `tree-sitter-dart` |
+| Lua | `.lua` | `tree-sitter-lua` |
+| Luau | `.luau` | `tree-sitter-luau` |
+| Svelte | `.svelte` | `tree-sitter-javascript` (script block) |
+| Pascal | `.pas`, `.pp`, `.dpr`, `.lpr`, `.dpk` | `tree-sitter-pascal` |
+| Liquid | `.liquid` | `tree-sitter-liquid` |
 
 Tệp có phần mở rộng khác vẫn được chia chunk và embedding để tìm kiếm ngữ nghĩa,
 nhưng không extract symbol hay call edge từ chúng.
