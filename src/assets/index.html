@@ -269,6 +269,27 @@
         </div>
       </section>
 
+      <!-- Section: Purchased Plans -->
+      <section id="plan-purchased-section" class="mb-8 hidden">
+        <h2 data-i18n="plan.purchased" class="font-wiki text-xl dark:text-wiki-heading text-gray-900 border-b border-gray-200 dark:border-wiki-border pb-2 mb-4">
+          Purchased Plans
+        </h2>
+        <!-- Lookup by invoice -->
+        <div class="mb-4 flex gap-2">
+          <input id="plan-lookup-input" type="text" placeholder="PKG_..."
+                 class="flex-1 border border-gray-200 dark:border-wiki-border bg-white dark:bg-wiki-bg text-gray-900 dark:text-wiki-text rounded px-3 py-2 text-sm font-mono"
+                 data-i18n-placeholder="plan.purchased.lookup" />
+          <button id="btn-plan-lookup"
+                  class="px-4 py-2 bg-blue-600 dark:bg-wiki-border-active/20 dark:border dark:border-wiki-border-active text-white dark:text-wiki-link text-sm rounded
+                         hover:bg-blue-700 dark:hover:bg-wiki-border-active/30 focus:outline-none focus:ring-2 focus:ring-blue-400"
+                  data-i18n="plan.purchased.lookupBtn">Lookup</button>
+        </div>
+        <p class="text-xs text-gray-400 dark:text-wiki-text-muted mb-4" data-i18n="plan.purchased.lookupHint">Paste an invoice number to retrieve your key from another device.</p>
+        <div id="plan-lookup-error" class="hidden text-sm text-red-600 dark:text-red-400 mb-3"></div>
+        <!-- Purchased list -->
+        <div id="plan-purchased-list" class="space-y-3"></div>
+      </section>
+
       <!-- Section: Embedding Provider -->
       <section class="mb-8">
         <h2 data-i18n="embed.heading" class="font-wiki text-xl dark:text-wiki-heading text-gray-900 border-b border-gray-200 dark:border-wiki-border pb-2 mb-4">
@@ -1178,6 +1199,15 @@ const STR = {
   'plan.voyage':        { en: `Voyage budget`, vi: `Voyage budget`, zh: `Voyage 预算` },
   'plan.openai':        { en: `OpenAI budget`, vi: `OpenAI budget`, zh: `OpenAI 预算` },
   'plan.timeout':       { en: `Payment not confirmed. Check your email or try again.`, vi: `Chưa xác nhận được thanh toán. Kiểm tra email hoặc thử lại.`, zh: `付款未确认。请检查邮件或重试。` },
+  'plan.purchased':     { en: `Purchased Plans`, vi: `Gói đã mua`, zh: `已购套餐` },
+  'plan.purchased.lookup': { en: `Lookup by invoice`, vi: `Tra cứu theo invoice`, zh: `按发票号查询` },
+  'plan.purchased.lookupBtn': { en: `Lookup`, vi: `Tra cứu`, zh: `查询` },
+  'plan.purchased.lookupHint': { en: `Paste an invoice number to retrieve your key from another device.`, vi: `Dán invoice number để lấy lại key từ thiết bị khác.`, zh: `粘贴发票号以从其他设备检索密钥。` },
+  'plan.purchased.expires': { en: `Expires {date}`, vi: `Hết hạn {date}`, zh: `{date} 到期` },
+  'plan.purchased.expired': { en: `Expired`, vi: `Đã hết hạn`, zh: `已过期` },
+  'plan.purchased.remove': { en: `Remove`, vi: `Xóa`, zh: `移除` },
+  'plan.purchased.notFound': { en: `Invoice not found or payment incomplete.`, vi: `Không tìm thấy invoice hoặc chưa thanh toán.`, zh: `未找到发票或付款未完成。` },
+  'plan.purchased.added': { en: `Added!`, vi: `Đã thêm!`, zh: `已添加！` },
 
   // Repositories
   'repos.placeholder': { en: `e.g. {path}`, vi: `vd. {path}`, zh: `例如 {path}` },
@@ -2097,6 +2127,8 @@ let planPollTimer = null;
 let planPollCount = 0;
 let planInvoice = null;
 let planBaseUrl = null;
+let planPackagesCache = [];
+let planSelectedPackage = null;
 
 function formatVND(n) {
   return new Intl.NumberFormat('vi-VN', { style: 'currency', currency: 'VND' }).format(n);
@@ -2119,6 +2151,7 @@ async function planFetchPackages() {
       throw new Error(d.error || `HTTP ${res.status}`);
     }
     const packages = await res.json();
+    planPackagesCache = packages;
     loading.classList.add('hidden');
     if (!packages.length) { empty.classList.remove('hidden'); return; }
     packages.forEach(pkg => {
@@ -2167,6 +2200,8 @@ async function planCheckout(packageId) {
     localStorage.setItem('pending_payment', JSON.stringify({
       invoice: planInvoice,
       created_at: Date.now(),
+      package_name: planSelectedPackage ? planSelectedPackage.name : '',
+      duration_days: planSelectedPackage ? planSelectedPackage.duration_days : 0,
     }));
 
     // Redirect to SePay checkout page (backend already did the POST)
@@ -2231,26 +2266,26 @@ function planShowSuccess(proxyKey, baseUrl) {
   document.getElementById('plan-success').classList.remove('hidden');
   const hint = document.getElementById('plan-provider-hint');
   hint.classList.toggle('hidden', (cfg.llm.provider || 'google') === 'openai');
+
+  // Save to purchased plans localStorage
+  const entry = {
+    invoice: planInvoice,
+    proxy_key: proxyKey,
+    base_url: baseUrl || '',
+    package_name: planSelectedPackage ? planSelectedPackage.name : '',
+    purchased_at: Date.now(),
+    expires_at: (planSelectedPackage && planSelectedPackage.duration_days > 0)
+      ? Date.now() + planSelectedPackage.duration_days * 86400000 : null,
+  };
+  addPurchasedPlan(entry);
+  renderPurchasedPlans();
 }
 
 function planApply() {
-  if (!cfg) return;
   const key = document.getElementById('plan-result-key').value;
   const baseUrl = document.getElementById('plan-result-base-url').value;
   if (!key || !baseUrl) return;
-
-  // Embedding: set base_url, prepend key
-  cfg.embedding.voyage_base_url = baseUrl;
-  if (!cfg.embedding.api_keys.includes(key)) {
-    cfg.embedding.api_keys.unshift(key);
-  }
-  // LLM: set openai_base_url, prepend key
-  cfg.llm.openai_base_url = baseUrl;
-  if (!cfg.llm.api_keys.includes(key)) {
-    cfg.llm.api_keys.unshift(key);
-  }
-  saveNow();
-  renderAll();
+  planApplyEntry({ proxy_key: key, base_url: baseUrl });
   const btn = document.getElementById('btn-plan-apply');
   btn.textContent = t('plan.applied');
   btn.disabled = true;
@@ -2258,22 +2293,141 @@ function planApply() {
 }
 
 function planReplace() {
-  if (!cfg) return;
   const key = document.getElementById('plan-result-key').value;
   const baseUrl = document.getElementById('plan-result-base-url').value;
   if (!key || !baseUrl) return;
-
-  // Replace all keys: clear existing, set only the new one
-  cfg.embedding.api_keys = [key];
-  cfg.embedding.voyage_base_url = baseUrl;
-  cfg.llm.api_keys = [key];
-  cfg.llm.openai_base_url = baseUrl;
-  saveNow();
-  renderAll();
+  planReplaceEntry({ proxy_key: key, base_url: baseUrl });
   const btn = document.getElementById('btn-plan-replace');
   btn.textContent = t('plan.replaced');
   btn.disabled = true;
   setTimeout(() => { btn.textContent = t('plan.replace'); btn.disabled = false; }, 2000);
+}
+
+function planApplyEntry(entry) {
+  if (!cfg) return;
+  cfg.embedding.voyage_base_url = entry.base_url;
+  cfg.embedding.model = 'voyage-4-lite';
+  if (!cfg.embedding.api_keys.includes(entry.proxy_key)) {
+    cfg.embedding.api_keys.unshift(entry.proxy_key);
+  }
+  cfg.llm.provider = 'openai';
+  cfg.llm.openai_base_url = entry.base_url;
+  cfg.llm.rerank_model = 'vibervn-rag-0626';
+  if (!cfg.llm.api_keys.includes(entry.proxy_key)) {
+    cfg.llm.api_keys.unshift(entry.proxy_key);
+  }
+  saveNow();
+  renderAll();
+}
+
+function planReplaceEntry(entry) {
+  if (!cfg) return;
+  cfg.embedding.api_keys = [entry.proxy_key];
+  cfg.embedding.voyage_base_url = entry.base_url;
+  cfg.embedding.model = 'voyage-4-lite';
+  cfg.llm.provider = 'openai';
+  cfg.llm.api_keys = [entry.proxy_key];
+  cfg.llm.openai_base_url = entry.base_url;
+  cfg.llm.rerank_model = 'vibervn-rag-0626';
+  saveNow();
+  renderAll();
+}
+
+// ─── Purchased Plans (localStorage) ─────────────────────────────────────────
+
+function loadPurchasedPlans() {
+  try {
+    return JSON.parse(localStorage.getItem('purchased_plans') || '[]');
+  } catch (_) { return []; }
+}
+
+function savePurchasedPlans(arr) {
+  localStorage.setItem('purchased_plans', JSON.stringify(arr));
+}
+
+function addPurchasedPlan(entry) {
+  const plans = loadPurchasedPlans().filter(p => p.invoice !== entry.invoice);
+  plans.unshift(entry);
+  savePurchasedPlans(plans);
+}
+
+function removePurchasedPlan(invoice) {
+  const plans = loadPurchasedPlans().filter(p => p.invoice !== invoice);
+  savePurchasedPlans(plans);
+  renderPurchasedPlans();
+}
+
+function renderPurchasedPlans() {
+  const plans = loadPurchasedPlans();
+  const section = document.getElementById('plan-purchased-section');
+  const list = document.getElementById('plan-purchased-list');
+  if (!plans.length) { section.classList.add('hidden'); return; }
+  section.classList.remove('hidden');
+  list.innerHTML = plans.map(p => {
+    const masked = p.proxy_key ? '••••••••' + p.proxy_key.slice(-4) : '—';
+    const dateStr = p.purchased_at ? new Date(p.purchased_at).toLocaleDateString() : '';
+    let expiryHtml = '';
+    if (p.expires_at) {
+      const expired = Date.now() > p.expires_at;
+      const expDate = new Date(p.expires_at).toLocaleDateString();
+      expiryHtml = expired
+        ? `<span class="text-red-400 text-xs">${t('plan.purchased.expired')}</span>`
+        : `<span class="text-xs text-gray-400 dark:text-wiki-text-muted">${t('plan.purchased.expires', { date: expDate })}</span>`;
+    }
+    return `<div class="flex items-center justify-between p-3 border border-gray-200 dark:border-wiki-border rounded" data-invoice="${escHtml(p.invoice)}">
+      <div class="flex-1 min-w-0">
+        <div class="font-medium text-sm text-gray-900 dark:text-wiki-heading">${escHtml(p.package_name || p.invoice)}</div>
+        <div class="text-xs text-gray-500 dark:text-wiki-text-muted mt-0.5 font-mono flex items-center gap-2">
+          <span class="plan-key-display">${masked}</span>
+          <button class="plan-copy-key-btn text-blue-500 hover:text-blue-400 text-xs" data-key="${escHtml(p.proxy_key || '')}">${t('action.copy')}</button>
+        </div>
+        <div class="text-xs text-gray-400 dark:text-wiki-text-muted mt-1">${escHtml(p.base_url)} · ${dateStr} ${expiryHtml}</div>
+      </div>
+      <div class="flex items-center gap-2 ml-4">
+        <button class="plan-row-apply px-2 py-1 text-xs bg-blue-600 dark:bg-wiki-border-active/20 dark:border dark:border-wiki-border-active text-white dark:text-wiki-link rounded hover:bg-blue-700 dark:hover:bg-wiki-border-active/30">${t('plan.apply')}</button>
+        <button class="plan-row-replace px-2 py-1 text-xs bg-red-600 dark:bg-red-700/30 dark:border dark:border-red-600/50 text-white dark:text-red-300 rounded hover:bg-red-700 dark:hover:bg-red-700/50">${t('plan.replace')}</button>
+        <button class="plan-row-remove px-2 py-1 text-xs border border-gray-300 dark:border-wiki-border text-gray-500 dark:text-wiki-text-muted rounded hover:bg-gray-100 dark:hover:bg-wiki-surface">${t('plan.purchased.remove')}</button>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+async function planLookupInvoice() {
+  const input = document.getElementById('plan-lookup-input');
+  const errEl = document.getElementById('plan-lookup-error');
+  errEl.classList.add('hidden');
+  const invoice = input.value.trim();
+  if (!invoice) return;
+
+  try {
+    const res = await fetch(`/api/plan/orders/${encodeURIComponent(invoice)}/status`);
+    if (!res.ok) throw new Error();
+    const data = await res.json();
+    if (data.status !== 'COMPLETED' || !data.proxy_key) {
+      errEl.textContent = t('plan.purchased.notFound');
+      errEl.classList.remove('hidden');
+      return;
+    }
+    const entry = {
+      invoice,
+      proxy_key: data.proxy_key,
+      base_url: data.base_url || '',
+      package_name: invoice,
+      purchased_at: Date.now(),
+      expires_at: null,
+    };
+    addPurchasedPlan(entry);
+    renderPurchasedPlans();
+    input.value = '';
+    errEl.textContent = t('plan.purchased.added');
+    errEl.classList.remove('hidden');
+    errEl.classList.remove('text-red-600', 'dark:text-red-400');
+    errEl.classList.add('text-green-600', 'dark:text-green-400');
+    setTimeout(() => { errEl.classList.add('hidden'); errEl.classList.remove('text-green-600', 'dark:text-green-400'); errEl.classList.add('text-red-600', 'dark:text-red-400'); }, 2000);
+  } catch (_) {
+    errEl.textContent = t('plan.purchased.notFound');
+    errEl.classList.remove('hidden');
+  }
 }
 
 function planResumePending() {
@@ -2286,6 +2440,7 @@ function planResumePending() {
       return;
     }
     planInvoice = pending.invoice;
+    planSelectedPackage = { name: pending.package_name || '', duration_days: pending.duration_days || 0 };
     planStartPolling();
   } catch (_) { localStorage.removeItem('pending_payment'); }
 }
@@ -2294,7 +2449,9 @@ function planResumePending() {
 document.getElementById('plan-packages').addEventListener('click', (e) => {
   const btn = e.target.closest('.plan-buy-btn');
   if (!btn) return;
-  planCheckout(parseInt(btn.dataset.pkgId, 10));
+  const pkgId = parseInt(btn.dataset.pkgId, 10);
+  planSelectedPackage = planPackagesCache.find(p => p.id === pkgId) || null;
+  planCheckout(pkgId);
 });
 document.getElementById('btn-plan-cancel-wait').addEventListener('click', () => {
   planStopPolling();
@@ -2319,6 +2476,45 @@ document.getElementById('plan-success').addEventListener('click', (e) => {
     setTimeout(() => { btn.textContent = prev; }, 1500);
   });
 });
+
+// Purchased plans section events
+document.getElementById('btn-plan-lookup').addEventListener('click', planLookupInvoice);
+document.getElementById('plan-lookup-input').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') planLookupInvoice();
+});
+document.getElementById('plan-purchased-list').addEventListener('click', (e) => {
+  const row = e.target.closest('[data-invoice]');
+  if (!row) return;
+  const invoice = row.dataset.invoice;
+  const plans = loadPurchasedPlans();
+  const entry = plans.find(p => p.invoice === invoice);
+  if (!entry) return;
+
+  if (e.target.closest('.plan-row-apply')) {
+    planApplyEntry(entry);
+    const btn = e.target.closest('.plan-row-apply');
+    btn.textContent = t('plan.applied');
+    setTimeout(() => { btn.textContent = t('plan.apply'); }, 1500);
+  } else if (e.target.closest('.plan-row-replace')) {
+    planReplaceEntry(entry);
+    const btn = e.target.closest('.plan-row-replace');
+    btn.textContent = t('plan.replaced');
+    setTimeout(() => { btn.textContent = t('plan.replace'); }, 1500);
+  } else if (e.target.closest('.plan-row-remove')) {
+    removePurchasedPlan(invoice);
+  } else if (e.target.closest('.plan-copy-key-btn')) {
+    const key = e.target.closest('.plan-copy-key-btn').dataset.key;
+    navigator.clipboard.writeText(key).then(() => {
+      const btn = e.target.closest('.plan-copy-key-btn');
+      const prev = btn.textContent;
+      btn.textContent = t('action.copied');
+      setTimeout(() => { btn.textContent = prev; }, 1500);
+    });
+  }
+});
+
+// Render purchased plans on startup
+renderPurchasedPlans();
 
 // ─── End Buy Plan ──────────────────────────────────────────────────────────
 
