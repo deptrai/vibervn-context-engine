@@ -312,6 +312,12 @@ pub struct Settings {
     /// Filenames to skip during indexing (case-sensitive, filename-only match).
     #[serde(default = "default_index_ignore_filenames")]
     pub index_ignore_filenames: Vec<String>,
+    /// Base URL of the context-engine-admin gateway for the Buy Plan flow.
+    /// `None` means the UI uses the hardcoded default
+    /// (`https://context-engine.viber.vn`). Overridable at boot via env
+    /// `CONTEXT_ENGINE_ADMIN_URL`.
+    #[serde(default)]
+    pub admin_base_url: Option<String>,
 }
 
 impl Default for Settings {
@@ -329,6 +335,7 @@ impl Default for Settings {
             enabled_mcp_tools: default_enabled_mcp_tools(),
             custom_extensions: Vec::new(),
             index_ignore_filenames: default_index_ignore_filenames(),
+            admin_base_url: None,
         }
     }
 }

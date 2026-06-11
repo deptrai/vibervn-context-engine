@@ -206,6 +206,64 @@
         Add an embedding API key below to start indexing repositories.
       </div>
 
+      <!-- Section: Buy Plan -->
+      <section id="section-buy-plan" class="mb-8">
+        <h2 data-i18n="plan.heading" class="font-wiki text-xl dark:text-wiki-heading text-gray-900 border-b border-gray-200 dark:border-wiki-border pb-2 mb-4">
+          Buy Plan
+        </h2>
+        <!-- Package cards container -->
+        <div id="plan-packages" class="space-y-3"></div>
+        <!-- Loading / empty states -->
+        <div id="plan-loading" class="hidden text-sm text-gray-500 dark:text-wiki-text-muted py-4" data-i18n="plan.loading">Loading packages…</div>
+        <div id="plan-empty" class="hidden text-sm text-gray-500 dark:text-wiki-text-muted py-4" data-i18n="plan.empty">No packages available.</div>
+        <div id="plan-error" class="hidden text-sm text-red-600 dark:text-red-400 py-4"></div>
+        <!-- Payment waiting state -->
+        <div id="plan-waiting" class="hidden mt-4 p-4 border border-amber-300 dark:border-amber-600/50 bg-amber-50 dark:bg-amber-900/10 rounded">
+          <p class="text-sm font-medium text-amber-800 dark:text-amber-300" data-i18n="plan.waiting">Waiting for payment…</p>
+          <p class="text-xs text-amber-600 dark:text-amber-400 mt-1" data-i18n="plan.waitingHint">Complete the payment in the opened tab. This will update automatically.</p>
+          <button id="btn-plan-cancel-wait" class="mt-2 text-xs text-gray-500 dark:text-wiki-text-muted underline" data-i18n="action.cancel">Cancel</button>
+        </div>
+        <!-- Success state -->
+        <div id="plan-success" class="hidden mt-4 p-4 border border-green-300 dark:border-green-600/50 bg-green-50 dark:bg-green-900/10 rounded">
+          <p class="text-sm font-medium text-green-800 dark:text-green-300 mb-3" data-i18n="plan.success">Payment successful!</p>
+          <div class="space-y-2">
+            <div>
+              <label class="block text-xs font-medium text-gray-500 dark:text-wiki-text-muted mb-1" data-i18n="plan.key">Your API Key</label>
+              <div class="flex gap-2">
+                <input id="plan-result-key" type="text" readonly
+                       class="flex-1 border border-gray-200 dark:border-wiki-border bg-gray-50 dark:bg-wiki-bg text-gray-900 dark:text-wiki-text rounded px-3 py-2 text-sm font-mono" />
+                <button class="copy-btn px-3 py-2 text-sm rounded border border-gray-300 dark:border-wiki-border text-gray-600 dark:text-wiki-text-muted
+                               hover:bg-gray-100 dark:hover:bg-wiki-surface" data-copy-target="plan-result-key" data-i18n="action.copy">Copy</button>
+              </div>
+            </div>
+            <div>
+              <label class="block text-xs font-medium text-gray-500 dark:text-wiki-text-muted mb-1" data-i18n="plan.baseUrl">Base URL</label>
+              <div class="flex gap-2">
+                <input id="plan-result-base-url" type="text" readonly
+                       class="flex-1 border border-gray-200 dark:border-wiki-border bg-gray-50 dark:bg-wiki-bg text-gray-900 dark:text-wiki-text rounded px-3 py-2 text-sm font-mono" />
+                <button class="copy-btn px-3 py-2 text-sm rounded border border-gray-300 dark:border-wiki-border text-gray-600 dark:text-wiki-text-muted
+                               hover:bg-gray-100 dark:hover:bg-wiki-surface" data-copy-target="plan-result-base-url" data-i18n="action.copy">Copy</button>
+              </div>
+            </div>
+          </div>
+          <div class="mt-3 flex gap-2">
+            <button id="btn-plan-apply" data-i18n="plan.apply"
+                    class="px-4 py-2 bg-blue-600 dark:bg-wiki-border-active/20 dark:border dark:border-wiki-border-active text-white dark:text-wiki-link text-sm rounded
+                           hover:bg-blue-700 dark:hover:bg-wiki-border-active/30 focus:outline-none focus:ring-2 focus:ring-blue-400">
+              Apply to Settings
+            </button>
+            <button id="btn-plan-dismiss" data-i18n="action.close"
+                    class="px-4 py-2 text-sm rounded border border-gray-300 dark:border-wiki-border text-gray-600 dark:text-wiki-text-muted
+                           hover:bg-gray-100 dark:hover:bg-wiki-surface focus:outline-none focus:ring-2 focus:ring-blue-400">
+              Close
+            </button>
+          </div>
+          <p id="plan-provider-hint" class="hidden mt-2 text-xs text-amber-600 dark:text-amber-400" data-i18n="plan.providerHint">
+            Your LLM provider is set to Google. To use this key for reranking, switch to OpenAI above.
+          </p>
+        </div>
+      </section>
+
       <!-- Section: Embedding Provider -->
       <section class="mb-8">
         <h2 data-i18n="embed.heading" class="font-wiki text-xl dark:text-wiki-heading text-gray-900 border-b border-gray-200 dark:border-wiki-border pb-2 mb-4">
@@ -1096,6 +1154,24 @@ const STR = {
   'tab.mcp':          { en: `MCP`, vi: `MCP`, zh: `MCP` },
   'tab.settings':     { en: `Settings`, vi: `Cài đặt`, zh: `设置` },
 
+  // Buy Plan
+  'plan.heading':       { en: `Buy Plan`, vi: `Mua gói`, zh: `购买套餐` },
+  'plan.loading':       { en: `Loading packages…`, vi: `Đang tải gói…`, zh: `正在加载套餐…` },
+  'plan.empty':         { en: `No packages available.`, vi: `Không có gói nào.`, zh: `暂无可用套餐。` },
+  'plan.buy':           { en: `Buy`, vi: `Mua`, zh: `购买` },
+  'plan.waiting':       { en: `Waiting for payment…`, vi: `Đang chờ thanh toán…`, zh: `等待付款…` },
+  'plan.waitingHint':   { en: `Complete the payment in the opened tab. This will update automatically.`, vi: `Hoàn tất thanh toán ở tab đã mở. Trạng thái sẽ tự cập nhật.`, zh: `在打开的标签页中完成付款，状态将自动更新。` },
+  'plan.success':       { en: `Payment successful!`, vi: `Thanh toán thành công!`, zh: `付款成功！` },
+  'plan.key':           { en: `Your API Key`, vi: `API Key của bạn`, zh: `您的 API 密钥` },
+  'plan.baseUrl':       { en: `Base URL`, vi: `Base URL`, zh: `Base URL` },
+  'plan.apply':         { en: `Apply to Settings`, vi: `Áp dụng vào cài đặt`, zh: `应用到设置` },
+  'plan.applied':       { en: `Applied!`, vi: `Đã áp dụng!`, zh: `已应用！` },
+  'plan.providerHint':  { en: `Your LLM provider is set to Google. To use this key for reranking, switch to OpenAI above.`, vi: `LLM provider đang là Google. Để dùng key này cho rerank, chuyển sang OpenAI ở trên.`, zh: `LLM 提供商当前为 Google。要使用此密钥进行重排序，请在上方切换到 OpenAI。` },
+  'plan.duration':      { en: `{n} days`, vi: `{n} ngày`, zh: `{n} 天` },
+  'plan.voyage':        { en: `Voyage budget`, vi: `Voyage budget`, zh: `Voyage 预算` },
+  'plan.openai':        { en: `OpenAI budget`, vi: `OpenAI budget`, zh: `OpenAI 预算` },
+  'plan.timeout':       { en: `Payment not confirmed. Check your email or try again.`, vi: `Chưa xác nhận được thanh toán. Kiểm tra email hoặc thử lại.`, zh: `付款未确认。请检查邮件或重试。` },
+
   // Repositories
   'repos.placeholder': { en: `e.g. {path}`, vi: `vd. {path}`, zh: `例如 {path}` },
   'repos.warning':     { en: `Warning: path does not look absolute. It will still be saved.`, vi: `Cảnh báo: đường dẫn không giống đường dẫn tuyệt đối. Vẫn sẽ được lưu.`, zh: `警告：路径看起来不是绝对路径，但仍会被保存。` },
@@ -1850,6 +1926,8 @@ async function loadConfig() {
     document.getElementById('main-content').classList.remove('hidden');
     renderAll();
     navigateIfFirstUse();
+    planFetchPackages();
+    planResumePending();
   } catch (err) {
     document.getElementById('skeleton').classList.add('hidden');
     document.getElementById('main-content').classList.remove('hidden');
@@ -2004,6 +2082,231 @@ document.getElementById('form-add-ignore').addEventListener('submit', handleAddI
 document.getElementById('input-ignore-filename').addEventListener('keydown', (e) => {
   if (e.key === 'Enter') { e.preventDefault(); handleAddIgnore(); }
 });
+
+// ─── Buy Plan ──────────────────────────────────────────────────────────────
+const PLAN_POLL_INTERVAL = 3000;
+const PLAN_POLL_MAX = 200;
+let planPollTimer = null;
+let planPollCount = 0;
+let planInvoice = null;
+let planBaseUrl = null;
+
+function formatVND(n) {
+  return new Intl.NumberFormat('vi-VN', { style: 'currency', currency: 'VND' }).format(n);
+}
+
+async function planFetchPackages() {
+  const container = document.getElementById('plan-packages');
+  const loading = document.getElementById('plan-loading');
+  const empty = document.getElementById('plan-empty');
+  const error = document.getElementById('plan-error');
+  container.innerHTML = '';
+  loading.classList.remove('hidden');
+  empty.classList.add('hidden');
+  error.classList.add('hidden');
+
+  try {
+    const res = await fetch('/api/plan/packages');
+    if (!res.ok) {
+      const d = await res.json().catch(() => ({}));
+      throw new Error(d.error || `HTTP ${res.status}`);
+    }
+    const packages = await res.json();
+    loading.classList.add('hidden');
+    if (!packages.length) { empty.classList.remove('hidden'); return; }
+    packages.forEach(pkg => {
+      const card = document.createElement('div');
+      card.className = 'flex items-center justify-between p-3 border border-gray-200 dark:border-wiki-border rounded';
+      card.innerHTML = `
+        <div class="flex-1 min-w-0">
+          <div class="font-medium text-sm text-gray-900 dark:text-wiki-heading">${escHtml(pkg.name)}</div>
+          <div class="text-xs text-gray-500 dark:text-wiki-text-muted mt-0.5">${escHtml(pkg.description || '')}</div>
+          <div class="text-xs text-gray-400 dark:text-wiki-text-muted mt-1">
+            ${t('plan.voyage')}: ${pkg.voyage_budget.toLocaleString()} requests · ${t('plan.openai')}: ${pkg.openai_budget.toLocaleString()} requests
+            ${pkg.duration_days > 0 ? ` · ${t('plan.duration', { n: pkg.duration_days })}` : ''}
+          </div>
+        </div>
+        <div class="flex items-center gap-3 ml-4">
+          <span class="text-sm font-medium text-gray-900 dark:text-wiki-heading whitespace-nowrap">${formatVND(pkg.price_vnd)}</span>
+          <button class="plan-buy-btn px-3 py-1.5 bg-blue-600 dark:bg-wiki-border-active/20 dark:border dark:border-wiki-border-active text-white dark:text-wiki-link text-sm rounded
+                         hover:bg-blue-700 dark:hover:bg-wiki-border-active/30 focus:outline-none focus:ring-2 focus:ring-blue-400"
+                  data-pkg-id="${pkg.id}">${t('plan.buy')}</button>
+        </div>`;
+      container.appendChild(card);
+    });
+  } catch (e) {
+    loading.classList.add('hidden');
+    error.textContent = e.message;
+    error.classList.remove('hidden');
+  }
+}
+
+async function planCheckout(packageId) {
+  const error = document.getElementById('plan-error');
+  error.classList.add('hidden');
+  try {
+    const res = await fetch('/api/plan/checkout', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ package_id: packageId }),
+    });
+    if (!res.ok) {
+      const d = await res.json().catch(() => ({}));
+      throw new Error(d.error || `HTTP ${res.status}`);
+    }
+    const data = await res.json();
+    planInvoice = data.invoice_number;
+    planBaseUrl = data.base_url || null;
+    localStorage.setItem('pending_payment', JSON.stringify({
+      invoice: planInvoice,
+      created_at: Date.now(),
+    }));
+
+    // Build hidden form and submit to SePay
+    const form = document.createElement('form');
+    form.method = 'POST';
+    form.action = data.checkout_url;
+    form.target = '_blank';
+    for (const [k, v] of Object.entries(data.fields)) {
+      const input = document.createElement('input');
+      input.type = 'hidden';
+      input.name = k;
+      input.value = v;
+      form.appendChild(input);
+    }
+    document.body.appendChild(form);
+    form.submit();
+    document.body.removeChild(form);
+
+    planStartPolling();
+  } catch (e) {
+    error.textContent = e.message;
+    error.classList.remove('hidden');
+  }
+}
+
+function planStartPolling() {
+  planPollCount = 0;
+  document.getElementById('plan-waiting').classList.remove('hidden');
+  document.getElementById('plan-success').classList.add('hidden');
+  planPoll();
+}
+
+function planStopPolling() {
+  clearTimeout(planPollTimer);
+  planPollTimer = null;
+  document.getElementById('plan-waiting').classList.add('hidden');
+}
+
+async function planPoll() {
+  if (!planInvoice) return;
+  planPollCount++;
+  if (planPollCount > PLAN_POLL_MAX) {
+    planStopPolling();
+    const error = document.getElementById('plan-error');
+    error.textContent = t('plan.timeout');
+    error.classList.remove('hidden');
+    localStorage.removeItem('pending_payment');
+    return;
+  }
+  try {
+    const res = await fetch(`/api/plan/orders/${encodeURIComponent(planInvoice)}/status`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    if (data.status === 'COMPLETED' && data.proxy_key) {
+      planStopPolling();
+      localStorage.removeItem('pending_payment');
+      planShowSuccess(data.proxy_key, data.base_url);
+      return;
+    }
+    if (data.status === 'FAILED') {
+      planStopPolling();
+      localStorage.removeItem('pending_payment');
+      const error = document.getElementById('plan-error');
+      error.textContent = t('plan.timeout');
+      error.classList.remove('hidden');
+      return;
+    }
+  } catch (_) { /* retry */ }
+  planPollTimer = setTimeout(planPoll, PLAN_POLL_INTERVAL);
+}
+
+function planShowSuccess(proxyKey, baseUrl) {
+  document.getElementById('plan-result-key').value = proxyKey;
+  document.getElementById('plan-result-base-url').value = baseUrl || '';
+  document.getElementById('plan-success').classList.remove('hidden');
+  const hint = document.getElementById('plan-provider-hint');
+  hint.classList.toggle('hidden', (cfg.llm.provider || 'google') === 'openai');
+}
+
+function planApply() {
+  if (!cfg) return;
+  const key = document.getElementById('plan-result-key').value;
+  const baseUrl = document.getElementById('plan-result-base-url').value;
+  if (!key || !baseUrl) return;
+
+  // Embedding: set base_url, prepend key
+  cfg.embedding.voyage_base_url = baseUrl;
+  if (!cfg.embedding.api_keys.includes(key)) {
+    cfg.embedding.api_keys.unshift(key);
+  }
+  // LLM: set openai_base_url, prepend key
+  cfg.llm.openai_base_url = baseUrl;
+  if (!cfg.llm.api_keys.includes(key)) {
+    cfg.llm.api_keys.unshift(key);
+  }
+  saveNow();
+  renderAll();
+  const btn = document.getElementById('btn-plan-apply');
+  btn.textContent = t('plan.applied');
+  btn.disabled = true;
+  setTimeout(() => { btn.textContent = t('plan.apply'); btn.disabled = false; }, 2000);
+}
+
+function planResumePending() {
+  try {
+    const raw = localStorage.getItem('pending_payment');
+    if (!raw) return;
+    const pending = JSON.parse(raw);
+    if (Date.now() - pending.created_at > PLAN_POLL_MAX * PLAN_POLL_INTERVAL) {
+      localStorage.removeItem('pending_payment');
+      return;
+    }
+    planInvoice = pending.invoice;
+    planStartPolling();
+  } catch (_) { localStorage.removeItem('pending_payment'); }
+}
+
+// Event listeners for Buy Plan
+document.getElementById('plan-packages').addEventListener('click', (e) => {
+  const btn = e.target.closest('.plan-buy-btn');
+  if (!btn) return;
+  planCheckout(parseInt(btn.dataset.pkgId, 10));
+});
+document.getElementById('btn-plan-cancel-wait').addEventListener('click', () => {
+  planStopPolling();
+  localStorage.removeItem('pending_payment');
+  planInvoice = null;
+});
+document.getElementById('btn-plan-apply').addEventListener('click', planApply);
+document.getElementById('btn-plan-dismiss').addEventListener('click', () => {
+  document.getElementById('plan-success').classList.add('hidden');
+});
+// Copy buttons in success panel
+document.getElementById('plan-success').addEventListener('click', (e) => {
+  const btn = e.target.closest('.copy-btn');
+  if (!btn) return;
+  const targetId = btn.dataset.copyTarget;
+  const input = document.getElementById(targetId);
+  if (!input) return;
+  navigator.clipboard.writeText(input.value).then(() => {
+    const prev = btn.textContent;
+    btn.textContent = t('action.copied');
+    setTimeout(() => { btn.textContent = prev; }, 1500);
+  });
+});
+
+// ─── End Buy Plan ──────────────────────────────────────────────────────────
 
 document.getElementById('embedding-model').addEventListener('input', (e) => {
   if (cfg) { cfg.embedding.model = e.target.value; saveDebounced(); }

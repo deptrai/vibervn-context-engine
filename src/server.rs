@@ -191,6 +191,9 @@ pub fn build_router(
         .route("/api/embedding-cache", delete(delete_embedding_cache))
         .route("/api/defender-status", get(get_defender_status))
         .route("/api/defender-exclude", post(post_defender_exclude))
+        .route("/api/plan/packages", get(plan_get_packages))
+        .route("/api/plan/checkout", post(plan_post_checkout))
+        .route("/api/plan/orders/:invoice/status", get(plan_get_order_status))
         .route("/mcp-repo/:repo_id", any(handle_repo_mcp))
         .merge(Router::new().nest_service("/mcp", mcp_service))
         .with_state(state)
@@ -248,7 +251,13 @@ async fn serve_index() -> impl IntoResponse {
 
 async fn get_config(State(state): State<AppState>) -> Response {
     match tokio::task::spawn_blocking(move || ensure_dir_and_load(&state.home_dir)).await {
-        Ok(Ok(settings)) => Json(settings).into_response(),
+        Ok(Ok(settings)) => {
+            let mut v = serde_json::to_value(&settings).unwrap_or_default();
+            if let Some(obj) = v.as_object_mut() {
+                obj.remove("admin_base_url");
+            }
+            Json(v).into_response()
+        }
         Ok(Err(e)) => e.into_response(),
         Err(join_err) => {
             let body = json!({ "error": format!("internal error: {join_err}") });
@@ -1213,4 +1222,132 @@ async fn post_defender_exclude(State(state): State<AppState>) -> Response {
             (StatusCode::INTERNAL_SERVER_ERROR, Json(body)).into_response()
         }
     }
+}
+
+// ─── Plan proxy (admin gateway) ──────────────────────────────────────────
+
+const PLAN_DEFAULT_ADMIN: &str = "https://context-engine.viber.vn";
+const PLAN_PROXY_TIMEOUT: Duration = Duration::from_secs(15);
+
+fn plan_admin_base(settings: &Settings) -> String {
+    settings
+        .admin_base_url
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(PLAN_DEFAULT_ADMIN)
+        .trim_end_matches('/')
+        .to_string()
+}
+
+fn plan_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(PLAN_PROXY_TIMEOUT)
+        .build()
+        .unwrap_or_default()
+}
+
+async fn plan_get_packages(State(state): State<AppState>) -> Response {
+    let base = plan_admin_base(&*state.settings.read().await);
+    let url = format!("{base}/api/packages");
+
+    let res = match plan_http_client().get(&url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({ "error": format!("admin gateway unreachable: {e}") })),
+            )
+                .into_response();
+        }
+    };
+
+    let status = StatusCode::from_u16(res.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let body = res.bytes().await.unwrap_or_default();
+    Response::builder()
+        .status(status)
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(body))
+        .unwrap()
+}
+
+async fn plan_post_checkout(
+    State(state): State<AppState>,
+    Json(body): Json<Value>,
+) -> Response {
+    let base = plan_admin_base(&*state.settings.read().await);
+    let url = format!("{base}/api/checkout");
+
+    let res = match plan_http_client()
+        .post(&url)
+        .header("content-type", "application/json")
+        .json(&body)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({ "error": format!("admin gateway unreachable: {e}") })),
+            )
+                .into_response();
+        }
+    };
+
+    let status = StatusCode::from_u16(res.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let body_bytes = res.bytes().await.unwrap_or_default();
+
+    // Inject admin_base_url into the response so frontend knows where the proxy key points to.
+    if status.is_success()
+        && let Ok(mut obj) = serde_json::from_slice::<Value>(&body_bytes)
+    {
+        let admin_url = plan_admin_base(&*state.settings.read().await);
+        obj["base_url"] = Value::String(format!("{admin_url}/v1"));
+        return (status, Json(obj)).into_response();
+    }
+
+    Response::builder()
+        .status(status)
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(body_bytes))
+        .unwrap()
+}
+
+async fn plan_get_order_status(
+    State(state): State<AppState>,
+    Path(invoice): Path<String>,
+) -> Response {
+    let base = plan_admin_base(&*state.settings.read().await);
+    let url = format!("{base}/api/orders/{invoice}/status");
+
+    let res = match plan_http_client().get(&url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({ "error": format!("admin gateway unreachable: {e}") })),
+            )
+                .into_response();
+        }
+    };
+
+    let status = StatusCode::from_u16(res.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let body_bytes = res.bytes().await.unwrap_or_default();
+
+    // Inject base_url when order is completed so frontend can show it
+    if status.is_success()
+        && let Ok(mut obj) = serde_json::from_slice::<Value>(&body_bytes)
+    {
+        if obj.get("status").and_then(|s| s.as_str()) == Some("COMPLETED") {
+            let admin_url = plan_admin_base(&*state.settings.read().await);
+            obj["base_url"] = Value::String(format!("{admin_url}/v1"));
+        }
+        return (status, Json(obj)).into_response();
+    }
+
+    Response::builder()
+        .status(status)
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(body_bytes))
+        .unwrap()
 }
