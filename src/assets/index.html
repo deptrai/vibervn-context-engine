@@ -218,6 +218,29 @@
           </svg>
         </button>
         <div id="plan-card-body" class="mt-4">
+        <!-- Sub-section: Free Trial (hidden until /api/plan/free-trial reports available) -->
+        <div id="plan-free-trial-section" class="hidden mb-6">
+          <h3 data-i18n="plan.freeTrial.heading" class="font-wiki text-base dark:text-wiki-heading text-gray-900 border-b border-gray-200 dark:border-wiki-border pb-2 mb-3">
+            Free Trial
+          </h3>
+          <div class="flex items-center justify-between p-3 border border-blue-300 dark:border-wiki-border-active/50 bg-blue-50/50 dark:bg-wiki-border-active/10 rounded">
+            <div class="flex-1 min-w-0">
+              <div class="font-medium text-sm text-gray-900 dark:text-wiki-heading" data-i18n="plan.freeTrial.heading">Free Trial</div>
+              <div id="plan-ft-budget" class="text-xs text-gray-400 dark:text-wiki-text-muted mt-1"></div>
+              <p class="text-xs text-gray-400 dark:text-wiki-text-muted mt-1" data-i18n="plan.freeTrial.machineHint">
+                A hashed machine identifier (not your raw hardware ID) is sent to ensure each machine can claim the free trial only once.
+              </p>
+            </div>
+            <div class="ml-4">
+              <button id="btn-plan-claim-ft" data-i18n="plan.freeTrial.claim"
+                      class="plan-claim-ft-btn px-3 py-1.5 bg-blue-600 dark:bg-wiki-border-active/20 dark:border dark:border-wiki-border-active text-white dark:text-wiki-link text-sm rounded whitespace-nowrap
+                             hover:bg-blue-700 dark:hover:bg-wiki-border-active/30 focus:outline-none focus:ring-2 focus:ring-blue-400">
+                Claim Free Trial
+              </button>
+            </div>
+          </div>
+          <div id="plan-ft-error" class="hidden text-sm text-red-600 dark:text-red-400 mt-2"></div>
+        </div>
         <!-- Sub-section: Buy -->
         <h3 data-i18n="plan.heading" class="font-wiki text-base dark:text-wiki-heading text-gray-900 border-b border-gray-200 dark:border-wiki-border pb-2 mb-3">
           Buy Plan
@@ -1252,6 +1275,14 @@ const STR = {
   'plan.purchased.added': { en: `Added!`, vi: `Đã thêm!`, zh: `已添加！` },
   'plan.purchased.usage': { en: `{remaining} / {budget}`, vi: `{remaining} / {budget}`, zh: `{remaining} / {budget}` },
   'plan.purchased.usageLoading': { en: `Loading usage…`, vi: `Đang tải usage…`, zh: `正在加载用量…` },
+  'plan.freeTrial.heading': { en: `Free Trial`, vi: `Free Trial`, zh: `免费试用` },
+  'plan.freeTrial.claim': { en: `Claim Free Trial`, vi: `Nhận Free Trial`, zh: `领取免费试用` },
+  'plan.freeTrial.claiming': { en: `Claiming…`, vi: `Đang nhận…`, zh: `领取中…` },
+  'plan.freeTrial.budget': { en: `Voyage budget: {voyage} requests · OpenAI budget: {openai} requests`, vi: `Voyage budget: {voyage} requests · OpenAI budget: {openai} requests`, zh: `Voyage 预算：{voyage} 次请求 · OpenAI 预算：{openai} 次请求` },
+  'plan.freeTrial.machineHint': { en: `A hashed machine identifier (not your raw hardware ID) is sent to ensure each machine can claim the free trial only once.`, vi: `Một machine ID đã được hash (không phải ID phần cứng thô) sẽ được gửi để đảm bảo mỗi máy chỉ nhận free trial 1 lần.`, zh: `系统会发送一个经过哈希处理的机器标识符（而非原始硬件 ID），以确保每台机器只能领取一次免费试用。` },
+  'plan.freeTrial.expired': { en: `Free trial expired`, vi: `Free trial đã hết hạn`, zh: `免费试用已过期` },
+  'plan.freeTrial.expiredHint': { en: `Your free trial has ended. Buy a plan below to keep going.`, vi: `Free trial của bạn đã kết thúc. Mua một gói bên dưới để tiếp tục.`, zh: `您的免费试用已结束。购买下方的套餐以继续使用。` },
+  'plan.freeTrial.unavailable': { en: `Free trial is not available right now.`, vi: `Free trial hiện không khả dụng.`, zh: `免费试用当前不可用。` },
 
   // Repositories
   'repos.placeholder': { en: `e.g. {path}`, vi: `vd. {path}`, zh: `例如 {path}` },
@@ -2098,6 +2129,7 @@ async function loadConfig() {
     renderAll();
     navigateIfFirstUse();
     planFetchPackages();
+    planLoadFreeTrial();
     planResumePending();
   } catch (err) {
     document.getElementById('skeleton').classList.add('hidden');
@@ -2320,6 +2352,85 @@ async function planFetchPackages() {
   }
 }
 
+// ─── Free Trial ──────────────────────────────────────────────────────────
+let planFreeTrialInfo = null;
+
+async function planLoadFreeTrial() {
+  const section = document.getElementById('plan-free-trial-section');
+  try {
+    const res = await fetch('/api/plan/free-trial');
+    if (!res.ok) { section.classList.add('hidden'); return; }
+    const info = await res.json();
+    planFreeTrialInfo = info;
+    // Hide the whole card when the admin hasn't configured/enabled a free
+    // trial — matches how the public pricing page hides unavailable features.
+    if (!info.available) { section.classList.add('hidden'); return; }
+    document.getElementById('plan-ft-budget').textContent = t('plan.freeTrial.budget', {
+      voyage: (info.voyage_budget || 0).toLocaleString(),
+      openai: (info.openai_budget || 0).toLocaleString(),
+    });
+    section.classList.remove('hidden');
+  } catch (_) {
+    section.classList.add('hidden');
+  }
+}
+
+async function planClaimFreeTrial() {
+  const btn = document.getElementById('btn-plan-claim-ft');
+  const errEl = document.getElementById('plan-ft-error');
+  errEl.classList.add('hidden');
+  btn.disabled = true;
+  const prevLabel = btn.textContent;
+  btn.textContent = t('plan.freeTrial.claiming');
+  try {
+    const res = await fetch('/api/plan/free-trial/claim', { method: 'POST' });
+    if (!res.ok) {
+      const d = await res.json().catch(() => ({}));
+      // 503 == admin disabled / not configured.
+      throw new Error(res.status === 503 ? t('plan.freeTrial.unavailable') : (d.error || `HTTP ${res.status}`));
+    }
+    const data = await res.json();
+    // Reuse the purchase success machinery: show the key + save to Purchased
+    // Plans (usage bar, expiry badge, Apply/Replace all come for free). The
+    // duration comes from the free-trial info so the expiry badge is accurate.
+    const durationDays = planFreeTrialInfo
+      ? (planFreeTrialInfo.duration_days || 0) : 0;
+    planFreeTrialSuccess(data.proxy_key, data.base_url, data.expires_at, durationDays);
+  } catch (e) {
+    errEl.textContent = e.message;
+    errEl.classList.remove('hidden');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = prevLabel;
+  }
+}
+
+function planFreeTrialSuccess(proxyKey, baseUrl, expiresAt, durationDays) {
+  // Save as a purchased plan flagged is_free_trial so the expired badge shows
+  // the "buy a plan" hint (F1=C). Idempotent invoice key so re-claim updates
+  // the same row instead of duplicating it.
+  let expiresMs = null;
+  if (expiresAt) {
+    const parsed = Date.parse(expiresAt.replace(' ', 'T') + 'Z');
+    if (!Number.isNaN(parsed)) expiresMs = parsed;
+  } else if (durationDays > 0) {
+    expiresMs = Date.now() + durationDays * 86400000;
+  }
+  const entry = {
+    invoice: 'FREETRIAL',
+    proxy_key: proxyKey,
+    base_url: baseUrl || '',
+    package_name: t('plan.freeTrial.heading'),
+    purchased_at: Date.now(),
+    expires_at: expiresMs,
+    is_free_trial: true,
+  };
+  addPurchasedPlan(entry);
+  renderPurchasedPlans();
+  // Immediately apply so the trial key is usable without an extra click.
+  planApplyEntry({ proxy_key: proxyKey, base_url: baseUrl || '' });
+}
+
 async function planCheckout(packageId) {
   const error = document.getElementById('plan-error');
   error.classList.add('hidden');
@@ -2509,9 +2620,16 @@ function renderPurchasedPlans() {
     if (p.expires_at) {
       const expired = Date.now() > p.expires_at;
       const expDate = new Date(p.expires_at).toLocaleDateString();
-      expiryHtml = expired
-        ? `<span class="text-red-400 text-xs">${t('plan.purchased.expired')}</span>`
-        : `<span class="text-xs text-gray-400 dark:text-wiki-text-muted">${t('plan.purchased.expires', { date: expDate })}</span>`;
+      if (expired) {
+        // Free-trial expiry gets a dedicated label + "buy a plan" nudge (F1=C);
+        // the key stays dead — re-claiming returns the same expired key.
+        expiryHtml = p.is_free_trial
+          ? `<span class="text-red-400 text-xs">${t('plan.freeTrial.expired')}</span>
+             <span class="block text-xs text-amber-600 dark:text-amber-400 mt-0.5">${t('plan.freeTrial.expiredHint')}</span>`
+          : `<span class="text-red-400 text-xs">${t('plan.purchased.expired')}</span>`;
+      } else {
+        expiryHtml = `<span class="text-xs text-gray-400 dark:text-wiki-text-muted">${t('plan.purchased.expires', { date: expDate })}</span>`;
+      }
     }
     return `<div class="flex items-center justify-between p-3 border border-gray-200 dark:border-wiki-border rounded" data-invoice="${escHtml(p.invoice)}">
       <div class="flex-1 min-w-0">
@@ -2640,6 +2758,7 @@ document.getElementById('plan-packages').addEventListener('click', (e) => {
   planSelectedPackage = planPackagesCache.find(p => p.id === pkgId) || null;
   planCheckout(pkgId);
 });
+document.getElementById('btn-plan-claim-ft').addEventListener('click', planClaimFreeTrial);
 document.getElementById('btn-plan-cancel-wait').addEventListener('click', () => {
   planStopPolling();
   localStorage.removeItem('pending_payment');

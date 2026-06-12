@@ -195,6 +195,11 @@ pub fn build_router(
         .route("/api/plan/checkout", post(plan_post_checkout))
         .route("/api/plan/orders/:invoice/status", get(plan_get_order_status))
         .route("/api/plan/usage", get(plan_get_usage))
+        .route("/api/plan/free-trial", get(plan_get_free_trial))
+        .route(
+            "/api/plan/free-trial/claim",
+            post(plan_post_free_trial_claim),
+        )
         .route("/mcp-repo/:repo_id", any(handle_repo_mcp))
         .merge(Router::new().nest_service("/mcp", mcp_service))
         .with_state(state)
@@ -1350,6 +1355,116 @@ fn plan_http_client() -> reqwest::Client {
         .timeout(PLAN_PROXY_TIMEOUT)
         .build()
         .unwrap_or_default()
+}
+
+// Salt mixed into the machine-id hash. A fixed compile-in constant: it must
+// stay byte-identical across versions/restarts so the derived id is stable for
+// a given machine (the free-trial dedup + idempotent recovery depend on it).
+const MACHINE_ID_SALT: &str = "vibervn-context-engine::free-trial::v1";
+
+/// Derive a stable, opaque per-machine id: `sha256(SALT ‖ machine_uid)` as hex.
+///
+/// We never send the raw hardware uid to the server — only this hash. Returns
+/// an error (NOT a random fallback) when the hardware uid is unavailable: a
+/// random id would silently break idempotency (every claim would look like a
+/// new machine), so the claim must fail loudly instead.
+fn machine_id() -> Result<String, String> {
+    use sha2::{Digest, Sha256};
+    let uid = machine_uid::get().map_err(|e| format!("machine id unavailable: {e}"))?;
+    let mut hasher = Sha256::new();
+    hasher.update(MACHINE_ID_SALT.as_bytes());
+    hasher.update(b"\x00");
+    hasher.update(uid.as_bytes());
+    Ok(hex_encode(&hasher.finalize()))
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+async fn plan_get_free_trial(State(_): State<AppState>) -> Response {
+    let base = plan_admin_base();
+    let url = format!("{base}/api/free-trial");
+
+    let res = match plan_http_client().get(&url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({ "error": format!("admin gateway unreachable: {e}") })),
+            )
+                .into_response();
+        }
+    };
+
+    let status = StatusCode::from_u16(res.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let body = res.bytes().await.unwrap_or_default();
+    Response::builder()
+        .status(status)
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(body))
+        .unwrap()
+}
+
+async fn plan_post_free_trial_claim(State(_): State<AppState>) -> Response {
+    // The machine id is computed here (server-side); the browser never sees it
+    // and cannot read hardware identifiers anyway. A failure to derive it is a
+    // hard error — see machine_id() for why no random fallback is allowed.
+    let machine_id = match machine_id() {
+        Ok(id) => id,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": e })),
+            )
+                .into_response();
+        }
+    };
+
+    let base = plan_admin_base();
+    let url = format!("{base}/api/free-trial/claim");
+
+    let res = match plan_http_client()
+        .post(&url)
+        .header("content-type", "application/json")
+        .json(&json!({ "machine_id": machine_id }))
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({ "error": format!("admin gateway unreachable: {e}") })),
+            )
+                .into_response();
+        }
+    };
+
+    let status = StatusCode::from_u16(res.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let body_bytes = res.bytes().await.unwrap_or_default();
+
+    // Inject base_url on success so the frontend knows where the key points to
+    // (mirrors plan_post_checkout). Applies to both 201 Claimed and 200
+    // Recovered responses.
+    if status.is_success()
+        && let Ok(mut obj) = serde_json::from_slice::<Value>(&body_bytes)
+    {
+        let admin_url = plan_admin_base();
+        obj["base_url"] = Value::String(format!("{admin_url}/v1"));
+        return (status, Json(obj)).into_response();
+    }
+
+    Response::builder()
+        .status(status)
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(body_bytes))
+        .unwrap()
 }
 
 async fn plan_get_packages(State(_): State<AppState>) -> Response {
