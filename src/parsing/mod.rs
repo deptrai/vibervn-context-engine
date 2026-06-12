@@ -9,7 +9,7 @@ use std::path::Path;
 use tracing::{warn};
 use tree_sitter::{Node, Parser};
 
-use crate::parsing::chunker::{Chunk, chunk_file};
+use crate::parsing::chunker::{Chunk, chunk_file, chunk_file_ast};
 use crate::parsing::relations::{EdgeKind, EdgeTarget, RawEdge};
 use crate::parsing::symbols::{QualifiedSymbol, Symbol, SymbolKind};
 
@@ -87,173 +87,174 @@ pub fn parse_file(file_path: &str, source: &str) -> ParseResult {
     let path = Path::new(file_path);
     let lang = detect_language(path);
 
-    let (symbols, edges, imports) = match lang {
+    let (symbols, edges, imports, chunks) = match lang {
         Lang::Python => {
-            let (s, e) = parse_with_tree_sitter(
+            let (s, e, c) = parse_with_tree_sitter(
                 file_path,
                 source,
                 tree_sitter_python::LANGUAGE.into(),
                 extract_python,
             );
-            (s, e, HashMap::new())
+            (s, e, HashMap::new(), c)
         }
         Lang::JavaScript | Lang::Tsx => {
-            let (s, e) = parse_with_tree_sitter(
+            let (s, e, c) = parse_with_tree_sitter(
                 file_path,
                 source,
                 tree_sitter_javascript::LANGUAGE.into(),
                 extract_javascript,
             );
-            (s, e, HashMap::new())
+            (s, e, HashMap::new(), c)
         }
         Lang::TypeScript => {
-            let (s, e) = parse_with_tree_sitter(
+            let (s, e, c) = parse_with_tree_sitter(
                 file_path,
                 source,
                 tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
                 extract_typescript,
             );
-            (s, e, HashMap::new())
+            (s, e, HashMap::new(), c)
         }
         Lang::Rust => {
-            let (s, e) = parse_with_tree_sitter(
+            let (s, e, c) = parse_with_tree_sitter(
                 file_path,
                 source,
                 tree_sitter_rust::LANGUAGE.into(),
                 extract_rust,
             );
-            (s, e, HashMap::new())
+            (s, e, HashMap::new(), c)
         }
         Lang::Go => {
-            let (s, e) = parse_with_tree_sitter(
+            let (s, e, c) = parse_with_tree_sitter(
                 file_path,
                 source,
                 tree_sitter_go::LANGUAGE.into(),
                 extract_go,
             );
-            (s, e, HashMap::new())
+            (s, e, HashMap::new(), c)
         }
         Lang::Java => {
-            let (s, e) = parse_with_tree_sitter(
+            let (s, e, c) = parse_with_tree_sitter(
                 file_path,
                 source,
                 tree_sitter_java::LANGUAGE.into(),
                 extract_java,
             );
-            (s, e, HashMap::new())
+            (s, e, HashMap::new(), c)
         }
         Lang::C => {
-            let (s, e, imp) = parse_with_tree_sitter_c_cpp(
+            let (s, e, imp, c) = parse_with_tree_sitter_c_cpp(
                 file_path,
                 source,
                 tree_sitter_c::LANGUAGE.into(),
             );
-            (s, e, imp)
+            (s, e, imp, c)
         }
         Lang::Cpp => {
-            let (s, e, imp) = parse_with_tree_sitter_c_cpp(
+            let (s, e, imp, c) = parse_with_tree_sitter_c_cpp(
                 file_path,
                 source,
                 tree_sitter_cpp::LANGUAGE.into(),
             );
-            (s, e, imp)
+            (s, e, imp, c)
         }
-        Lang::Other => (vec![], vec![], HashMap::new()),
+        Lang::Other => (vec![], vec![], HashMap::new(), chunk_file(file_path, source, &[])),
         Lang::CSharp => {
-            let (s, e) = parse_with_tree_sitter(
+            let (s, e, c) = parse_with_tree_sitter(
                 file_path, source,
                 tree_sitter_c_sharp::LANGUAGE.into(),
                 extract_csharp,
             );
-            (s, e, HashMap::new())
+            (s, e, HashMap::new(), c)
         }
         Lang::Php => {
-            let (s, e) = parse_with_tree_sitter(
+            let (s, e, c) = parse_with_tree_sitter(
                 file_path, source,
                 tree_sitter_php::LANGUAGE_PHP.into(),
                 extract_php,
             );
-            (s, e, HashMap::new())
+            (s, e, HashMap::new(), c)
         }
         Lang::Ruby => {
-            let (s, e) = parse_with_tree_sitter(
+            let (s, e, c) = parse_with_tree_sitter(
                 file_path, source,
                 tree_sitter_ruby::LANGUAGE.into(),
                 extract_ruby,
             );
-            (s, e, HashMap::new())
+            (s, e, HashMap::new(), c)
         }
         Lang::ObjectiveC => {
-            let (s, e) = parse_with_tree_sitter(
+            let (s, e, c) = parse_with_tree_sitter(
                 file_path, source,
                 tree_sitter_objc::LANGUAGE.into(),
                 extract_objc,
             );
-            (s, e, HashMap::new())
+            (s, e, HashMap::new(), c)
         }
         Lang::Swift => {
-            let (s, e) = parse_with_tree_sitter(
+            let (s, e, c) = parse_with_tree_sitter(
                 file_path, source,
                 tree_sitter_swift::LANGUAGE.into(),
                 extract_swift,
             );
-            (s, e, HashMap::new())
+            (s, e, HashMap::new(), c)
         }
         Lang::Kotlin => {
-            let (s, e) = parse_with_tree_sitter(
+            let (s, e, c) = parse_with_tree_sitter(
                 file_path, source,
                 tree_sitter_kotlin_ng::LANGUAGE.into(),
                 extract_kotlin,
             );
-            (s, e, HashMap::new())
+            (s, e, HashMap::new(), c)
         }
         Lang::Dart => {
-            let (s, e) = parse_with_tree_sitter(
+            let (s, e, c) = parse_with_tree_sitter(
                 file_path, source,
                 tree_sitter_dart::LANGUAGE.into(),
                 extract_dart,
             );
-            (s, e, HashMap::new())
+            (s, e, HashMap::new(), c)
         }
         Lang::Lua => {
-            let (s, e) = parse_with_tree_sitter(
+            let (s, e, c) = parse_with_tree_sitter(
                 file_path, source,
                 tree_sitter_lua::LANGUAGE.into(),
                 extract_lua,
             );
-            (s, e, HashMap::new())
+            (s, e, HashMap::new(), c)
         }
         Lang::Luau => {
-            let (s, e) = parse_with_tree_sitter(
+            let (s, e, c) = parse_with_tree_sitter(
                 file_path, source,
                 tree_sitter_luau::LANGUAGE.into(),
                 extract_luau,
             );
-            (s, e, HashMap::new())
+            (s, e, HashMap::new(), c)
         }
         Lang::Svelte => {
+            // Svelte uses a hand-rolled extractor without a retained tree;
+            // chunk via the source-only fallback (non-overlapping line windows).
             let (s, e) = extract_svelte(file_path, source);
-            (s, e, HashMap::new())
+            let c = chunk_file(file_path, source, &s);
+            (s, e, HashMap::new(), c)
         }
         Lang::Pascal => {
-            let (s, e) = parse_with_tree_sitter(
+            let (s, e, c) = parse_with_tree_sitter(
                 file_path, source,
                 tree_sitter_pascal::LANGUAGE.into(),
                 extract_pascal,
             );
-            (s, e, HashMap::new())
+            (s, e, HashMap::new(), c)
         }
         Lang::Liquid => {
-            let (s, e) = parse_with_tree_sitter(
+            let (s, e, c) = parse_with_tree_sitter(
                 file_path, source,
                 tree_sitter_liquid::LANGUAGE.into(),
                 extract_liquid,
             );
-            (s, e, HashMap::new())
+            (s, e, HashMap::new(), c)
         }
     };
-
-    let chunks = chunk_file(file_path, source, &symbols);
 
     ParseResult {
         symbols,
@@ -270,20 +271,28 @@ fn parse_with_tree_sitter<F>(
     source: &str,
     language: tree_sitter::Language,
     extractor: F,
-) -> (Vec<Symbol>, Vec<RawEdge>)
+) -> (Vec<Symbol>, Vec<RawEdge>, Vec<Chunk>)
 where
     F: Fn(&str, &str, &tree_sitter::Tree) -> (Vec<Symbol>, Vec<RawEdge>),
 {
     let mut parser = Parser::new();
     if let Err(e) = parser.set_language(&language) {
         warn!(file = file_path, error = %e, "failed to set tree-sitter language");
-        return (vec![], vec![]);
+        // No tree → source-only fallback chunking (no symbols to link).
+        return (vec![], vec![], chunk_file(file_path, source, &[]));
     }
     match parser.parse(source, None) {
-        Some(tree) => extractor(file_path, source, &tree),
+        Some(tree) => {
+            let (symbols, edges) = extractor(file_path, source, &tree);
+            // Chunk INSIDE this closure: `tree_sitter::Tree`/`Node` are not
+            // `Send`, so the tree must be consumed here (off the async runtime,
+            // on the rayon worker) and only owned `Vec<Chunk>` may leave.
+            let chunks = chunk_file_ast(file_path, source, tree.root_node(), &symbols);
+            (symbols, edges, chunks)
+        }
         None => {
             warn!(file = file_path, "tree-sitter parse returned None");
-            (vec![], vec![])
+            (vec![], vec![], chunk_file(file_path, source, &[]))
         }
     }
 }
@@ -293,17 +302,23 @@ fn parse_with_tree_sitter_c_cpp(
     file_path: &str,
     source: &str,
     language: tree_sitter::Language,
-) -> (Vec<Symbol>, Vec<RawEdge>, HashMap<String, String>) {
+) -> (Vec<Symbol>, Vec<RawEdge>, HashMap<String, String>, Vec<Chunk>) {
     let mut parser = Parser::new();
     if let Err(e) = parser.set_language(&language) {
         warn!(file = file_path, error = %e, "failed to set tree-sitter language for C/C++");
-        return (vec![], vec![], HashMap::new());
+        return (vec![], vec![], HashMap::new(), chunk_file(file_path, source, &[]));
     }
     match parser.parse(source, None) {
-        Some(tree) => extract_c_cpp(file_path, source, &tree),
+        Some(tree) => {
+            let (symbols, edges, imports) = extract_c_cpp(file_path, source, &tree);
+            // Chunk inside the closure — see `parse_with_tree_sitter` for the
+            // non-Send Tree rationale.
+            let chunks = chunk_file_ast(file_path, source, tree.root_node(), &symbols);
+            (symbols, edges, imports, chunks)
+        }
         None => {
             warn!(file = file_path, "tree-sitter parse returned None for C/C++");
-            (vec![], vec![], HashMap::new())
+            (vec![], vec![], HashMap::new(), chunk_file(file_path, source, &[]))
         }
     }
 }

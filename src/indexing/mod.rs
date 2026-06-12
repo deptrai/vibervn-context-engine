@@ -685,8 +685,23 @@ async fn run_consumer(
 
         // Acquire the SHARED repo DB handle — the same instance the server reads
         // through, so the explorer/query layer sees these writes immediately.
-        let db = match store::get_or_open(&engine_ref.repo_dbs, &engine_ref.data_dir, &repo).await {
-            Ok(db) => db,
+        //
+        // `open_or_reset_index` self-heals a corrupt or orphaned-LOCK index dir:
+        // `open_db` already rode out transient locks for ~30s, so a failure here
+        // means the data is unrecoverable. It deletes + reopens (a full rebuild,
+        // API-free via the embedding cache) rather than wedging the repo in Error
+        // forever. A live OS handle still holding the LOCK blocks the delete and
+        // surfaces the original error — the safety valve against destroying a
+        // healthy index. We must NOT call `close_repo_db` from here (it re-acquires
+        // the per-repo index lock we already hold → deadlock); the heal removes the
+        // cached handle directly.
+        let db = match store::open_or_reset_index(&engine_ref.repo_dbs, &engine_ref.data_dir, &repo).await {
+            Ok((db, was_reset)) => {
+                if was_reset {
+                    warn!(repo = %repo, "index directory failed to open and was reset; rebuilding from scratch");
+                }
+                db
+            }
             Err(e) => {
                 error!(repo = %repo, error = %e, "failed to open repo DB");
                 let mut statuses = engine_ref.statuses.write().await;

@@ -427,13 +427,17 @@ impl IndexPipeline {
                 let ext_clone = self.extra_extensions.clone();
                 let ign_clone = self.ignore_filenames.clone();
                 let ign_paths_clone = self.ignore_paths.clone();
-                let meta_map: HashMap<String, (i64, i64)> = stored_meta
+                let meta_map: HashMap<String, (i64, i64, i64)> = stored_meta
                     .iter()
-                    .map(|m| (m.path.clone(), (m.mtime, m.size)))
+                    .map(|m| (m.path.clone(), (m.mtime, m.size, m.chunker_version)))
                     .collect();
                 tokio::task::spawn_blocking(move || {
                     let all_files = walk_repo_with(&repo_clone, &ext_clone, &ign_clone, &ign_paths_clone);
-                    crate::indexing::tracker::detect_changes(&all_files, &meta_map)
+                    crate::indexing::tracker::detect_changes(
+                        &all_files,
+                        &meta_map,
+                        crate::parsing::chunker::CHUNKER_VERSION,
+                    )
                 })
                 .await
                 .context("incremental walk spawn_blocking")?
@@ -489,7 +493,7 @@ impl IndexPipeline {
                 } else {
                     // Normal Phase 2 replay: raw_edges are in DB (overflow path or incremental).
                     info!(repo = %self.repo, raw_edge_total, "edges_resolved marker absent — replaying Phase 2 from DB");
-                    self.resolve_edges_phase2(db).await
+                    self.resolve_edges_phase2(db, cancel_token.as_ref()).await
                         .context("edges Phase 2 replay on no-change run")?;
                 }
             }
@@ -536,6 +540,14 @@ impl IndexPipeline {
         let all_files = walk_repo_with(&self.repo, &self.extra_extensions, &self.ignore_filenames, &self.ignore_paths);
         info!(repo = %self.repo, file_count = all_files.len(), "walking repo for full rebuild");
 
+        // Cancel landing before any DB writes: bail before the destructive
+        // delete_all_data so the existing index is left intact.
+        if let Some(ct) = cancel_token
+            && ct.is_cancelled()
+        {
+            return Err(PipelineAbort::Cancelled.into());
+        }
+
         // Delete everything first (crash-safe: file_meta is the commit marker,
         // written per-file only after its chunks are durable).
         delete_all_data(db).await.context("full_rebuild: delete_all_data")?;
@@ -562,12 +574,12 @@ impl IndexPipeline {
         let phase2_start = Instant::now();
         if !ram_edges_overflowed && !ram_raw_edges.is_empty() {
             // Fast path: all raw_edges are in RAM — skip DB scan entirely.
-            self.resolve_edges_from_ram(db, ram_raw_edges)
+            self.resolve_edges_from_ram(db, ram_raw_edges, cancel_token)
                 .await
                 .context("full_rebuild: resolve_edges_from_ram")?;
         } else {
             // DB path: overflow or incremental — use keyset scan as before.
-            self.resolve_edges_phase2(db)
+            self.resolve_edges_phase2(db, cancel_token)
                 .await
                 .context("full_rebuild: resolve_edges_phase2")?;
         }
@@ -1104,6 +1116,11 @@ impl IndexPipeline {
                 size: ef.size,
                 repo: self.repo.clone(),
                 chunk_count: file_chunk_count,
+                // Stamp the build's chunker version. file_meta is the crash-safe
+                // commit marker — written only after this file's chunks are
+                // durable (deferred until the chunk-batch flush below), so an
+                // interrupted re-chunk leaves the stale version and re-runs.
+                chunker_version: crate::parsing::chunker::CHUNKER_VERSION,
             });
 
             let store_elapsed_ms = store_start.elapsed().as_millis() as u64;
@@ -1133,6 +1150,23 @@ impl IndexPipeline {
                     status: status.to_string(),
                 });
             }
+        }
+
+        // Post-loop cancellation re-check. The Stage 3 loop above only observes a
+        // cancel when it *receives* a file. If the user cancels while Stage 3 is
+        // parked on `recv()`, Stage 2's unfold stops feeding the channel, in-flight
+        // embeds drain, `embed_tx` drops, and `recv()` returns None — so the loop
+        // exits normally with `cancelled` still false. Without this re-check we'd
+        // flush the tail and return Ok, Phase 2 would run to completion, and the repo
+        // would finish "successfully" — i.e. the cancel button would appear to do
+        // nothing. Re-reading the token here turns that drained-on-cancel exit into a
+        // proper abort.
+        if !cancelled
+            && let Some(ct) = cancel_token
+            && ct.is_cancelled()
+        {
+            info!(repo = %self.repo, "indexing cancelled — channel drained after cancel");
+            cancelled = true;
         }
 
         // If cancelled, drop remaining channel items and return early.
@@ -1404,7 +1438,7 @@ impl IndexPipeline {
     /// the index seek and achieves O(N) total.
     ///
     /// Writes the `edges_resolved` marker in `index_meta` only after all pages commit.
-    async fn resolve_edges_phase2(&self, db: &Surreal<Db>) -> Result<()> {
+    async fn resolve_edges_phase2(&self, db: &Surreal<Db>, cancel_token: Option<&CancellationToken>) -> Result<()> {
         use serde::Deserialize;
 
         // First delete all existing calls edges (we're rewriting them from raw_edge).
@@ -1495,6 +1529,18 @@ impl IndexPipeline {
         let mut resolve_ms_total: u64 = 0;
 
         loop {
+            // Cancellation check at the page boundary. Phase 2 can run for tens of
+            // seconds on a large repo; without this a cancel landing here would be
+            // ignored until resolution finished. We leave EDGES_RESOLVED_KEY unset
+            // on abort, so the next run replays Phase 2 from the durable raw_edge
+            // table (crash-safe replay path) rather than shipping a half-built graph.
+            if let Some(ct) = cancel_token
+                && ct.is_cancelled()
+            {
+                info!(repo = %self.repo, "phase2: cancelled at page boundary");
+                return Err(PipelineAbort::Cancelled.into());
+            }
+
             // Outer: get next batch of distinct from_file values after the cursor.
             #[derive(Deserialize)]
             struct FileRow { from_file: String }
@@ -1637,6 +1683,7 @@ impl IndexPipeline {
         &self,
         db: &Surreal<Db>,
         raw_edges: Vec<RawEdgeRecord>,
+        cancel_token: Option<&CancellationToken>,
     ) -> Result<()> {
         let total = raw_edges.len();
         info!(repo = %self.repo, total_raw_edges = total, "phase2(ram): starting in-RAM edge resolution");
@@ -1682,7 +1729,19 @@ impl IndexPipeline {
         let mut edge_batch: Vec<(String, String, i64, String, String, String, String)> = Vec::new();
         let mut relate_write_ms: u64 = 0;
 
-        for re in &raw_edges {
+        for (i, re) in raw_edges.iter().enumerate() {
+            // Cancellation check every EDGE_RELATE_BATCH_SIZE edges (cheap, bounded
+            // frequency). On abort we leave EDGES_RESOLVED_KEY unset; because the
+            // RAM path never wrote raw_edge to the DB, run()'s crash-recovery branch
+            // (edges_resolved absent + raw_edge empty + file_meta present) forces a
+            // full rebuild on the next trigger, which is the correct recovery here.
+            if i % EDGE_RELATE_BATCH_SIZE == 0
+                && let Some(ct) = cancel_token
+                && ct.is_cancelled()
+            {
+                info!(repo = %self.repo, "phase2(ram): cancelled mid-resolution");
+                return Err(PipelineAbort::Cancelled.into());
+            }
             // Resolve this edge using the symbol map.
             let candidates = match name_bucket.get(&re.to_name) {
                 Some(v) if !v.is_empty() => v,
@@ -3431,7 +3490,7 @@ mod incremental_phase2_tests {
         insert_raw_edge(&db, "/b.rs", "b_fn", "c_fn").await;
 
         // Run a full Phase 2 to establish baseline calls rows.
-        pipeline.resolve_edges_phase2(&db).await.expect("initial full phase2");
+        pipeline.resolve_edges_phase2(&db, None).await.expect("initial full phase2");
 
         let initial_calls = all_calls(&db).await;
         println!("Initial calls: {:?}", initial_calls);
@@ -3535,7 +3594,7 @@ mod incremental_phase2_tests {
         insert_raw_edge(&db, "/x_caller.rs", "x_fn", "foo").await;
 
         // Full Phase 2: X→foo resolves to Z (the only candidate).
-        pipeline.resolve_edges_phase2(&db).await.expect("initial full phase2");
+        pipeline.resolve_edges_phase2(&db, None).await.expect("initial full phase2");
 
         let initial_calls = all_calls(&db).await;
         println!("Initial calls: {:?}", initial_calls);
@@ -3615,7 +3674,7 @@ mod incremental_phase2_tests {
         insert_raw_edge(&db, "/x.rs", "x_fn", "bar").await;
 
         // Full Phase 2: X→bar→W (W is lex-first).
-        pipeline.resolve_edges_phase2(&db).await.expect("initial full phase2");
+        pipeline.resolve_edges_phase2(&db, None).await.expect("initial full phase2");
 
         let initial_calls = all_calls(&db).await;
         println!("Initial calls: {:?}", initial_calls);
@@ -3711,7 +3770,7 @@ mod incremental_phase2_tests {
         insert_raw_edge(&db, "/x.rs", "x_fn", "foo").await;
 
         // Full Phase 2: X→foo→W.
-        pipeline.resolve_edges_phase2(&db).await.expect("initial full phase2");
+        pipeline.resolve_edges_phase2(&db, None).await.expect("initial full phase2");
 
         let initial_calls = all_calls(&db).await;
         assert_eq!(initial_calls.len(), 1, "initial: 1 calls edge");
@@ -4315,7 +4374,7 @@ mod ram_path_fqn_tests {
 
         let pipeline = IndexPipeline::new(repo.to_string(), None);
         pipeline
-            .resolve_edges_from_ram(&db, raw_edges)
+            .resolve_edges_from_ram(&db, raw_edges, None)
             .await
             .expect("resolve_edges_from_ram");
 
@@ -4342,6 +4401,98 @@ mod ram_path_fqn_tests {
             row.out_name.as_deref(),
             Some("/b.cpp::Bar::callee"),
             "out_name must be the full FQN, not the leaf name 'callee'"
+        );
+    }
+
+    /// A pre-cancelled token must abort Phase 2 (RAM path) with PipelineAbort::Cancelled
+    /// and leave the edges_resolved marker UNSET, so the next run replays/rebuilds.
+    /// This pins the cancellation responsiveness added to resolve_edges_from_ram —
+    /// before the fix, Phase 2 ran to completion regardless of the token.
+    #[tokio::test]
+    async fn ram_phase2_aborts_on_cancelled_token() {
+        let home = TempDir::new().unwrap();
+        let repo = "/test/ram_cancel";
+        let db = open_db(home.path(), repo).await.unwrap();
+
+        insert_symbol_fqn(&db, "/a.cpp::Foo::caller", "/a.cpp", "caller").await;
+        insert_symbol_fqn(&db, "/b.cpp::Bar::callee", "/b.cpp", "callee").await;
+
+        let raw_edges = vec![RawEdgeRecord {
+            from_file: "/a.cpp".to_string(),
+            from_name: "caller".to_string(),
+            from_fqn: "/a.cpp::Foo::caller".to_string(),
+            to_name: "callee".to_string(),
+            kind: "calls".to_string(),
+            line: 7,
+            import_path: None,
+        }];
+
+        let token = CancellationToken::new();
+        token.cancel();
+
+        let pipeline = IndexPipeline::new(repo.to_string(), None);
+        let err = pipeline
+            .resolve_edges_from_ram(&db, raw_edges, Some(&token))
+            .await
+            .expect_err("pre-cancelled token must abort Phase 2");
+        assert!(
+            matches!(
+                err.downcast_ref::<PipelineAbort>(),
+                Some(PipelineAbort::Cancelled)
+            ),
+            "expected PipelineAbort::Cancelled, got: {err:#}"
+        );
+
+        // edges_resolved marker must NOT be stamped on abort — the next run must
+        // be able to detect the unresolved state and recover.
+        let marker = get_meta(&db, EDGES_RESOLVED_KEY).await.unwrap();
+        assert!(
+            marker.is_none(),
+            "edges_resolved must stay unset after a cancelled Phase 2"
+        );
+    }
+
+    /// Same guarantee for the DB-scan Phase 2 path (resolve_edges_phase2): a
+    /// pre-cancelled token aborts at the first page boundary with Cancelled and
+    /// leaves the marker unset.
+    #[tokio::test]
+    async fn db_phase2_aborts_on_cancelled_token() {
+        let home = TempDir::new().unwrap();
+        let repo = "/test/db_cancel";
+        let db = open_db(home.path(), repo).await.unwrap();
+
+        insert_symbol_fqn(&db, "/a.cpp::Foo::caller", "/a.cpp", "caller").await;
+        insert_symbol_fqn(&db, "/b.cpp::Bar::callee", "/b.cpp", "callee").await;
+
+        // Persist a raw_edge row so the DB-scan path has work to do (total > 0).
+        db.query(
+            "CREATE raw_edge SET from_file = '/a.cpp', from_name = 'caller', \
+             from_fqn = '/a.cpp::Foo::caller', to_name = 'callee', kind = 'calls', \
+             line = 7, import_path = NONE",
+        )
+        .await
+        .expect("seed raw_edge");
+
+        let token = CancellationToken::new();
+        token.cancel();
+
+        let pipeline = IndexPipeline::new(repo.to_string(), None);
+        let err = pipeline
+            .resolve_edges_phase2(&db, Some(&token))
+            .await
+            .expect_err("pre-cancelled token must abort DB-scan Phase 2");
+        assert!(
+            matches!(
+                err.downcast_ref::<PipelineAbort>(),
+                Some(PipelineAbort::Cancelled)
+            ),
+            "expected PipelineAbort::Cancelled, got: {err:#}"
+        );
+
+        let marker = get_meta(&db, EDGES_RESOLVED_KEY).await.unwrap();
+        assert!(
+            marker.is_none(),
+            "edges_resolved must stay unset after a cancelled Phase 2"
         );
     }
 }

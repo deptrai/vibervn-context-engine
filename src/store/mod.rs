@@ -747,6 +747,67 @@ pub async fn get_or_open(
     Ok(db)
 }
 
+/// Open the repo DB like [`get_or_open`], but self-heal a corrupt or orphaned-LOCK
+/// index directory by deleting it and reopening fresh. Returns `(db, was_reset)`
+/// where `was_reset` is `true` when the directory had to be destroyed and rebuilt.
+///
+/// WHY this is safe and correct:
+/// - `open_db` already retries the RocksDB open for ~30s to ride out a *transient*
+///   stale LOCK from a draining prior handle (see its retry loop). So if
+///   `get_or_open` still fails here, the directory is genuinely corrupt or holds an
+///   orphaned LOCK that no longer has an owner — neither of which clears on its own.
+/// - Deleting the directory and reopening is exactly the pipeline's documented
+///   `is_first_run` recovery: a missing `file_meta` triggers a full rebuild. It is
+///   API-free because embeddings are cached in a *separate* directory
+///   (`<data_dir>/embeddings/<model>/`), so the rebuild re-uses cached vectors and
+///   never re-hits the Voyage API for unchanged content.
+/// - The deletion goes through [`remove_index_dir`], whose `remove_dir_all` FAILS
+///   when a live OS handle still holds the LOCK. That failure is the intended SAFETY
+///   VALVE: if some other handle is alive on this path, the index is healthy (just
+///   contended) and must NOT be destroyed — so we surface the original error and
+///   leave the data untouched. No data loss is possible.
+/// - We retry the open exactly ONCE after a successful delete. A *fresh empty
+///   directory* that still won't open is not a corruption we can fix by deleting
+///   again — it signals an environment fault (disk full, permissions, AV
+///   quarantine). Looping would just thrash; we surface the second error instead.
+///
+/// DEADLOCK NOTE: the index consumer that calls this already holds the per-repo
+/// *index* lock. `close_repo_db` re-acquires that same lock, so we must NOT call it
+/// here — we drop the cached handle directly from `repo_dbs`. `remove_index_dir`
+/// uses a *separate* per-repo open gate (released by `get_or_open` before it
+/// returns), so there is no deadlock between the index lock and the open gate.
+pub async fn open_or_reset_index(
+    repo_dbs: &RepoDbMap,
+    data_dir: &Path,
+    repo: &str,
+) -> Result<(Surreal<Db>, bool)> {
+    match get_or_open(repo_dbs, data_dir, repo).await {
+        Ok(db) => Ok((db, false)),
+        Err(orig) => {
+            let normalized = normalize_repo_path(repo);
+
+            // Defensively drop any cached handle so nothing in this process keeps
+            // the LOCK alive. We remove it directly from the map rather than via
+            // `close_repo_db`, which would deadlock (see DEADLOCK NOTE above).
+            repo_dbs.write().await.remove(&normalized);
+
+            // Attempt to delete the on-disk index. Returns false (without deleting)
+            // if a live OS handle still holds the LOCK — the safety valve.
+            if remove_index_dir(data_dir, repo).await {
+                // Directory is gone. Reopen exactly once on the fresh path.
+                match get_or_open(repo_dbs, data_dir, repo).await {
+                    Ok(db) => Ok((db, true)),
+                    Err(e2) => Err(e2).context("reopen after index reset"),
+                }
+            } else {
+                // A live handle blocked removal: the index is healthy, not corrupt.
+                // Surface the original open error and leave the data intact.
+                Err(orig)
+            }
+        }
+    }
+}
+
 /// Like [`get_or_open`], but returns `Ok(None)` when the repo has **no index on
 /// disk yet** instead of creating one.
 ///
@@ -892,6 +953,105 @@ mod open_concurrency {
         assert!(db_path(home.path(), repo).exists());
         let res2 = open_if_indexed(&map, home.path(), repo).await.expect("ok");
         assert!(res2.is_some(), "indexed repo must return Some");
+    }
+}
+
+#[cfg(test)]
+mod reset_index {
+    use super::*;
+    use tempfile::TempDir;
+
+    /// A healthy repo opens normally and is NEVER reset. First open creates a
+    /// fresh empty DB (`was_reset == false`); a second open returns the same
+    /// cached handle, also without a reset. This is the common path — the heal
+    /// must add zero behavior change when nothing is wrong.
+    #[tokio::test]
+    async fn healthy_repo_is_not_reset() {
+        let home = TempDir::new().unwrap();
+        let repo = "/proj/repo_healthy";
+        let map: RepoDbMap = Arc::new(RwLock::new(HashMap::new()));
+
+        let (db, was_reset) = open_or_reset_index(&map, home.path(), repo)
+            .await
+            .expect("healthy open");
+        assert!(!was_reset, "a healthy fresh repo must not be reset");
+        assert_eq!(ops::count_chunks(&db).await.unwrap(), 0, "fresh DB must be empty");
+        assert!(db_path(home.path(), repo).exists(), "index directory must exist");
+
+        let (_db2, was_reset2) = open_or_reset_index(&map, home.path(), repo)
+            .await
+            .expect("second open");
+        assert!(!was_reset2, "a cached healthy repo must not be reset");
+    }
+
+    /// SAFETY VALVE: when a live OS handle still holds the exclusive RocksDB LOCK,
+    /// the heal's `remove_dir_all` fails, so `open_or_reset_index` MUST surface the
+    /// original open error and leave the directory intact — never destroy a
+    /// (contended-but-healthy) index.
+    ///
+    /// Deterministic setup mirrors `exclusive_lock_then_shared_handle_works`: a raw
+    /// `open_db` handle (held in a local, NOT inserted into the map) holds the lock.
+    /// With an EMPTY map, `open_or_reset_index` misses the cache → `open_db` fails on
+    /// the live lock → `remove_index_dir` fails (live OS handle blocks removal) →
+    /// `Err` is returned. The raw handle is kept alive until after the assertion.
+    #[tokio::test]
+    async fn live_handle_blocks_reset_and_surfaces_error() {
+        let home = TempDir::new().unwrap();
+        let repo = "/proj/repo_locked";
+
+        // Hold the exclusive lock with a raw handle (not in the map).
+        let _holder = open_db(home.path(), repo).await.expect("hold lock");
+
+        let map: RepoDbMap = Arc::new(RwLock::new(HashMap::new()));
+        let res = open_or_reset_index(&map, home.path(), repo).await;
+        assert!(
+            res.is_err(),
+            "a live lock must block the reset and surface the original error (no data loss)"
+        );
+
+        // The directory must still exist — the safety valve did not delete it.
+        assert!(
+            db_path(home.path(), repo).exists(),
+            "the contended index directory must NOT be destroyed"
+        );
+
+        // Keep the holder alive until here so the lock is genuinely held during the
+        // heal attempt above.
+        drop(_holder);
+    }
+
+    /// CORRUPT-BUT-UNLOCKED: a directory with a malformed RocksDB `CURRENT` (pointing
+    /// at a non-existent MANIFEST) and NO live handle. If `open_db` rejects it, the
+    /// heal deletes the dir (nothing holds the lock) and reopens fresh, returning
+    /// `(db, true)` with an empty, usable DB.
+    ///
+    /// EMPIRICAL OUTCOME (verified by running this test): RocksDB DOES reject the
+    /// malformed `CURRENT`, so the open fails and the heal path is exercised —
+    /// `was_reset == true` and the rebuilt DB is empty.
+    #[tokio::test]
+    async fn corrupt_unlocked_dir_is_healed() {
+        let home = TempDir::new().unwrap();
+        let repo = "/proj/repo_corrupt";
+
+        // Materialize the index directory with a garbage CURRENT file. No handle is
+        // opened, so no LOCK is held — removal will succeed.
+        let path = db_path(home.path(), repo);
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("CURRENT"), b"GARBAGE-NOT-A-MANIFEST\n").unwrap();
+
+        let map: RepoDbMap = Arc::new(RwLock::new(HashMap::new()));
+        let (db, was_reset) = open_or_reset_index(&map, home.path(), repo)
+            .await
+            .expect("corrupt dir must heal and reopen");
+        assert!(
+            was_reset,
+            "a corrupt unlocked directory must be reset and rebuilt fresh"
+        );
+        assert_eq!(
+            ops::count_chunks(&db).await.unwrap(),
+            0,
+            "the rebuilt DB must be empty and usable"
+        );
     }
 }
 

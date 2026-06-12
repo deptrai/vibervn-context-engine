@@ -24,15 +24,21 @@ pub struct FileStat {
     pub size: i64,
 }
 
-/// Detect stale files by comparing on-disk mtime/size against stored metadata.
+/// Detect stale files by comparing on-disk mtime/size and the stored
+/// chunker_version against stored metadata.
 ///
 /// Returns a list of `FileChange` entries for files that are:
 /// - new (in `current_files` but not in `indexed_meta`)
-/// - modified (mtime or size differs)
+/// - modified (mtime or size differs, OR the stored `chunker_version` differs
+///   from the current build's `current_chunker_version` — a chunker algorithm
+///   change forces a lazy re-chunk even when mtime/size are unchanged)
 /// - deleted (in `indexed_meta` but no longer on disk / not in `current_files`)
+///
+/// `indexed_meta` maps path → (mtime, size, chunker_version).
 pub fn detect_changes(
     current_files: &[String],
-    indexed_meta: &std::collections::HashMap<String, (i64, i64)>, // path → (mtime, size)
+    indexed_meta: &std::collections::HashMap<String, (i64, i64, i64)>,
+    current_chunker_version: i64,
 ) -> Vec<FileChange> {
     let mut changes = Vec::new();
 
@@ -50,8 +56,16 @@ pub fn detect_changes(
                     kind: ChangeKind::Added,
                 });
             }
-            Some(&(indexed_mtime, indexed_size)) => {
-                if stat.mtime != indexed_mtime || stat.size != indexed_size {
+            Some(&(indexed_mtime, indexed_size, indexed_chunker_version)) => {
+                // mtime/size change OR a stale chunker_version both mean the
+                // file's chunks must be regenerated. Treating a version
+                // mismatch as Modified routes it through the normal per-file
+                // re-chunk path (delete + re-parse + re-embed + re-write
+                // file_meta with the new version as the crash-safe marker).
+                if stat.mtime != indexed_mtime
+                    || stat.size != indexed_size
+                    || indexed_chunker_version != current_chunker_version
+                {
                     changes.push(FileChange {
                         path: path.clone(),
                         kind: ChangeKind::Modified,

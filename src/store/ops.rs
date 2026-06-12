@@ -154,6 +154,13 @@ pub struct FileMeta {
     ///   real integer → that value
     #[serde(default, deserialize_with = "de_null_as_zero_i64")]
     pub chunk_count: i64,
+    /// Chunker algorithm version that produced this file's chunks (added for the
+    /// cAST change). Threaded into the freshness check so an algorithm change
+    /// forces a lazy re-chunk without a DB schema bump. Absent/null on rows
+    /// written before this field existed → 0, which never matches the current
+    /// `CHUNKER_VERSION` (>= 1), so legacy rows re-chunk on next trigger.
+    #[serde(default, deserialize_with = "de_null_as_zero_i64")]
+    pub chunker_version: i64,
 }
 
 // ─── IndexMeta ────────────────────────────────────────────────────────────
@@ -435,13 +442,14 @@ pub async fn insert_edge(
 pub async fn upsert_file_meta(db: &Surreal<Db>, meta: &FileMeta) -> Result<()> {
     db.query(
         "UPSERT file_meta SET path = $path, mtime = $mtime, size = $size, repo = $repo, \
-         chunk_count = $chunk_count WHERE path = $path",
+         chunk_count = $chunk_count, chunker_version = $chunker_version WHERE path = $path",
     )
     .bind(("path", meta.path.clone()))
     .bind(("mtime", meta.mtime))
     .bind(("size", meta.size))
     .bind(("repo", meta.repo.clone()))
     .bind(("chunk_count", meta.chunk_count))
+    .bind(("chunker_version", meta.chunker_version))
     .await
     .context("upsert file_meta")?;
 
@@ -453,7 +461,7 @@ pub async fn upsert_file_meta(db: &Surreal<Db>, meta: &FileMeta) -> Result<()> {
 /// Fetch all file_meta rows for a given repo.
 pub async fn get_all_file_meta(db: &Surreal<Db>, repo: &str) -> Result<Vec<FileMeta>> {
     let rows: Vec<FileMeta> = db
-        .query("SELECT path, mtime, size, repo, chunk_count FROM file_meta WHERE repo = $repo")
+        .query("SELECT path, mtime, size, repo, chunk_count, chunker_version FROM file_meta WHERE repo = $repo")
         .bind(("repo", repo.to_string()))
         .await
         .context("get all file_meta")?
@@ -1252,6 +1260,7 @@ mod null_chunk_count_deserialization {
             size: 4096,
             repo: "/repo/real_chunk_count_test".to_string(),
             chunk_count: 42,
+            chunker_version: crate::parsing::chunker::CHUNKER_VERSION,
         };
         upsert_file_meta(&db, &meta).await.expect("upsert");
 

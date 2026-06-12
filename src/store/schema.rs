@@ -89,6 +89,12 @@ DEFINE FIELD OVERWRITE mtime       ON file_meta TYPE int;
 DEFINE FIELD OVERWRITE size        ON file_meta TYPE int;
 DEFINE FIELD OVERWRITE repo        ON file_meta TYPE string;
 DEFINE FIELD OVERWRITE chunk_count ON file_meta TYPE int;
+-- chunker_version: the cAST chunk-algorithm version that produced this file's
+-- chunks. DEFAULT 0 so pre-existing rows (written before this field) read back
+-- as 0, which never matches the current CHUNKER_VERSION (>= 1) → those files are
+-- treated as modified by detect_changes and lazily re-chunked. No DB_SCHEMA_VERSION
+-- bump: this is a freshness marker, not a data migration.
+DEFINE FIELD OVERWRITE chunker_version ON file_meta TYPE int DEFAULT 0;
 DEFINE INDEX IF NOT EXISTS idx_filemeta_path ON file_meta FIELDS path UNIQUE;
 
 DEFINE TABLE IF NOT EXISTS index_meta SCHEMAFULL;

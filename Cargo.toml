@@ -2,6 +2,11 @@
 name = "context-engine-rs"
 version = "0.1.35"
 edition = "2024"
+# The benchmark harness lives in src/bin/chunk_bench.rs as a second binary.
+# Without default-run, `cargo run`/`cargo watch -x 'run -r'` becomes ambiguous
+# ("could not determine which binary to run") and the dev server fails to start.
+# Pin the server binary as the default so the bench binary is opt-in via --bin.
+default-run = "context-engine-rs"
 
 [dependencies]
 ignore = "0.4"
