@@ -36,6 +36,10 @@ RESULTS_DIR="${RESULTS_DIR:-D:/projects/Python/ce_bench_results}"
 RUN_TAG="${RUN_TAG:-$(printf '%s' "$REPO" | tr '/:\\' '___' | tr 'A-Z' 'a-z')_$(date +%Y%m%d_%H%M%S)}"
 RESULTS="${RESULTS_DIR}/${RUN_TAG}.txt"
 mkdir -p "$RESULTS_DIR"
+# Max seconds any single /api/query call may take before we give up. A query can
+# hang (e.g. the query-embed network call, or a multi-GB vector search) and would
+# otherwise stall the whole bench mid-run. On timeout we record the bound, not a hang.
+QUERY_MAX_TIME="${QUERY_MAX_TIME:-120}"
 
 # Append a line to BOTH stdout and the persisted results file.
 emit() { echo "$@"; echo "$@" >>"$RESULTS"; }
@@ -108,9 +112,16 @@ emit "===== TOTAL WALL-CLOCK (trigger -> idle) ====="
 emit "[bench] total_wall_clock_s=${WALL}"
 
 emit "===== PERF SUMMARY full_rebuild (stage breakdown) ====="
-{ grep -E "PERF SUMMARY full_rebuild" "$LOG" | tail -1 || echo "(no full_rebuild PERF SUMMARY found)"; } | tee -a "$RESULTS"
-emit "===== PERF SUMMARY phase2 / stage3 ====="
-{ grep -E "PERF SUMMARY (phase2|streaming_index stage3)" "$LOG" | tail -2 || true; } | tee -a "$RESULTS"
+# Filter by repo: a sibling repo (listed in the shared home settings.json) can
+# index concurrently and write its own PERF SUMMARY into the shared log. Match
+# the target repo's normalized path so we never capture a sibling's numbers.
+# The full_rebuild line carries ALL stage3 + phase2 sub-fields, so it alone is
+# sufficient (the separate streaming_index stage3 log line has no repo= field
+# and is therefore unfilterable — we intentionally do not grep it).
+{ grep -aE "PERF SUMMARY full_rebuild" "$LOG" | grep -aF "repo=${REPO_NORM}" | tail -1 \
+    || echo "(no full_rebuild PERF SUMMARY for ${REPO_NORM})"; } | tee -a "$RESULTS"
+emit "===== PERF SUMMARY phase2(ram) (repo-filtered) ====="
+{ grep -aE "PERF SUMMARY phase2\(ram\)" "$LOG" | grep -aF "repo=${REPO_NORM}" | tail -1 || true; } | tee -a "$RESULTS"
 
 # First-query latency: issue a real query against the repo after idle. If
 # embedding/rerank keys are absent the call may degrade to an empty result;
@@ -119,10 +130,11 @@ emit "===== PERF SUMMARY phase2 / stage3 ====="
 emit "===== FIRST-QUERY LATENCY (warm shard, same process) ====="
 Q_BODY="$(python -c "import json,sys; print(json.dumps({'query':'initialize the main entry point','repo':sys.argv[1],'top_k':10,'rerank':False}))" "$REPO")"
 Q_START=$(date +%s.%N)
-QRESP="$(curl -sS -X POST "${URL}/api/query" -H 'content-type: application/json' -d "$Q_BODY" 2>/dev/null || true)"
+QRESP="$(curl -sS --max-time "$QUERY_MAX_TIME" -X POST "${URL}/api/query" -H 'content-type: application/json' -d "$Q_BODY" 2>/dev/null || true)"
 Q_END=$(date +%s.%N)
 QLAT=$(python -c "print('%.0f' % ((${Q_END} - ${Q_START})*1000))" 2>/dev/null || echo "?")
-emit "[bench] warm_same_process_query_latency_ms=${QLAT}"
+QFLAG=""; [ -z "$QRESP" ] && QFLAG=" (EMPTY/timeout — bound=${QUERY_MAX_TIME}s, not a real latency)"
+emit "[bench] warm_same_process_query_latency_ms=${QLAT}${QFLAG}"
 emit "[bench] first_query_response_head=${QRESP:0:160}"
 
 # Output-invariance digest: the call-graph endpoint reads calls.in_name/out_name.
@@ -156,21 +168,44 @@ for i in $(seq 1 60); do
 done
 # First query on the freshly-booted process — triggers lazy shard warm.
 CQ_START=$(date +%s.%N)
-CQRESP="$(curl -sS -X POST "${URL}/api/query" -H 'content-type: application/json' -d "$Q_BODY" 2>/dev/null || true)"
+CQRESP="$(curl -sS --max-time "$QUERY_MAX_TIME" -X POST "${URL}/api/query" -H 'content-type: application/json' -d "$Q_BODY" 2>/dev/null || true)"
 CQ_END=$(date +%s.%N)
 CQLAT=$(python -c "print('%.0f' % ((${CQ_END} - ${CQ_START})*1000))" 2>/dev/null || echo "?")
-emit "[bench] cold_first_query_latency_ms=${CQLAT}  (includes shard load_from_db warm)"
+CQFLAG=""; [ -z "$CQRESP" ] && CQFLAG=" (EMPTY/timeout — bound=${QUERY_MAX_TIME}s; shard warm time is authoritative via shard_warm_log below)"
+emit "[bench] cold_first_query_latency_ms=${CQLAT}  (includes shard load_from_db warm)${CQFLAG}"
 emit "[bench] cold_first_query_response_head=${CQRESP:0:160}"
 # A second query on the now-warm shard, for the warm/cold delta.
 WQ_START=$(date +%s.%N)
-curl -sS -X POST "${URL}/api/query" -H 'content-type: application/json' -d "$Q_BODY" >/dev/null 2>&1 || true
+curl -sS --max-time "$QUERY_MAX_TIME" -X POST "${URL}/api/query" -H 'content-type: application/json' -d "$Q_BODY" >/dev/null 2>&1 || true
 WQ_END=$(date +%s.%N)
 WQLAT=$(python -c "print('%.0f' % ((${WQ_END} - ${WQ_START})*1000))" 2>/dev/null || echo "?")
 emit "[bench] cold_restart_warm_second_query_latency_ms=${WQLAT}  (shard already resident)"
 # Surface the shard load_from_db warm time straight from the log (authoritative).
-SHARD_WARM="$(grep -E "loaded embeddings into VectorIndex" "$LOG" | tail -1 || true)"
+# Compute the load->install delta for THIS repo: the two adjacent markers
+# "loaded embeddings into VectorIndex" then "installed vector shard repo=<repo>"
+# bracket the cold warm. This is the true "shard warm" cost, independent of the
+# query-embed network call (which the cold_first_query latency also includes).
+SHARD_WARM="$(grep -aE "loaded embeddings into VectorIndex" "$LOG" | tail -1 || true)"
 emit "[bench] shard_warm_log=${SHARD_WARM:-'(no load_from_db marker — shard may have warmed lazily mid-query)'}"
+SHARD_WARM_MS="$(python - "$LOG" "$REPO_NORM" <<'PY' 2>/dev/null || true
+import sys, re, datetime
+log, repo = sys.argv[1], sys.argv[2]
+def ts(line):
+    m = re.match(r'(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+)', re.sub(r'\x1b\[[0-9;]*m','',line))
+    return datetime.datetime.fromisoformat(m.group(1)) if m else None
+load_t = inst_t = None
+for raw in open(log, encoding='utf-8', errors='replace'):
+    line = re.sub(r'\x1b\[[0-9;]*m','',raw)
+    if 'loaded embeddings into VectorIndex' in line:
+        load_t = ts(line)
+    elif 'installed vector shard' in line and ('repo=%s' % repo) in line and load_t:
+        inst_t = ts(line)
+        if inst_t:
+            print('%.0f' % ((inst_t - load_t).total_seconds()*1000)); break
+PY
+)"
+emit "[bench] shard_warm_ms=${SHARD_WARM_MS:-'?'}  (load_from_db -> install, repo-specific; the true cold-warm cost)"
 emit "===== TIME-TO-QUERY SUMMARY ====="
-emit "[bench] index_wall_clock_s=${WALL}  cold_first_query_ms=${CQLAT}  cold_warm_second_query_ms=${WQLAT}"
+emit "[bench] index_wall_clock_s=${WALL}  shard_warm_ms=${SHARD_WARM_MS:-?}  cold_first_query_ms=${CQLAT}  cold_warm_second_query_ms=${WQLAT}"
 emit "[bench] results_file=${RESULTS}"
 
