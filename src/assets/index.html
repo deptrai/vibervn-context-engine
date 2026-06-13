@@ -2733,8 +2733,8 @@ async function fetchPlanUsage(el, proxyKey) {
     if (!res.ok) { el.innerHTML = ''; return; }
     const data = await res.json();
     el.innerHTML = `<div class="space-y-1">
-      ${renderUsageBar('Voyage', data.voyage_remaining, data.voyage_budget)}
-      ${renderUsageBar('OpenAI', data.openai_remaining, data.openai_budget)}
+      ${renderUsageBar('Embeddings', data.voyage_remaining, data.voyage_budget)}
+      ${renderUsageBar('Search', data.openai_remaining, data.openai_budget)}
     </div>`;
     // Sync expires_at from the server into cfg.purchased_plans. Re-read here
     // (not a snapshot taken before the await) so a plan added/removed during the

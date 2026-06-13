@@ -151,6 +151,16 @@ impl ChangeFilter {
         let mut builder = GitignoreBuilder::new(repo_root);
         let _ = builder.add(repo_root.join(".gitignore"));
         let _ = builder.add(repo_root.join(".ignore"));
+        // `.augmentignore` added LAST so it ranks above `.gitignore`/`.ignore`:
+        // `GitignoreBuilder` applies patterns in add-order and a later match wins,
+        // so its patterns (including `!pattern` negation) override earlier files,
+        // letting a repo re-include something `.gitignore` excluded. ROOT-LEVEL
+        // only here — matching how `.gitignore`/`.ignore` are handled on this
+        // watcher/incremental path (the full-rebuild walker gets per-directory
+        // nesting via `add_custom_ignore_filename`). The extension allowlist,
+        // dot-dir, and SKIP_DIRS predicates still run first in `allows`, so `!`
+        // cannot resurrect files those layers already excluded.
+        let _ = builder.add(repo_root.join(".augmentignore"));
         let gitignore = builder.build().unwrap_or_else(|e| {
             debug!(error = %e, "failed to build gitignore matcher; nothing will be gitignore-excluded");
             ignore::gitignore::Gitignore::empty()
@@ -214,6 +224,16 @@ pub fn walk_repo_with(repo_path: &str, extra_extensions: &[String], ignore_filen
         .git_ignore(true)
         .git_global(true)
         .ignore(true)
+        // `.augmentignore` is a custom ignore file discovered at every directory
+        // level. The `ignore` crate ranks custom ignore filenames ABOVE all other
+        // ignore sources (`.gitignore`, `.ignore`, global git ignore), so its
+        // patterns win. It uses full gitignore syntax including `!pattern`
+        // negation, which lets a repo re-include something `.gitignore` excluded
+        // (e.g. `!build_config.rs`). Note this only re-includes within the layers
+        // below it: the extension allowlist, SKIP_DIRS pruning, and dot-dir
+        // pruning still run first, so `!` cannot resurrect files under
+        // `node_modules`/`target`/dot-dirs or with non-code extensions.
+        .add_custom_ignore_filename(".augmentignore")
         .filter_entry(|entry| {
             if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                 let name = entry.file_name().to_str().unwrap_or("");
@@ -643,6 +663,132 @@ mod tests {
         assert!(
             filter.allows(&main_native),
             "src/main.rs must pass; candidate={main_native:?}"
+        );
+    }
+
+    /// Full-rebuild path: a top-level `.augmentignore` with a plain exclude
+    /// pattern must drop the matching file while a control file is still indexed.
+    /// Uses indexable extensions (.md/.rs) and paths outside SKIP_DIRS/dot-dirs so
+    /// the `.augmentignore` matcher is the deciding predicate.
+    #[test]
+    fn walk_repo_respects_augmentignore_exclude() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        fs::write(root.join(".augmentignore"), "notes.md\n/generated2\n").unwrap();
+
+        touch(root, "src/main.rs"); // control — indexed
+        touch(root, "notes.md"); // excluded by bare pattern
+        touch(root, "generated2/leak.rs"); // excluded by /generated2
+
+        let repo_str = root.to_str().unwrap();
+        let result: Vec<String> = walk_repo(repo_str).into_iter().map(|p| fwd(&p)).collect();
+
+        assert!(
+            result.iter().any(|p| p.ends_with("src/main.rs")),
+            "src/main.rs must be indexed; got: {:?}", result
+        );
+        assert!(
+            !result.iter().any(|p| p.ends_with("notes.md")),
+            "notes.md must be excluded by .augmentignore; got: {:?}", result
+        );
+        assert!(
+            !result.iter().any(|p| p.contains("generated2")),
+            "generated2/leak.rs must be excluded by .augmentignore; got: {:?}", result
+        );
+    }
+
+    /// Full-rebuild path: `.augmentignore` ranks ABOVE `.gitignore`, so a `!`
+    /// negation re-includes a file `.gitignore` excluded. A second file excluded
+    /// by `.gitignore` with no negation proves `.gitignore` still works.
+    /// All files use the indexable `.rs` extension so the allowlist never masks
+    /// the gitignore-layer result.
+    #[test]
+    fn walk_repo_augmentignore_negation_overrides_gitignore() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        // `WalkBuilder.git_ignore(true)` only honors `.gitignore` when the tree is
+        // a git repo (default `require_git`), so create an empty `.git` dir to make
+        // the gitignore layer active — otherwise `.gitignore` is a no-op and this
+        // test would not actually prove `.augmentignore` outranks it.
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::write(root.join(".gitignore"), "secret.rs\nalso_secret.rs\n").unwrap();
+        fs::write(root.join(".augmentignore"), "!secret.rs\n").unwrap();
+
+        touch(root, "secret.rs"); // re-included by .augmentignore negation
+        touch(root, "also_secret.rs"); // excluded by .gitignore, no negation
+        touch(root, "src/main.rs"); // control
+
+        let repo_str = root.to_str().unwrap();
+        let result: Vec<String> = walk_repo(repo_str).into_iter().map(|p| fwd(&p)).collect();
+
+        assert!(
+            result.iter().any(|p| p.ends_with("secret.rs") && !p.ends_with("also_secret.rs")),
+            "secret.rs must be re-included by .augmentignore !negation; got: {:?}", result
+        );
+        assert!(
+            !result.iter().any(|p| p.ends_with("also_secret.rs")),
+            "also_secret.rs must stay excluded by .gitignore (no negation); got: {:?}", result
+        );
+        assert!(
+            result.iter().any(|p| p.ends_with("src/main.rs")),
+            "src/main.rs control must be indexed; got: {:?}", result
+        );
+    }
+
+    /// `ChangeFilter` path: a root-level `.augmentignore` exclude pattern must
+    /// reject the matching file while a control file passes. Indexable extensions
+    /// and non-SKIP_DIRS/non-dot paths so the gitignore-layer is decisive.
+    #[test]
+    fn change_filter_respects_augmentignore_exclude() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        fs::write(root.join(".augmentignore"), "notes.md\n").unwrap();
+        touch(root, "notes.md");
+        touch(root, "src/main.rs");
+
+        let filter = ChangeFilter::new(root);
+
+        assert!(
+            !filter.allows(&root.join("notes.md")),
+            "notes.md must be excluded by .augmentignore"
+        );
+        assert!(
+            filter.allows(&root.join("src").join("main.rs")),
+            "src/main.rs must pass"
+        );
+    }
+
+    /// `ChangeFilter` path: `.augmentignore` is added LAST in the builder so its
+    /// `!secret.rs` negation outranks `.gitignore`'s `secret.rs` exclude and
+    /// re-includes the file. A gitignore-only-excluded control still returns false.
+    #[test]
+    fn change_filter_augmentignore_negation_overrides_gitignore() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        fs::write(root.join(".gitignore"), "secret.rs\nalso_secret.rs\n").unwrap();
+        fs::write(root.join(".augmentignore"), "!secret.rs\n").unwrap();
+
+        touch(root, "secret.rs");
+        touch(root, "also_secret.rs");
+        touch(root, "src/main.rs");
+
+        let filter = ChangeFilter::new(root);
+
+        assert!(
+            filter.allows(&root.join("secret.rs")),
+            "secret.rs must be re-included by .augmentignore !negation"
+        );
+        assert!(
+            !filter.allows(&root.join("also_secret.rs")),
+            "also_secret.rs must stay excluded by .gitignore (no negation)"
+        );
+        assert!(
+            filter.allows(&root.join("src").join("main.rs")),
+            "src/main.rs control must pass"
         );
     }
 }
