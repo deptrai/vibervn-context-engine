@@ -44,6 +44,23 @@ QUERY_MAX_TIME="${QUERY_MAX_TIME:-120}"
 # Append a line to BOTH stdout and the persisted results file.
 emit() { echo "$@"; echo "$@" >>"$RESULTS"; }
 
+# Parse the per-phase QueryTiming breakdown out of an /api/query JSON response
+# (the response already carries result.timing.{embed,search,graph,merge,rerank,total}_ms).
+# This attributes total query latency to its phases WITHOUT new server code.
+emit_query_timing() {  # emit_query_timing <label> <json>
+  local label="$1" json="$2"
+  printf '%s' "$json" | python -c "
+import sys, json
+label = sys.argv[1]
+try:
+    t = json.load(sys.stdin).get('timing', {})
+except Exception:
+    print(f'[bench] {label}_timing=UNPARSEABLE (empty/timeout response)'); sys.exit(0)
+keys = ['embed_ms','search_ms','graph_ms','merge_ms','rerank_ms','total_ms']
+print('[bench] %s_timing=%s' % (label, ' '.join('%s=%s'%(k, t.get(k,'?')) for k in keys)))
+" "$label" | tee -a "$RESULTS"
+}
+
 # repo_id = urlsafe-base64(no-pad) of normalized (lowercased, backslash) path.
 REPO_NORM="$(printf '%s' "$REPO" | tr '/' '\\' | tr 'A-Z' 'a-z')"
 REPO_ID="$(printf '%s' "$REPO_NORM" | base64 | tr '+/' '-_' | tr -d '=')"
@@ -136,6 +153,16 @@ QLAT=$(python -c "print('%.0f' % ((${Q_END} - ${Q_START})*1000))" 2>/dev/null ||
 QFLAG=""; [ -z "$QRESP" ] && QFLAG=" (EMPTY/timeout — bound=${QUERY_MAX_TIME}s, not a real latency)"
 emit "[bench] warm_same_process_query_latency_ms=${QLAT}${QFLAG}"
 emit "[bench] first_query_response_head=${QRESP:0:160}"
+# Per-phase attribution of THIS query's total (embed/search/graph/merge/rerank).
+emit_query_timing "warm_q1" "$QRESP"
+# Two more warm queries for steady-state per-phase numbers (first call can carry
+# one-off costs like lazy connection setup). This is the breakdown that tells us
+# whether the cold-query cost is query-embed (network, likely out of scope) vs
+# vector search / graph-expand (in-scope, the "time to query" half).
+for qn in 2 3; do
+  R="$(curl -sS --max-time "$QUERY_MAX_TIME" -X POST "${URL}/api/query" -H 'content-type: application/json' -d "$Q_BODY" 2>/dev/null || true)"
+  emit_query_timing "warm_q${qn}" "$R"
+done
 
 # Output-invariance digest: the call-graph endpoint reads calls.in_name/out_name.
 # A stable sorted digest (sorted node ids + sorted edge endpoint pairs, hashed)
@@ -174,12 +201,14 @@ CQLAT=$(python -c "print('%.0f' % ((${CQ_END} - ${CQ_START})*1000))" 2>/dev/null
 CQFLAG=""; [ -z "$CQRESP" ] && CQFLAG=" (EMPTY/timeout — bound=${QUERY_MAX_TIME}s; shard warm time is authoritative via shard_warm_log below)"
 emit "[bench] cold_first_query_latency_ms=${CQLAT}  (includes shard load_from_db warm)${CQFLAG}"
 emit "[bench] cold_first_query_response_head=${CQRESP:0:160}"
+emit_query_timing "cold_first" "$CQRESP"
 # A second query on the now-warm shard, for the warm/cold delta.
 WQ_START=$(date +%s.%N)
-curl -sS --max-time "$QUERY_MAX_TIME" -X POST "${URL}/api/query" -H 'content-type: application/json' -d "$Q_BODY" >/dev/null 2>&1 || true
+WQRESP="$(curl -sS --max-time "$QUERY_MAX_TIME" -X POST "${URL}/api/query" -H 'content-type: application/json' -d "$Q_BODY" 2>/dev/null || true)"
 WQ_END=$(date +%s.%N)
 WQLAT=$(python -c "print('%.0f' % ((${WQ_END} - ${WQ_START})*1000))" 2>/dev/null || echo "?")
 emit "[bench] cold_restart_warm_second_query_latency_ms=${WQLAT}  (shard already resident)"
+emit_query_timing "cold_warm2" "$WQRESP"
 # Surface the shard load_from_db warm time straight from the log (authoritative).
 # Compute the load->install delta for THIS repo: the two adjacent markers
 # "loaded embeddings into VectorIndex" then "installed vector shard repo=<repo>"
