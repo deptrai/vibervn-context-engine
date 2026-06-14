@@ -169,6 +169,18 @@ pub async fn open_db(data_dir: &Path, repo_path: &str, generation: u32) -> Resul
         .check()
         .context("schema DDL contained errors")?;
 
+    // Build the six drop-during-rebuild secondary indexes (symbol + calls) that
+    // SCHEMA_DDL deliberately omits. This is the crash-recovery cure for Theory-A:
+    // a repo that died mid-rebuild has those indexes dropped while rows remain; a
+    // foreground `DEFINE INDEX` over the populated table would roll back under the
+    // pinned RocksDB buffers and fail this open. ensure_secondary_indexes routes any
+    // missing index through `build_index_concurrently` (batched commits) and is a
+    // fast no-op when the index already exists (steady-state reopen) or the table is
+    // empty (fresh DB — defined instantly).
+    ensure_secondary_indexes(&db)
+        .await
+        .context("ensure secondary indexes")?;
+
     Ok(db)
 }
 
@@ -721,6 +733,356 @@ pub async fn run_migration_v5_to_v6(db: &Surreal<Db>) -> Result<()> {
 
     info!("migration v5→v6 complete");
     Ok(())
+}
+
+/// The six secondary indexes that the rebuild pipeline DROPS before its bulk write
+/// and that are therefore NOT defined in `SCHEMA_DDL` (see the SCHEMA_DDL doc comment).
+/// Each entry is `(index_name, table, field)`.
+const DROPPABLE_SECONDARY_INDEXES: &[(&str, &str, &str)] = &[
+    ("idx_symbol_file", "symbol", "file"),
+    ("idx_symbol_name", "symbol", "name"),
+    ("idx_calls_in_file", "calls", "in_file"),
+    ("idx_calls_out_file", "calls", "out_file"),
+    ("idx_calls_in_name", "calls", "in_name"),
+    ("idx_calls_out_name", "calls", "out_name"),
+];
+
+/// Return the set of secondary-index names currently defined on `table`.
+async fn defined_index_names(db: &Surreal<Db>, table: &str) -> Result<std::collections::BTreeSet<String>> {
+    #[derive(serde::Deserialize)]
+    struct TableInfo {
+        indexes: std::collections::BTreeMap<String, String>,
+    }
+    let info: Option<TableInfo> = db
+        .query(format!("INFO FOR TABLE {table}"))
+        .await
+        .context("INFO FOR TABLE")?
+        .take(0)
+        .context("take INFO FOR TABLE row")?;
+    Ok(info.map(|i| i.indexes.into_keys().collect()).unwrap_or_default())
+}
+
+/// Read the CONCURRENTLY-build status of a single, already-defined index via
+/// `INFO FOR INDEX <index> ON <table>`.
+///
+/// Returns the `building.status` string when a build record is present, or
+/// `None` when the `INFO FOR INDEX` row carries no `building` block / no
+/// `status` — which in SurrealDB 2.6.5 is exactly the shape of a plain,
+/// fully-built index (one defined on an empty table, or one whose CONCURRENTLY
+/// build has completed and whose transient `building` record is gone). This is
+/// the SAME `building` → `status` parse `build_index_concurrently` uses in its
+/// poll loop (kept identical so we match the real serialization rather than
+/// inventing a second shape).
+async fn index_building_status(
+    db: &Surreal<Db>,
+    index: &str,
+    table: &str,
+) -> Result<Option<String>> {
+    let info: Option<serde_json::Value> = db
+        .query(format!("INFO FOR INDEX {index} ON {table}"))
+        .await
+        .with_context(|| format!("INFO FOR INDEX {index} ON {table}"))?
+        .take(0)
+        .with_context(|| format!("take INFO FOR INDEX {index} ON {table} row"))?;
+    Ok(info
+        .as_ref()
+        .and_then(|v| v.get("building"))
+        .and_then(|b| b.get("status"))
+        .and_then(|s| s.as_str())
+        .map(|s| s.to_string()))
+}
+
+/// Decide whether an already-DEFINED index can be trusted as fully built from
+/// its `building.status` (as returned by [`index_building_status`]).
+///
+/// A `DEFINE INDEX … CONCURRENTLY` writes the index DEFINITION at kickoff (so
+/// `INFO FOR TABLE` immediately lists the name) while the BACKFILL runs in a
+/// background pass. If the process dies MID-backfill, the name is present but
+/// the index is only partially populated — and trusting name-presence alone
+/// would let a half-built index serve Phase-2 name lookups / queries with
+/// wrong/incomplete results. So an index is trustworthy ONLY when:
+///   - `None`     → no in-progress `building` record at all = a plain,
+///     fully-built index (empty-table define, or a completed concurrent build
+///     whose transient record is gone), or
+///   - `"ready"`  → the concurrent build reached completion.
+///
+/// Anything else — in-progress (`started`/`cleaning`/`indexing`) left by a
+/// crash, or a terminal failure (`error`/`aborted`) — is NOT trustworthy and
+/// must be dropped and rebuilt.
+fn index_status_is_trustworthy(status: Option<&str>) -> bool {
+    matches!(status, None | Some("ready"))
+}
+
+/// (Re)build the six drop-during-rebuild secondary indexes that `SCHEMA_DDL`
+/// deliberately omits (`idx_symbol_*`, `idx_calls_*`).
+///
+/// ROOT-CAUSE FIX (crash recovery, Theory-A): if a process dies AFTER the rebuild
+/// pipeline drops these indexes but BEFORE it rebuilds them, the table holds all its
+/// rows while the indexes are physically absent. Re-defining them in `SCHEMA_DDL`
+/// with a plain foreground `DEFINE INDEX … FIELDS …` would backfill every existing
+/// row in ONE transaction, which ROLLS BACK under the production-pinned RocksDB write
+/// buffers at kernel scale — and, because `open_db` runs `.check()` on `SCHEMA_DDL`,
+/// would fail the ENTIRE open of that repo (the original symptom: "schema DDL
+/// contained errors", repo unreopenable). Even absent the error the index would be
+/// missing → the kernel-query regression returns.
+///
+/// This helper is the single owner of populated-table builds for these six indexes.
+/// For each one:
+///   - present + fully built (`building.status` is `ready`, or there is no
+///     in-progress `building` record at all) → no-op (the steady-state reopen of a
+///     healthy indexed DB; the common case — one cheap `INFO FOR TABLE` per table
+///     plus one cheap `INFO FOR INDEX` per present index, no build).
+///   - present but NOT ready (a `DEFINE INDEX … CONCURRENTLY` whose backfill was
+///     interrupted by a crash — `building.status` is `indexing`/`cleaning`/`started`,
+///     or a terminal `error`/`aborted`) → `REMOVE INDEX` then `build_index_concurrently`,
+///     because a half-built index is listed by name yet would serve wrong/incomplete
+///     results to Phase-2 name lookups and queries. We do NOT trust SurrealDB to
+///     auto-resume an interrupted build (unverified in 2.6.5); we rebuild cleanly.
+///   - absent + table empty → define it in the foreground (instant, no backfill — the
+///     fresh-DB open; a full rebuild later drops+concurrently-rebuilds it anyway).
+///   - absent + table populated → `build_index_concurrently` (batched commits, polls
+///     to `ready`), which commits cleanly under the pinned buffers — the crash-recovery
+///     self-heal, with NO foreground backfill over a populated table.
+///
+/// Idempotent + crash-safe: re-running is a no-op once all six are present AND ready;
+/// an interrupted concurrent build (whether absent or present-but-not-ready) is
+/// re-driven to `ready` on the next open.
+pub async fn ensure_secondary_indexes(db: &Surreal<Db>) -> Result<()> {
+    // Cache the present-index set + emptiness per table so the healthy-reopen path
+    // (all six present) costs exactly two `INFO FOR TABLE` queries and no build.
+    let mut present: HashMap<&str, std::collections::BTreeSet<String>> = HashMap::new();
+    let mut empty: HashMap<&str, bool> = HashMap::new();
+
+    for &(index, table, field) in DROPPABLE_SECONDARY_INDEXES {
+        let names = match present.get(table) {
+            Some(n) => n,
+            None => {
+                let n = defined_index_names(db, table).await?;
+                present.entry(table).or_insert(n)
+            }
+        };
+        if names.contains(index) {
+            // Name present — but a `DEFINE INDEX … CONCURRENTLY` writes the
+            // definition (so the name shows up in `INFO FOR TABLE`) BEFORE its
+            // background backfill finishes. A crash mid-backfill leaves a
+            // half-built index that name-presence alone would treat as ready.
+            // Confirm the build actually reached `ready` (or carries no
+            // in-progress `building` record at all) before trusting it.
+            let status = index_building_status(db, index, table).await?;
+            if index_status_is_trustworthy(status.as_deref()) {
+                continue; // healthy reopen: index defined AND fully built → nothing to do.
+            }
+            // Present but not ready: a crash interrupted the concurrent backfill
+            // (or it failed). Do NOT rely on SurrealDB auto-resuming the build
+            // (unverified in 2.6.5). Drop the untrustworthy half-built index and
+            // rebuild it cleanly via the concurrent helper (which polls to `ready`
+            // and hard-errors on a terminal failure).
+            warn!(
+                %index, %table, ?status,
+                "secondary index present but its concurrent build is not 'ready' \
+                 (interrupted/failed backfill) — dropping and rebuilding concurrently"
+            );
+            db.query(format!("REMOVE INDEX IF EXISTS {index} ON {table};"))
+                .await
+                .with_context(|| format!("remove half-built {index} on {table}"))?
+                .check()
+                .with_context(|| format!("remove half-built {index} on {table} (check)"))?;
+            build_index_concurrently(db, index, table, field)
+                .await
+                .with_context(|| format!("rebuild half-built {index} concurrently"))?;
+            continue;
+        }
+
+        // Index absent. Decide foreground (empty table) vs concurrent (populated).
+        let is_empty = match empty.get(table) {
+            Some(&e) => e,
+            None => {
+                let row: Option<serde_json::Value> = db
+                    .query(format!("SELECT 1 FROM {table} LIMIT 1"))
+                    .await
+                    .with_context(|| format!("probe {table} emptiness"))?
+                    .take(0)
+                    .with_context(|| format!("take {table} emptiness row"))?;
+                let e = row.is_none();
+                *empty.entry(table).or_insert(e)
+            }
+        };
+
+        if is_empty {
+            // Fresh DB / empty table: a plain DEFINE INDEX has nothing to backfill,
+            // so it is instant and cannot trip the pinned-buffer rollback.
+            db.query(format!(
+                "DEFINE INDEX IF NOT EXISTS {index} ON {table} FIELDS {field};"
+            ))
+            .await
+            .with_context(|| format!("define {index} on empty {table}"))?
+            .check()
+            .with_context(|| format!("define {index} on empty {table} (check)"))?;
+        } else {
+            // Populated table with the index missing: the crash-recovery case. Build
+            // CONCURRENTLY (batched) so it survives the pinned buffers — never a
+            // foreground backfill over a populated table.
+            warn!(
+                %index, %table,
+                "secondary index absent on a populated table (likely a crash mid-rebuild) \
+                 — rebuilding concurrently"
+            );
+            build_index_concurrently(db, index, table, field)
+                .await
+                .with_context(|| format!("crash-recovery concurrent build of {index}"))?;
+        }
+    }
+    Ok(())
+}
+
+/// Build a secondary index over an already-populated table without a single
+/// monolithic transaction.
+///
+/// ROOT-CAUSE FIX (kernel-query regression): a plain foreground
+/// `DEFINE INDEX … FIELDS …` backfills every existing row inside ONE write
+/// transaction. Under the production-pinned RocksDB write buffers
+/// (`SURREAL_ROCKSDB_WRITE_BUFFER_SIZE` = 32 MiB × 2; see
+/// `engine_boot::set_rocksdb_memory_bounds`), that single transaction over
+/// millions of rows fails to commit — "Failed to commit transaction due to a
+/// read or write conflict" — and the ENTIRE `DEFINE INDEX` (including the index
+/// *definition*) rolls back, leaving `INFO FOR TABLE` with `indexes:{}`. The
+/// pipeline's rebuild sites issued the statement with `.await?` and NO
+/// `.check()`, so this statement-level rollback was silently swallowed: the run
+/// reported success while the secondary indexes were physically absent, turning
+/// every `WHERE out_name = …` / `WHERE file = …` into a full table scan
+/// (measured ~165s / ~129s per call at kernel scale). Verified empirically:
+/// the foreground build succeeds with SurrealDB's huge DEFAULT buffers but FAILS
+/// (rolls back, index absent) under the pinned 32 MiB buffers at 3.5M rows.
+///
+/// `CONCURRENTLY` (SurrealDB 2.x) builds the index in a background two-stage
+/// (initial + update) pass that batches its writes instead of one giant
+/// transaction, so it commits cleanly under the pinned buffers. Because the
+/// `DEFINE INDEX … CONCURRENTLY` statement returns immediately while the build
+/// continues asynchronously, we then POLL `INFO FOR INDEX` until
+/// `building.status == 'ready'` so the index is fully built and query-usable
+/// before this function returns — preserving the pipeline's invariant that the
+/// index exists before Phase 2 (symbol-name lookups) and before any query.
+///
+/// Idempotent + crash-safe: `IF NOT EXISTS` makes a re-run a no-op when the
+/// index is already present; a crash mid-build leaves the prior (possibly
+/// absent) definition, and the next full rebuild re-issues this build.
+pub async fn build_index_concurrently(
+    db: &Surreal<Db>,
+    index: &str,
+    table: &str,
+    field: &str,
+) -> Result<()> {
+    // `.check()` is MANDATORY here: `.await?` alone returns Ok even when the
+    // statement rolled back (the exact bug this fix addresses). A transient
+    // write-conflict on the kickoff statement is retried below.
+    let ddl = format!(
+        "DEFINE INDEX IF NOT EXISTS {index} ON {table} FIELDS {field} CONCURRENTLY;"
+    );
+
+    // Kick off the concurrent build. Retry a transient commit conflict on the
+    // (tiny) definition write itself — the heavy backfill happens in the
+    // background pass, not in this statement's transaction.
+    let mut last_err: Option<anyhow::Error> = None;
+    for attempt in 0..5u32 {
+        let outcome = match db.query(&ddl).await {
+            Ok(resp) => resp.check().map(|_| ()),
+            Err(e) => Err(e),
+        };
+        match outcome {
+            Ok(()) => {
+                last_err = None;
+                break;
+            }
+            Err(e) => {
+                last_err = Some(anyhow::Error::new(e).context(format!(
+                    "kick off concurrent build of {index} (attempt {attempt})"
+                )));
+                tokio::time::sleep(std::time::Duration::from_millis(200 * (attempt as u64 + 1)))
+                    .await;
+            }
+        }
+    }
+    if let Some(e) = last_err {
+        return Err(e);
+    }
+
+    // Poll INFO FOR INDEX until the background build reaches status 'ready'.
+    // While building, SurrealDB returns { building: { status: 'indexing',
+    // initial, pending, updated } }; on completion { building: { status:
+    // 'ready' } }. An index built when the table was empty (or already complete)
+    // reports 'ready' immediately. A FAILED build reports { status: 'error',
+    // error: <msg> } or { status: 'aborted' } — both terminal and handled below as
+    // a hard error return (never a forever-poll). No fixed cap for a HEALTHY slow
+    // build: a kernel-scale build legitimately takes tens of seconds, and the
+    // caller's run is already long-lived; we log progress so a long build is never
+    // silent.
+    let start = std::time::Instant::now();
+    let mut last_log = std::time::Instant::now();
+    loop {
+        let info: Option<serde_json::Value> = db
+            .query(format!("INFO FOR INDEX {index} ON {table}"))
+            .await
+            .context("INFO FOR INDEX")?
+            .take(0)
+            .context("take INFO FOR INDEX row")?;
+
+        // `building` is present only during/after a CONCURRENTLY build. Absent
+        // `building` (or absent status) means the index is a plain definition
+        // that is already complete (e.g. defined on an empty table by SCHEMA_DDL).
+        let status = info
+            .as_ref()
+            .and_then(|v| v.get("building"))
+            .and_then(|b| b.get("status"))
+            .and_then(|s| s.as_str())
+            .map(|s| s.to_string());
+
+        match status.as_deref() {
+            Some("ready") | None => {
+                info!(
+                    %index, %table,
+                    elapsed_ms = start.elapsed().as_millis() as u64,
+                    "concurrent index build ready"
+                );
+                return Ok(());
+            }
+            // Terminal FAILURE states (surrealdb 2.6.5 `BuildingStatus` →
+            // `Value`: see surrealdb-core/src/kvs/index.rs, the `From<BuildingStatus>`
+            // impl serializes `Aborted` → "aborted" and `Error(msg)` → {status:"error",
+            // error: msg}). These never progress to "ready", so we MUST return an error
+            // instead of polling forever — otherwise a failed CONCURRENTLY build (disk
+            // full, internal error, abort) wedges the per-repo indexing consumer
+            // indefinitely, blocking ALL future indexing for that repo.
+            Some("error") | Some("aborted") => {
+                let detail = info
+                    .as_ref()
+                    .and_then(|v| v.get("building"))
+                    .and_then(|b| b.get("error"))
+                    .and_then(|e| e.as_str())
+                    .unwrap_or("(no error detail)");
+                let st = status.as_deref().unwrap_or("error");
+                return Err(anyhow::anyhow!(
+                    "concurrent build of index {index} on {table} reached terminal status \
+                     '{st}' after {}ms: {detail}",
+                    start.elapsed().as_millis() as u64
+                ));
+            }
+            // Healthy in-progress states (started / cleaning / indexing): no fixed cap
+            // — a kernel-scale build legitimately takes tens of seconds; we log
+            // progress so a long build is never silent.
+            Some(_) => {
+                if last_log.elapsed() >= std::time::Duration::from_secs(5) {
+                    info!(
+                        %index, %table,
+                        elapsed_ms = start.elapsed().as_millis() as u64,
+                        building = ?info.as_ref().and_then(|v| v.get("building")),
+                        "concurrent index build in progress"
+                    );
+                    last_log = std::time::Instant::now();
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+        }
+    }
 }
 
 /// Return the shared `Surreal<Db>` handle for `repo`, opening and caching it on
@@ -1678,6 +2040,623 @@ mod stale_schema {
         assert!(
             rows.iter().any(|r| r.in_name.as_deref() == Some("/a.rs::foo")),
             "denormalized in_name/out_name read must work on NORMAL calls table"
+        );
+    }
+}
+
+// ─── Secondary-index persistence tests ────────────────────────────────────
+//
+// These tests pin the root-cause fix for the kernel-query regression: on the
+// persisted datastore `INFO FOR TABLE calls` / `INFO FOR TABLE symbol` returned
+// `indexes:{}` — the secondary indexes were PHYSICALLY ABSENT, so every
+// `WHERE out_name = $fqn` / `WHERE file = $f` was a full table scan (165s/129s
+// per call at kernel scale).
+//
+// MECHANISM — Theory-A (foreground-backfill rollback under pinned buffers).
+// The rebuild pipeline DROPS the symbol/calls secondary indexes before its bulk
+// write, then rebuilt them with a FOREGROUND `DEFINE INDEX … FIELDS …`. That
+// statement backfills every existing row inside ONE write transaction. Under the
+// production-pinned RocksDB write buffers (`SURREAL_ROCKSDB_WRITE_BUFFER_SIZE`
+// = 32 MiB × 2; see `engine_boot::set_rocksdb_memory_bounds`) that single
+// transaction over millions of rows fails to commit and the ENTIRE `DEFINE INDEX`
+// — including the index *definition* — ROLLS BACK, leaving `indexes:{}`. The fix
+// is `build_index_concurrently` (`DEFINE INDEX … CONCURRENTLY`, batched commits +
+// poll-to-ready), used by the three pipeline rebuild sites AND by
+// `ensure_secondary_indexes` on `open_db` for crash recovery. The `#[ignore]`d
+// `foreground_index_backfill_at_scale` test reproduces the rollback at volume
+// (and the CONCURRENTLY success under the same pinned bounds).
+//
+// NOT the mechanism — Theory-B (`DEFINE TABLE OVERWRITE` drops indexes). This was
+// the original (wrong) hypothesis. Verified FALSE against surrealdb 2.6.5
+// (`sql/statements/define/table.rs::DefineTableStatement::compute`): for a
+// non-view table, OVERWRITE only rewrites the table-definition record and clears
+// caches; it deletes table DATA (`txn.delp`) ONLY inside the `if let Some(view)`
+// branch, and never touches index definitions or index keys. So `symbol`/`calls`
+// keep their secondary indexes across an OVERWRITE reopen. (Because of this, the
+// six droppable indexes were removed from SCHEMA_DDL entirely — see its doc
+// comment — and are owned by `ensure_secondary_indexes`.)
+#[cfg(test)]
+mod index_persistence_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use tempfile::TempDir;
+
+    /// Pull the set of index names defined on a table via `INFO FOR TABLE`.
+    async fn table_index_names(db: &Surreal<Db>, table: &str) -> Vec<String> {
+        #[derive(serde::Deserialize)]
+        struct TableInfo {
+            indexes: BTreeMap<String, String>,
+        }
+        let info: Option<TableInfo> = db
+            .query(format!("INFO FOR TABLE {table}"))
+            .await
+            .expect("INFO FOR TABLE query")
+            .take(0)
+            .expect("take INFO FOR TABLE row");
+        let mut names: Vec<String> =
+            info.map(|i| i.indexes.into_keys().collect()).unwrap_or_default();
+        names.sort();
+        names
+    }
+
+    /// Recursively copy a quiesced RocksDB image, skipping the `LOCK` marker (a
+    /// new boot recreates it). Mirrors what a fresh OS process would open.
+    fn copy_db_image(src: &std::path::Path, dst: &std::path::Path) {
+        std::fs::create_dir_all(dst).expect("mkdir image dst");
+        for entry in std::fs::read_dir(src).expect("read image src") {
+            let entry = entry.expect("dir entry");
+            let name = entry.file_name();
+            let ty = entry.file_type().expect("file type");
+            let to = dst.join(&name);
+            if ty.is_dir() {
+                copy_db_image(&entry.path(), &to);
+            } else if name != "LOCK" {
+                std::fs::copy(entry.path(), &to).expect("copy image file");
+            }
+        }
+    }
+
+    /// THE crash-recovery contract test (real regression guard, not a tautology).
+    ///
+    /// Reproduces the precise state a crash mid-rebuild leaves on disk: a POPULATED
+    /// `symbol`/`calls` table with the secondary indexes DROPPED. We build that
+    /// state, quiesce it to a clean on-disk image, then open it from a FRESH path —
+    /// a faithful new-process server re-open.
+    ///
+    /// The fix's contract, which this asserts: `open_db` → `ensure_secondary_indexes`
+    /// rebuilds the absent indexes CONCURRENTLY (never a foreground backfill over the
+    /// populated table, which would roll back under the pinned RocksDB buffers and
+    /// fail the open — Theory-A), and the hot predicate is index-served afterward.
+    ///
+    /// Note this is NOT served by SCHEMA_DDL: the six droppable indexes were removed
+    /// from SCHEMA_DDL entirely, so a reopen that finds them absent MUST go through
+    /// `ensure_secondary_indexes` to restore them. (The kernel-scale rollback that
+    /// motivates CONCURRENTLY is reproduced by the `#[ignore]`d
+    /// `foreground_index_backfill_at_scale`; this test pins the recovery wiring at
+    /// unit speed.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn indexes_survive_cross_process_reopen() {
+        let build_home = TempDir::new().unwrap();
+        let repo = "/test/index_persistence";
+
+        // ── Boot 1: build a populated DB, then DROP the secondary indexes to
+        //    reproduce the crash-mid-rebuild on-disk state, then tear down so
+        //    RocksDB flushes a clean image. ──
+        let build_home_path = build_home.path().to_path_buf();
+        let repo_owned = repo.to_string();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build sacrificial runtime");
+            rt.block_on(async move {
+                let db = open_db(&build_home_path, &repo_owned, 0).await.expect("open boot1");
+                // Populate both tables so we reopen against non-empty tables (the
+                // production state: kernel = 2.63M symbols / 3.08M calls).
+                for i in 0..50 {
+                    db.query(format!(
+                        "INSERT INTO symbol {{ id: '/f.rs::s{i}', name: 's{i}', kind: 'function', \
+                         file: '/f.rs', line_start: {i}, line_end: {i}, signature: NONE, parent: NONE }}"
+                    )).await.expect("insert symbol").check().expect("symbol insert check");
+                    db.query(format!(
+                        "INSERT INTO calls {{ line: {i}, in_file: '/f.rs', out_file: '/g.rs', \
+                         in_name: '/f.rs::s{i}', out_name: '/g.rs::t{i}' }}"
+                    )).await.expect("insert call").check().expect("call insert check");
+                }
+                // Enter the crash window: drop ALL six secondary indexes while the
+                // rows remain (exactly the pipeline's pre-bulk-write drop state).
+                db.query(
+                    "REMOVE INDEX IF EXISTS idx_symbol_file ON symbol; \
+                     REMOVE INDEX IF EXISTS idx_symbol_name ON symbol; \
+                     REMOVE INDEX IF EXISTS idx_calls_in_file  ON calls; \
+                     REMOVE INDEX IF EXISTS idx_calls_out_file ON calls; \
+                     REMOVE INDEX IF EXISTS idx_calls_in_name  ON calls; \
+                     REMOVE INDEX IF EXISTS idx_calls_out_name ON calls;",
+                ).await.expect("drop indexes (enter crash window)").check().expect("drop check");
+                // Confirm we are genuinely IN the crash window: indexes absent, rows present.
+                let calls_idx = table_index_names(&db, "calls").await;
+                let symbol_idx = table_index_names(&db, "symbol").await;
+                assert!(
+                    !calls_idx.iter().any(|n| n.starts_with("idx_calls_"))
+                        && !symbol_idx.iter().any(|n| n.starts_with("idx_symbol_")),
+                    "boot1 must be in the crash window: indexes dropped (calls={calls_idx:?}, symbol={symbol_idx:?})"
+                );
+                drop(db);
+            });
+        })
+        .join()
+        .expect("boot1 build thread must not panic");
+
+        // ── Boot 2: open the quiesced image from a FRESH path (new-process boot).
+        //    open_db runs SCHEMA_DDL (no longer defines these six indexes) then
+        //    ensure_secondary_indexes, which must concurrently rebuild them over the
+        //    populated tables. ──
+        let reopen_home = TempDir::new().unwrap();
+        copy_db_image(
+            &db_path(build_home.path(), repo, 0),
+            &db_path(reopen_home.path(), repo, 0),
+        );
+        let db = open_db(reopen_home.path(), repo, 0).await.expect("open boot2");
+
+        let calls_idx = table_index_names(&db, "calls").await;
+        let symbol_idx = table_index_names(&db, "symbol").await;
+        assert!(
+            calls_idx.contains(&"idx_calls_out_name".to_string())
+                && calls_idx.contains(&"idx_calls_in_name".to_string())
+                && calls_idx.contains(&"idx_calls_in_file".to_string())
+                && calls_idx.contains(&"idx_calls_out_file".to_string()),
+            "after crash-recovery reopen, all 4 calls indexes MUST be rebuilt, got {calls_idx:?}"
+        );
+        assert!(
+            symbol_idx.contains(&"idx_symbol_file".to_string())
+                && symbol_idx.contains(&"idx_symbol_name".to_string()),
+            "after crash-recovery reopen, both symbol indexes MUST be rebuilt, got {symbol_idx:?}"
+        );
+
+        // The hot predicate must be served by the rebuilt index (not a full scan).
+        let plan: Vec<serde_json::Value> = db
+            .query("SELECT * FROM calls WHERE out_name = '/g.rs::t1' EXPLAIN")
+            .await
+            .expect("explain query")
+            .take(0)
+            .expect("take explain rows");
+        let plan_str = serde_json::to_string(&plan).expect("serialize plan");
+        assert!(
+            plan_str.contains("Iterate Index"),
+            "WHERE out_name=… must use an index after crash-recovery reopen (got plan: {plan_str})"
+        );
+    }
+
+    /// `build_index_concurrently` (the production fix) must, on a POPULATED table:
+    ///   (a) drive the build to completion (poll until building.status=='ready'),
+    ///   (b) leave the index present in `INFO FOR TABLE`, and
+    ///   (c) make the hot predicate use the index (EXPLAIN → "Iterate Index").
+    /// It must also be idempotent (a second call is a no-op via IF NOT EXISTS).
+    ///
+    /// This is the always-run guard for the root-cause fix: the pipeline rebuild
+    /// sites call exactly this helper. (The kernel-scale failure mode — a plain
+    /// foreground DEFINE INDEX rolling back under the pinned RocksDB buffers — is
+    /// reproduced separately by the `#[ignore]`d `foreground_index_backfill_at_scale`
+    /// with SURREAL_ROCKSDB_* set; this test pins the helper's contract at unit speed.)
+    #[tokio::test]
+    async fn build_index_concurrently_completes_and_is_usable() {
+        let home = TempDir::new().unwrap();
+        let repo = "/test/concurrent_build";
+        let db = open_db(home.path(), repo, 0).await.unwrap();
+
+        // Drop the index (as the pipeline does before its bulk write), then
+        // populate the table with the index absent.
+        db.query("REMOVE INDEX IF EXISTS idx_calls_out_name ON calls;")
+            .await
+            .expect("drop index")
+            .check()
+            .expect("drop check");
+        for i in 0..500 {
+            db.query(format!(
+                "INSERT INTO calls {{ line: {i}, in_file: '/f.rs', out_file: '/g.rs', \
+                 in_name: '/f.rs::c{i}', out_name: '/g.rs::t{}' }}",
+                i % 25
+            ))
+            .await
+            .expect("insert call")
+            .check()
+            .expect("insert check");
+        }
+
+        // Build via the production helper; must return only once ready.
+        super::build_index_concurrently(&db, "idx_calls_out_name", "calls", "out_name")
+            .await
+            .expect("concurrent build must complete");
+
+        let names = table_index_names(&db, "calls").await;
+        assert!(
+            names.contains(&"idx_calls_out_name".to_string()),
+            "index must be present after concurrent build (got {names:?})"
+        );
+
+        let plan: Vec<serde_json::Value> = db
+            .query("SELECT * FROM calls WHERE out_name = '/g.rs::t1' EXPLAIN")
+            .await
+            .expect("explain")
+            .take(0)
+            .expect("take explain");
+        assert!(
+            serde_json::to_string(&plan).unwrap_or_default().contains("Iterate Index"),
+            "predicate must use the index after concurrent build (plan: {plan:?})"
+        );
+
+        // Idempotent: a second build is a no-op and still leaves the index ready.
+        super::build_index_concurrently(&db, "idx_calls_out_name", "calls", "out_name")
+            .await
+            .expect("second concurrent build must be a no-op");
+        let names2 = table_index_names(&db, "calls").await;
+        assert!(
+            names2.contains(&"idx_calls_out_name".to_string()),
+            "index must remain present after idempotent re-build (got {names2:?})"
+        );
+    }
+
+    /// FRESH-DB open: SCHEMA_DDL no longer defines the six droppable indexes, so
+    /// `ensure_secondary_indexes` must define them on the EMPTY tables. This must be
+    /// instant (no backfill — empty tables) and leave all six present, so the
+    /// incremental write path (which relies on the live indexes) works immediately.
+    #[tokio::test]
+    async fn fresh_open_defines_all_six_indexes_on_empty_tables() {
+        let home = TempDir::new().unwrap();
+        let repo = "/test/fresh_open";
+        let db = open_db(home.path(), repo, 0).await.expect("fresh open");
+
+        let calls_idx = table_index_names(&db, "calls").await;
+        let symbol_idx = table_index_names(&db, "symbol").await;
+        assert!(
+            calls_idx.contains(&"idx_calls_in_file".to_string())
+                && calls_idx.contains(&"idx_calls_out_file".to_string())
+                && calls_idx.contains(&"idx_calls_in_name".to_string())
+                && calls_idx.contains(&"idx_calls_out_name".to_string()),
+            "fresh open must define all 4 calls indexes (got {calls_idx:?})"
+        );
+        assert!(
+            symbol_idx.contains(&"idx_symbol_file".to_string())
+                && symbol_idx.contains(&"idx_symbol_name".to_string()),
+            "fresh open must define both symbol indexes (got {symbol_idx:?})"
+        );
+    }
+
+    /// HEALTHY-REOPEN: `ensure_secondary_indexes` on a DB whose six indexes already
+    /// exist must NOT issue any build (no `DEFINE INDEX`, no CONCURRENTLY) — it is a
+    /// pure no-op driven by the per-table `INFO FOR TABLE` check. We assert it by
+    /// populating the tables, confirming the indexes are present, then calling the
+    /// helper directly: it must return quickly and leave everything intact (a
+    /// foreground backfill over the populated table would be the regression).
+    #[tokio::test]
+    async fn ensure_secondary_indexes_is_noop_on_healthy_indexed_db() {
+        let home = TempDir::new().unwrap();
+        let repo = "/test/healthy_reopen";
+        let db = open_db(home.path(), repo, 0).await.expect("open");
+
+        // Populate both tables; indexes are live (defined on the fresh open above).
+        for i in 0..200 {
+            db.query(format!(
+                "INSERT INTO symbol {{ id: '/f.rs::s{i}', name: 's{i}', kind: 'function', \
+                 file: '/f.rs', line_start: {i}, line_end: {i}, signature: NONE, parent: NONE }}"
+            )).await.expect("insert symbol").check().expect("symbol check");
+            db.query(format!(
+                "INSERT INTO calls {{ line: {i}, in_file: '/f.rs', out_file: '/g.rs', \
+                 in_name: '/f.rs::s{i}', out_name: '/g.rs::t{}' }}", i % 10
+            )).await.expect("insert call").check().expect("call check");
+        }
+        let before = table_index_names(&db, "calls").await;
+        assert!(before.len() >= 4, "indexes must be present before the no-op call (got {before:?})");
+
+        // Re-running ensure on the already-indexed, populated DB must be a no-op and
+        // must not error (it must NOT attempt a foreground backfill).
+        super::ensure_secondary_indexes(&db)
+            .await
+            .expect("ensure on healthy indexed DB must be a no-op");
+
+        let after_calls = table_index_names(&db, "calls").await;
+        let after_symbol = table_index_names(&db, "symbol").await;
+        assert!(
+            after_calls.len() >= 4 && after_symbol.len() >= 2,
+            "all indexes must remain after the no-op (calls={after_calls:?}, symbol={after_symbol:?})"
+        );
+    }
+
+    /// CRASH-RECOVERY ROUTING (same-process): drop the six indexes on a POPULATED
+    /// DB, then call `ensure_secondary_indexes`. It must rebuild every one (via the
+    /// concurrent helper — there is no foreground `DEFINE INDEX` over a populated
+    /// table anywhere in the open path) and leave the hot predicate index-served.
+    #[tokio::test]
+    async fn ensure_secondary_indexes_rebuilds_dropped_indexes_on_populated_db() {
+        let home = TempDir::new().unwrap();
+        let repo = "/test/recovery_routing";
+        let db = open_db(home.path(), repo, 0).await.expect("open");
+
+        for i in 0..200 {
+            db.query(format!(
+                "INSERT INTO symbol {{ id: '/f.rs::s{i}', name: 's{i}', kind: 'function', \
+                 file: '/f.rs', line_start: {i}, line_end: {i}, signature: NONE, parent: NONE }}"
+            )).await.expect("insert symbol").check().expect("symbol check");
+            db.query(format!(
+                "INSERT INTO calls {{ line: {i}, in_file: '/f.rs', out_file: '/g.rs', \
+                 in_name: '/f.rs::s{i}', out_name: '/g.rs::t{}' }}", i % 10
+            )).await.expect("insert call").check().expect("call check");
+        }
+
+        // Enter the crash window: indexes dropped, rows present.
+        db.query(
+            "REMOVE INDEX IF EXISTS idx_symbol_file ON symbol; \
+             REMOVE INDEX IF EXISTS idx_symbol_name ON symbol; \
+             REMOVE INDEX IF EXISTS idx_calls_in_file  ON calls; \
+             REMOVE INDEX IF EXISTS idx_calls_out_file ON calls; \
+             REMOVE INDEX IF EXISTS idx_calls_in_name  ON calls; \
+             REMOVE INDEX IF EXISTS idx_calls_out_name ON calls;",
+        ).await.expect("drop indexes").check().expect("drop check");
+        let dropped = table_index_names(&db, "calls").await;
+        assert!(
+            !dropped.iter().any(|n| n.starts_with("idx_calls_")),
+            "calls indexes must be absent before recovery (got {dropped:?})"
+        );
+
+        // Recovery: rebuild via the concurrent helper, polling to ready.
+        super::ensure_secondary_indexes(&db)
+            .await
+            .expect("ensure must rebuild dropped indexes on a populated table");
+
+        let calls_idx = table_index_names(&db, "calls").await;
+        let symbol_idx = table_index_names(&db, "symbol").await;
+        assert!(
+            calls_idx.len() >= 4 && symbol_idx.len() >= 2,
+            "all six indexes must be rebuilt (calls={calls_idx:?}, symbol={symbol_idx:?})"
+        );
+        let plan: Vec<serde_json::Value> = db
+            .query("SELECT * FROM calls WHERE out_name = '/g.rs::t1' EXPLAIN")
+            .await
+            .expect("explain")
+            .take(0)
+            .expect("take explain");
+        assert!(
+            serde_json::to_string(&plan).unwrap_or_default().contains("Iterate Index"),
+            "predicate must use the rebuilt index (plan: {plan:?})"
+        );
+    }
+
+    /// STATUS-TRUST DECISION (pure): the gate that distinguishes a fully-built
+    /// present index from a crash-interrupted half-built one. Only `None` (no
+    /// in-progress `building` record — a plain/completed index) and `"ready"`
+    /// (a finished concurrent build) are trustworthy; every other status —
+    /// in-progress (`started`/`cleaning`/`indexing`) left by a crash, or a
+    /// terminal failure (`error`/`aborted`) — must route to drop+rebuild.
+    #[test]
+    fn index_status_trust_gate_only_trusts_ready_or_absent() {
+        assert!(super::index_status_is_trustworthy(None), "absent building record = built");
+        assert!(super::index_status_is_trustworthy(Some("ready")), "ready = built");
+        for bad in ["started", "cleaning", "indexing", "error", "aborted", "weird"] {
+            assert!(
+                !super::index_status_is_trustworthy(Some(bad)),
+                "status {bad:?} must NOT be trusted (half-built / failed)"
+            );
+        }
+    }
+
+    /// STATUS PARSE + HEALTHY FAST-PATH (real DB): proves we read the REAL
+    /// `INFO FOR INDEX` serialization, and that a fully-built present index is
+    /// classified trustworthy so `ensure_secondary_indexes` leaves it untouched
+    /// (no drop, no rebuild).
+    ///
+    /// COVERAGE HONESTY: SurrealDB exposes no SQL to forge a *mid-build*
+    /// `building.status` (the `building` record is internal KV state managed by
+    /// the concurrent builder; it cannot be hand-set), so a true interrupted-
+    /// build image is not deterministically constructable in a unit test. We
+    /// therefore split the proof: this test pins the real "built → trustworthy →
+    /// skip" serialization end-to-end, while `index_status_trust_gate_only_trusts_
+    /// ready_or_absent` exhaustively pins the not-ready → rebuild routing on the
+    /// exact status strings SurrealDB emits, and `ensure_secondary_indexes_
+    /// rebuilds_dropped_indexes_on_populated_db` pins the drop→concurrent-rebuild
+    /// mechanics. What is NOT directly exercised: a literal process-crash leaving
+    /// `building.status == 'indexing'` persisted on disk.
+    #[tokio::test]
+    async fn present_built_index_reports_ready_and_is_left_untouched() {
+        let home = TempDir::new().unwrap();
+        let repo = "/test/status_fast_path";
+        let db = open_db(home.path(), repo, 0).await.expect("open");
+
+        // Populate, then build idx_calls_out_name via the production helper so it
+        // carries a real (completed) concurrent-build record.
+        db.query("REMOVE INDEX IF EXISTS idx_calls_out_name ON calls;")
+            .await
+            .expect("drop")
+            .check()
+            .expect("drop check");
+        for i in 0..200 {
+            db.query(format!(
+                "INSERT INTO calls {{ line: {i}, in_file: '/f.rs', out_file: '/g.rs', \
+                 in_name: '/f.rs::c{i}', out_name: '/g.rs::t{}' }}",
+                i % 10
+            ))
+            .await
+            .expect("insert")
+            .check()
+            .expect("insert check");
+        }
+        super::build_index_concurrently(&db, "idx_calls_out_name", "calls", "out_name")
+            .await
+            .expect("concurrent build");
+
+        // The real INFO FOR INDEX status of a completed build is either 'ready'
+        // or carries no in-progress building record — both trustworthy.
+        let status = super::index_building_status(&db, "idx_calls_out_name", "calls")
+            .await
+            .expect("read status");
+        assert!(
+            super::index_status_is_trustworthy(status.as_deref()),
+            "a completed concurrent build must read as trustworthy (got {status:?})"
+        );
+
+        // ensure_secondary_indexes must now leave this present+ready index alone:
+        // the index stays present and the predicate stays index-served (a spurious
+        // drop+rebuild would still leave it present, so we also assert the row set
+        // is intact and queryable to catch an accidental data-affecting rebuild).
+        super::ensure_secondary_indexes(&db)
+            .await
+            .expect("ensure on healthy DB");
+        let names = table_index_names(&db, "calls").await;
+        assert!(
+            names.contains(&"idx_calls_out_name".to_string()),
+            "present+ready index must remain after ensure (got {names:?})"
+        );
+        let plan: Vec<serde_json::Value> = db
+            .query("SELECT * FROM calls WHERE out_name = '/g.rs::t1' EXPLAIN")
+            .await
+            .expect("explain")
+            .take(0)
+            .expect("take explain");
+        assert!(
+            serde_json::to_string(&plan).unwrap_or_default().contains("Iterate Index"),
+            "predicate must stay index-served after the healthy no-op (plan: {plan:?})"
+        );
+    }
+
+    /// SCALE REPRO — THE source-of-truth demonstration of Theory-A (ignored by
+    /// default; run with `--ignored` and `IDX_SCALE_ROWS=<n>`). Mirrors the EXACT
+    /// pipeline path that the kernel rebuild takes and that the small-scale tests
+    /// never exercise:
+    ///   drop the secondary index → bulk-INSERT N rows with NO index live →
+    ///   foreground `DEFINE INDEX` that must BACKFILL all N existing rows.
+    ///
+    /// The small crash/rebuild tests only ever backfill ≤50 rows, where the build
+    /// trivially succeeds regardless of the fix (which is exactly why they are NOT a
+    /// regression guard for Theory-A on their own — they prove the recovery WIRING,
+    /// not the scale failure). This test scales the backfill to confirm the
+    /// foreground build itself ROLLS BACK at volume under the pinned RocksDB buffers
+    /// (and that `.await?` WITHOUT `.check()` silently swallows it, leaving
+    /// `INFO FOR TABLE` with `indexes:{}` exactly as the kernel DB showed) — and,
+    /// with `IDX_SCALE_CONCURRENTLY=1`, that `build_index_concurrently` succeeds
+    /// under the same bounds. That concurrent helper is what both the pipeline
+    /// rebuild sites AND `ensure_secondary_indexes` (crash-recovery on open) use, so
+    /// this test underwrites the whole drop→rebuild→reopen chain at true scale.
+    ///
+    /// Kept `#[ignore]`d because a faithful repro needs millions of rows (minutes +
+    /// the pinned-buffer env), too slow for the default suite. The unit-speed
+    /// regression guards are `indexes_survive_cross_process_reopen` (recovery wiring)
+    /// and `build_index_concurrently_completes_and_is_usable` (helper contract).
+    ///
+    /// Set IDX_SCALE_ROWS to e.g. 3000000 to match kernel `calls` cardinality.
+    #[tokio::test]
+    #[ignore = "scale repro; run explicitly with IDX_SCALE_ROWS set"]
+    async fn foreground_index_backfill_at_scale() {
+        let rows: usize = std::env::var("IDX_SCALE_ROWS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1_000_000);
+        let home = TempDir::new().unwrap();
+        let repo = "/test/idx_scale";
+        let db = open_db(home.path(), repo, 0).await.unwrap();
+
+        // Drop the calls indexes (as the pipeline does before its bulk write).
+        db.query(
+            "REMOVE INDEX IF EXISTS idx_calls_in_file  ON calls; \
+             REMOVE INDEX IF EXISTS idx_calls_out_file ON calls; \
+             REMOVE INDEX IF EXISTS idx_calls_in_name  ON calls; \
+             REMOVE INDEX IF EXISTS idx_calls_out_name ON calls;",
+        )
+        .await
+        .expect("drop calls indexes")
+        .check()
+        .expect("drop check");
+
+        // Bulk-insert N rows with NO index live (native array INSERT, like the
+        // pipeline's flush_edge_batch).
+        use std::collections::BTreeMap;
+        use surrealdb::sql::{Array as SqlArray, Object as SqlObject, Value as SqlValue};
+        let mut written = 0usize;
+        while written < rows {
+            let batch = std::cmp::min(20_000, rows - written);
+            let records: Vec<SqlValue> = (0..batch)
+                .map(|i| {
+                    let n = written + i;
+                    // Skew control: IDX_SCALE_DISTINCT caps the number of distinct
+                    // out_name/in_name values, reproducing the kernel's hot-symbol
+                    // skew (printk etc. appear in tens of thousands of rows). When
+                    // unset, keys are unique (low skew).
+                    let distinct: usize = std::env::var("IDX_SCALE_DISTINCT")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(usize::MAX);
+                    let key = if distinct == usize::MAX { n } else { n % distinct };
+                    let mut m: BTreeMap<String, SqlValue> = BTreeMap::new();
+                    m.insert("line".into(), SqlValue::from(n as i64));
+                    m.insert("in_file".into(), SqlValue::from(format!("/f{}.rs", n % 4096)));
+                    m.insert("out_file".into(), SqlValue::from(format!("/g{}.rs", n % 4096)));
+                    m.insert("in_name".into(), SqlValue::from(format!("/f{}.rs::c{key}", key % 4096)));
+                    m.insert("out_name".into(), SqlValue::from(format!("/g{}.rs::t{key}", key % 4096)));
+                    SqlValue::Object(SqlObject::from(m))
+                })
+                .collect();
+            db.query("INSERT INTO calls $data RETURN NONE")
+                .bind(("data", SqlArray::from(records)))
+                .await
+                .expect("bulk insert calls")
+                .check()
+                .expect("bulk insert check");
+            written += batch;
+        }
+
+        // Foreground DEFINE INDEX that must backfill all N rows. Capture the
+        // response and run BOTH .await (transport) and .check() (statement) so we
+        // can see whether a statement-level failure is being produced at scale.
+        // Set IDX_SCALE_CONCURRENTLY=1 to instead exercise the CONCURRENTLY +
+        // poll-to-ready fix path under the same pinned bounds.
+        let concurrently = std::env::var("IDX_SCALE_CONCURRENTLY").is_ok();
+        let t = std::time::Instant::now();
+        if concurrently {
+            build_index_concurrently(&db, "idx_calls_out_name", "calls", "out_name")
+                .await
+                .expect("concurrent build must succeed under pinned bounds");
+            eprintln!(
+                "SCALE rows={rows} CONCURRENTLY build elapsed_ms={}",
+                t.elapsed().as_millis()
+            );
+        } else {
+            let resp = db
+                .query(
+                    "DEFINE INDEX IF NOT EXISTS idx_calls_out_name ON calls FIELDS out_name;",
+                )
+                .await;
+            let await_ok = resp.is_ok();
+            let check_result = match resp {
+                Ok(r) => r.check().map(|_| ()),
+                Err(e) => Err(e),
+            };
+            eprintln!(
+                "SCALE rows={rows} define_index await_ok={await_ok} check_ok={} elapsed_ms={}",
+                check_result.is_ok(),
+                t.elapsed().as_millis()
+            );
+            if let Err(e) = &check_result {
+                eprintln!("SCALE define_index CHECK ERROR: {e:#}");
+            }
+        }
+
+        // Report whether the index definition actually persisted.
+        let names = table_index_names(&db, "calls").await;
+        eprintln!("SCALE post-build calls indexes = {names:?}");
+        let plan: Vec<serde_json::Value> = db
+            .query("SELECT * FROM calls WHERE out_name = '/g1.rs::t1' EXPLAIN")
+            .await
+            .expect("explain")
+            .take(0)
+            .expect("take explain");
+        eprintln!(
+            "SCALE plan uses index = {}",
+            serde_json::to_string(&plan).unwrap_or_default().contains("Iterate Index")
+        );
+
+        // The fix must make this hold even at scale. If the foreground build is
+        // the culprit, this assertion fails (index absent) BEFORE the fix.
+        assert!(
+            names.contains(&"idx_calls_out_name".to_string()),
+            "idx_calls_out_name must exist after a backfill build over {rows} rows (got {names:?})"
         );
     }
 }

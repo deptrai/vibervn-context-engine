@@ -27,6 +27,7 @@ use crate::store::ops::{
     FileMeta, delete_all_data, delete_files_data_bulk, get_all_file_meta,
     get_meta, set_meta, upsert_file_meta, find_symbols_by_names_with_pos, SymbolWithPos,
 };
+use crate::store::build_index_concurrently;
 use crate::vector::{ChunkId, ShardedVectorIndex};
 
 /// Batch size for DB writes — keeps per-query payload small and avoids the
@@ -1216,10 +1217,15 @@ impl IndexPipeline {
         // Incremental keeps writing through the live indexes (cheap at small N).
         //
         // Crash-safety (D4): a crash between this drop and the post-tail-flush rebuild
-        // leaves symbol ROWS intact but these two secondary indexes missing. `SCHEMA_DDL`
-        // (store/schema.rs:39-40) runs `DEFINE INDEX IF NOT EXISTS idx_symbol_file/_name`
-        // on every `open_db`, which re-creates AND rebuilds them over the existing rows on
-        // the next startup. No data loss; file_meta crash-safety ordering is untouched.
+        // leaves symbol ROWS intact but these two secondary indexes missing. Recovery
+        // is owned by `store::ensure_secondary_indexes`, which `open_db` runs on every
+        // open: it finds the indexes absent on the (populated) symbol table and
+        // rebuilds them via `build_index_concurrently` (batched commits, poll-to-ready)
+        // — NEVER a foreground `DEFINE INDEX` backfill, which would roll back under the
+        // pinned RocksDB buffers at kernel scale and fail the entire open. (These two
+        // indexes are deliberately NOT defined in `SCHEMA_DDL` — see store/schema.rs —
+        // precisely so the foreground-backfill rollback can never reoccur on recovery.)
+        // No data loss; file_meta crash-safety ordering is untouched.
         if is_full_rebuild {
             let t_sym_idx_drop = Instant::now();
             db.query(
@@ -1511,12 +1517,19 @@ impl IndexPipeline {
         // not be conflated. Gated on `is_full_rebuild` to pair with the drop above (D5).
         if is_full_rebuild {
             let t_sym_idx_rebuild = Instant::now();
-            db.query(
-                "DEFINE INDEX idx_symbol_file ON symbol FIELDS file; \
-                 DEFINE INDEX idx_symbol_name ON symbol FIELDS name;"
-            ).await.context("streaming_index: rebuild symbol indexes")?;
+            // Build CONCURRENTLY + poll to ready (see store::build_index_concurrently).
+            // A plain foreground `DEFINE INDEX` backfills all symbol rows in ONE
+            // transaction, which ROLLS BACK under the production-pinned RocksDB
+            // write buffers at kernel scale (commit conflict) — leaving the index
+            // absent and every name lookup a full scan. CONCURRENTLY batches the
+            // backfill; the poll guarantees the index is query-usable before
+            // Phase 2's name lookups run.
+            build_index_concurrently(db, "idx_symbol_file", "symbol", "file")
+                .await.context("streaming_index: build idx_symbol_file")?;
+            build_index_concurrently(db, "idx_symbol_name", "symbol", "name")
+                .await.context("streaming_index: build idx_symbol_name")?;
             sym_idx_rebuild_ms = t_sym_idx_rebuild.elapsed().as_millis() as u64;
-            info!(repo = %self.repo, sym_idx_rebuild_ms, "stage3: rebuilt symbol indexes synchronously (full rebuild)");
+            info!(repo = %self.repo, sym_idx_rebuild_ms, "stage3: rebuilt symbol indexes concurrently (full rebuild)");
         }
 
         if !pending_chunk_batch.is_empty() {
@@ -1996,19 +2009,25 @@ impl IndexPipeline {
         p2.relate_write_ms += t_flush_tail.elapsed().as_millis() as u64;
         info!(repo = %self.repo, flush_tail_ms = t_flush_tail.elapsed().as_millis() as u64, "phase2: tail flush complete");
 
-        // Rebuild calls indexes synchronously after all bulk RELATEs are committed.
-        // Synchronous (no CONCURRENTLY) so the rebuild completes before this function
-        // returns — the index is fully available and the wall-clock is honestly counted.
-        // idx_rebuild_ms > 0 in logs proves the rebuild is real and not deferred.
+        // Rebuild calls indexes after all bulk RELATEs are committed. Build
+        // CONCURRENTLY + poll to ready (see store::build_index_concurrently): a
+        // plain foreground `DEFINE INDEX` backfills all calls rows in ONE
+        // transaction, which ROLLS BACK under the production-pinned RocksDB write
+        // buffers at kernel scale (commit conflict) — leaving the indexes absent
+        // and every WHERE out_name/in_name a full scan. CONCURRENTLY batches the
+        // backfill; the poll guarantees each index is query-usable before the
+        // marker is stamped and before any query runs.
         let t_idx_rebuild = Instant::now();
-        db.query(
-            "DEFINE INDEX IF NOT EXISTS idx_calls_in_file  ON calls FIELDS in_file; \
-             DEFINE INDEX IF NOT EXISTS idx_calls_out_file ON calls FIELDS out_file; \
-             DEFINE INDEX IF NOT EXISTS idx_calls_in_name  ON calls FIELDS in_name; \
-             DEFINE INDEX IF NOT EXISTS idx_calls_out_name ON calls FIELDS out_name;"
-        ).await.context("phase2: rebuild calls indexes")?;
+        build_index_concurrently(db, "idx_calls_in_file", "calls", "in_file")
+            .await.context("phase2: build idx_calls_in_file")?;
+        build_index_concurrently(db, "idx_calls_out_file", "calls", "out_file")
+            .await.context("phase2: build idx_calls_out_file")?;
+        build_index_concurrently(db, "idx_calls_in_name", "calls", "in_name")
+            .await.context("phase2: build idx_calls_in_name")?;
+        build_index_concurrently(db, "idx_calls_out_name", "calls", "out_name")
+            .await.context("phase2: build idx_calls_out_name")?;
         p2.idx_rebuild_ms = t_idx_rebuild.elapsed().as_millis() as u64;
-        info!(repo = %self.repo, idx_rebuild_ms = p2.idx_rebuild_ms, "phase2: rebuilt calls indexes synchronously");
+        info!(repo = %self.repo, idx_rebuild_ms = p2.idx_rebuild_ms, "phase2: rebuilt calls indexes concurrently");
 
         // Stamp the edges_resolved marker ONLY after all pages commit AND indexes rebuild.
         set_meta(db, EDGES_RESOLVED_KEY, "1")
@@ -2192,16 +2211,25 @@ impl IndexPipeline {
         p2.relate_write_ms = relate_write_ms;
         p2.edges_written = edges_written;
 
-        // Rebuild calls indexes synchronously (same as DB-scan Phase 2).
+        // Rebuild calls indexes (same as DB-scan Phase 2). Build CONCURRENTLY +
+        // poll to ready (see store::build_index_concurrently): a plain foreground
+        // `DEFINE INDEX` backfills all calls rows in ONE transaction, which ROLLS
+        // BACK under the production-pinned RocksDB write buffers at kernel scale
+        // (this is the kernel path — RAM-buffered edges) — leaving the indexes
+        // absent and every WHERE out_name/in_name a full scan. CONCURRENTLY
+        // batches the backfill; the poll guarantees query-usability before the
+        // marker is stamped.
         let t_idx_rebuild = Instant::now();
-        db.query(
-            "DEFINE INDEX IF NOT EXISTS idx_calls_in_file  ON calls FIELDS in_file; \
-             DEFINE INDEX IF NOT EXISTS idx_calls_out_file ON calls FIELDS out_file; \
-             DEFINE INDEX IF NOT EXISTS idx_calls_in_name  ON calls FIELDS in_name; \
-             DEFINE INDEX IF NOT EXISTS idx_calls_out_name ON calls FIELDS out_name;"
-        ).await.context("phase2(ram): rebuild calls indexes")?;
+        build_index_concurrently(db, "idx_calls_in_file", "calls", "in_file")
+            .await.context("phase2(ram): build idx_calls_in_file")?;
+        build_index_concurrently(db, "idx_calls_out_file", "calls", "out_file")
+            .await.context("phase2(ram): build idx_calls_out_file")?;
+        build_index_concurrently(db, "idx_calls_in_name", "calls", "in_name")
+            .await.context("phase2(ram): build idx_calls_in_name")?;
+        build_index_concurrently(db, "idx_calls_out_name", "calls", "out_name")
+            .await.context("phase2(ram): build idx_calls_out_name")?;
         p2.idx_rebuild_ms = t_idx_rebuild.elapsed().as_millis() as u64;
-        info!(repo = %self.repo, idx_rebuild_ms = p2.idx_rebuild_ms, relate_write_ms, "phase2(ram): rebuilt calls indexes synchronously");
+        info!(repo = %self.repo, idx_rebuild_ms = p2.idx_rebuild_ms, relate_write_ms, "phase2(ram): rebuilt calls indexes concurrently");
 
         // Stamp edges_resolved marker.
         set_meta(db, EDGES_RESOLVED_KEY, "1")
@@ -3518,9 +3546,13 @@ mod symbol_index_drop_rebuild {
     /// 5.5 — Crash-safety of the drop/rebuild window (D4). If the process dies
     /// AFTER the secondary symbol indexes are dropped but BEFORE the post-build
     /// rebuild, the indexes are missing on disk while rows exist. The next
-    /// `open_db` runs `SCHEMA_DDL` (`DEFINE INDEX IF NOT EXISTS idx_symbol_file/
-    /// idx_symbol_name`) which re-defines both indexes over the existing rows —
-    /// self-healing the crash window with no manual rebuild and no data loss.
+    /// `open_db` runs `store::ensure_secondary_indexes`, which finds the indexes
+    /// absent on the populated symbol table and rebuilds them via
+    /// `build_index_concurrently` (CONCURRENTLY — never a foreground backfill that
+    /// would roll back under the pinned RocksDB buffers at scale) — self-healing the
+    /// crash window with no manual rebuild and no data loss. (At this test's tiny
+    /// row count the rebuild is instant either way; the scale failure that motivates
+    /// CONCURRENTLY is proven by `store::foreground_index_backfill_at_scale`.)
     ///
     /// This exercises the EXACT crash window rather than reading the DDL:
     ///   open → drop indexes → write rows → assert ABSENT (in the window) →
@@ -3578,7 +3610,8 @@ mod symbol_index_drop_rebuild {
                 .build()
                 .expect("build sacrificial runtime");
             rt.block_on(async move {
-                // Step 1 — first boot: open_db runs SCHEMA_DDL, defining both indexes.
+                // Step 1 — first boot: open_db defines both indexes (on the empty
+                // table, via ensure_secondary_indexes).
                 let db = open_db(&crash_home_path, &repo_for_thread, 0)
                     .await
                     .expect("open db (boot 1)");
@@ -3649,13 +3682,14 @@ mod symbol_index_drop_rebuild {
         let boot2_home = TempDir::new().unwrap();
         copy_crash_image(crash_home.path(), boot2_home.path());
 
-        // Step 6 — next boot: open_db on the crash image; it runs SCHEMA_DDL again.
+        // Step 6 — next boot: open_db on the crash image; it runs
+        // ensure_secondary_indexes after SCHEMA_DDL.
         let db = open_db(boot2_home.path(), &repo, 0)
             .await
             .expect("open db (boot 2, post-crash)");
 
-        // Step 7 — self-heal: SCHEMA_DDL's IF NOT EXISTS re-defined BOTH indexes
-        // over the existing rows.
+        // Step 7 — self-heal: ensure_secondary_indexes found both indexes absent on
+        // the populated symbol table and rebuilt them concurrently over the rows.
         let healed = symbol_index_names(&db).await;
         assert!(
             healed.iter().any(|n| n == "idx_symbol_file"),

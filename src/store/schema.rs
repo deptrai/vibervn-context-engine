@@ -14,6 +14,23 @@
 /// Index definitions use `IF NOT EXISTS` so that re-running the DDL on a live database
 /// never triggers a rebuild of an existing index unnecessarily; a new index name will
 /// still be created.
+///
+/// EXCEPTION — the six secondary indexes that the rebuild pipeline DROPS
+/// (`idx_symbol_file`, `idx_symbol_name`, `idx_calls_in_file`, `idx_calls_out_file`,
+/// `idx_calls_in_name`, `idx_calls_out_name`) are DELIBERATELY NOT defined here.
+/// A plain foreground `DEFINE INDEX … FIELDS …` backfills every existing row inside
+/// ONE write transaction; over a POPULATED table at kernel scale (2.63M symbols /
+/// 3.08M calls) that single transaction exceeds the production-pinned RocksDB write
+/// buffers (`SURREAL_ROCKSDB_WRITE_BUFFER_SIZE` = 32 MiB × 2; see
+/// `engine_boot::set_rocksdb_memory_bounds`) and ROLLS BACK — including the index
+/// *definition*. Because `open_db` runs `.check()` on this DDL, that rollback would
+/// surface as "schema DDL contained errors" and fail the ENTIRE open of a repo that
+/// crashed mid-rebuild (indexes dropped, rows present). These six indexes are instead
+/// (re)built exclusively by `store::ensure_secondary_indexes` (called right after this
+/// DDL in `open_db`) via `build_index_concurrently`, which batches its backfill and
+/// commits cleanly under the pinned buffers — and which is a fast no-op when the index
+/// already exists (the steady-state reopen). Defining them here would reintroduce the
+/// foreground-backfill rollback (Theory-A) on every crash-recovery reopen.
 pub const SCHEMA_DDL: &str = r#"
 -- SCHEMALESS: a SCHEMAFULL symbol table enforces per-field types. The native
 -- sql::Array INSERT path writes `parent` as a plain string ("symbol:⟨fqn⟩"), which
@@ -36,8 +53,10 @@ REMOVE FIELD IF EXISTS line_start ON symbol;
 REMOVE FIELD IF EXISTS line_end   ON symbol;
 REMOVE FIELD IF EXISTS signature  ON symbol;
 REMOVE FIELD IF EXISTS parent     ON symbol;
-DEFINE INDEX IF NOT EXISTS idx_symbol_file ON symbol FIELDS file;
-DEFINE INDEX IF NOT EXISTS idx_symbol_name ON symbol FIELDS name;
+-- NOTE: idx_symbol_file / idx_symbol_name are NOT defined here — they are built by
+-- store::ensure_secondary_indexes (CONCURRENTLY) so a populated symbol table that
+-- lost its indexes to a mid-rebuild crash is never foreground-backfilled on reopen
+-- (see the SCHEMA_DDL doc comment, Theory-A).
 
 -- SCHEMALESS: per-element array<float> validation on `embedding` costs ~530ms/95-chunk
 -- insert (SurrealDB 2.x). Removing SCHEMAFULL drops this to ~83ms (8.9×). Field type
@@ -66,10 +85,12 @@ DEFINE FIELD OVERWRITE in_file  ON calls TYPE string;
 DEFINE FIELD OVERWRITE out_file ON calls TYPE string;
 DEFINE FIELD OVERWRITE in_name  ON calls TYPE option<string>;
 DEFINE FIELD OVERWRITE out_name ON calls TYPE option<string>;
-DEFINE INDEX IF NOT EXISTS idx_calls_in_file  ON calls FIELDS in_file;
-DEFINE INDEX IF NOT EXISTS idx_calls_out_file ON calls FIELDS out_file;
-DEFINE INDEX IF NOT EXISTS idx_calls_in_name  ON calls FIELDS in_name;
-DEFINE INDEX IF NOT EXISTS idx_calls_out_name ON calls FIELDS out_name;
+-- NOTE: idx_calls_in_file / idx_calls_out_file / idx_calls_in_name / idx_calls_out_name
+-- are NOT defined here — they are built by store::ensure_secondary_indexes
+-- (CONCURRENTLY). A crash mid-Phase-2 leaves calls rows present with these indexes
+-- dropped; a foreground DEFINE INDEX over them on reopen would roll back under the
+-- pinned RocksDB buffers (Theory-A) and fail open_db. The concurrent builder batches
+-- the backfill and is a no-op when the index already exists (steady-state reopen).
 
 DEFINE TABLE IF NOT EXISTS uses TYPE RELATION IN symbol OUT symbol;
 DEFINE FIELD OVERWRITE in_file  ON uses TYPE string;
