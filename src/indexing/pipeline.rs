@@ -5799,6 +5799,119 @@ mod load_from_db_microbench {
     }
 }
 
+// ─── RECALL GATE (Group 1): i8 vs f32 ground-truth on a REAL index ─────────
+//
+// The acceptance gate for the i8 quantization change (quantize-vector-shards-i8).
+// Reads the REAL f32 embeddings already stored in a production index (NOT synthetic
+// — these are the actual Voyage document embeddings of real code), builds f32 top-k
+// ground truth for a probe set, then measures i8 recall@10 / recall@30 + score drift.
+// GATE: recall@10 >= 0.98. Below that → pivot to mmap fallback, do NOT ship i8.
+//
+// Runs against the production data dir by default (~/.vibervn/context-engine), repo
+// chosen via env. #[ignore]d — run explicitly:
+//   RECALL_REPO='c:/users/0x317/downloads/linux' \
+//     cargo test --release --lib recall_gate_i8_vs_f32 -- --ignored --nocapture
+#[cfg(test)]
+mod recall_gate {
+    use crate::store::open_db;
+    use crate::vector::{dot_product, dot_product_i8_dequant, l2_normalize, quantize_i8};
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn recall_gate_i8_vs_f32() {
+        let repo = std::env::var("RECALL_REPO")
+            .expect("set RECALL_REPO to a repo path that is already indexed");
+        let data_dir = std::env::var("RECALL_DATA_DIR").map(std::path::PathBuf::from).unwrap_or_else(|_| {
+            dirs::home_dir().unwrap().join(".vibervn").join("context-engine")
+        });
+        let n_probes: usize = std::env::var("RECALL_PROBES").ok().and_then(|v| v.parse().ok()).unwrap_or(50);
+
+        println!("recall gate: repo={repo} data_dir={data_dir:?} probes={n_probes}");
+        let db = open_db(&data_dir, &repo, 0).await.expect("open real index DB");
+
+        // Load ALL real f32 embeddings (the corpus).
+        #[derive(serde::Deserialize)]
+        struct Row {
+            file: String,
+            line_start: i64,
+            #[serde(deserialize_with = "crate::store::ops::de_embedding_dual")]
+            embedding: Vec<f32>,
+        }
+        let rows: Vec<Row> = db
+            .query("SELECT file, line_start, line_end, embedding FROM chunk WHERE embedding IS NOT NONE")
+            .await.expect("scan chunks").take(0).expect("take rows");
+        let corpus: Vec<Vec<f32>> = rows.iter().map(|r| l2_normalize(&r.embedding)).collect();
+        let labels: Vec<String> = rows.iter().map(|r| format!("{}:{}", r.file, r.line_start)).collect();
+        let n = corpus.len();
+        assert!(n > 1000, "index too small to be a meaningful recall gate (got {n})");
+        println!("  corpus: {n} real f32 embeddings, dim={}", corpus[0].len());
+
+        // Pre-quantize the whole corpus once (the i8 shard).
+        let corpus_i8: Vec<Vec<i8>> = corpus.iter().map(|v| quantize_i8(v)).collect();
+
+        // Probes: evenly-spaced held-out corpus vectors used as queries. These are
+        // real embeddings → faithful distribution. Each probe is excluded from its
+        // own ground truth (leave-one-out) so the self-match doesn't inflate recall.
+        let stride = (n / n_probes).max(1);
+        let probe_idxs: Vec<usize> = (0..n).step_by(stride).take(n_probes).collect();
+
+        let topk = 30usize;
+        let mut recall10_sum = 0.0f64;
+        let mut recall30_sum = 0.0f64;
+        let mut drift_sum = 0.0f64;
+        let mut drift_max = 0.0f32;
+
+        for &qi in &probe_idxs {
+            let q_f32 = &corpus[qi];
+            let q_i8 = &corpus_i8[qi];
+
+            // f32 ground-truth top-k (leave-one-out: skip self).
+            let mut f32_scored: Vec<(usize, f32)> = (0..n)
+                .filter(|&j| j != qi)
+                .map(|j| (j, dot_product(q_f32, &corpus[j])))
+                .collect();
+            f32_scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            let gt: Vec<usize> = f32_scored.iter().take(topk).map(|(j, _)| *j).collect();
+
+            // i8 top-k.
+            let mut i8_scored: Vec<(usize, f32)> = (0..n)
+                .filter(|&j| j != qi)
+                .map(|j| (j, dot_product_i8_dequant(q_i8, &corpus_i8[j])))
+                .collect();
+            i8_scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            let got: Vec<usize> = i8_scored.iter().take(topk).map(|(j, _)| *j).collect();
+
+            let gt10: std::collections::HashSet<usize> = gt.iter().take(10).copied().collect();
+            let gt30: std::collections::HashSet<usize> = gt.iter().copied().collect();
+            let got10: std::collections::HashSet<usize> = got.iter().take(10).copied().collect();
+            let got30: std::collections::HashSet<usize> = got.iter().copied().collect();
+            recall10_sum += gt10.intersection(&got10).count() as f64 / 10.0;
+            recall30_sum += gt30.intersection(&got30).count() as f64 / topk as f64;
+
+            // Score drift on the f32 top-k items (i8 score vs f32 score).
+            for &j in gt.iter().take(10) {
+                let d = (dot_product(q_f32, &corpus[j]) - dot_product_i8_dequant(q_i8, &corpus_i8[j])).abs();
+                drift_sum += d as f64;
+                drift_max = drift_max.max(d);
+            }
+            let _ = &labels; // labels retained for debugging if needed
+        }
+
+        let p = probe_idxs.len() as f64;
+        let recall10 = recall10_sum / p;
+        let recall30 = recall30_sum / p;
+        let drift_mean = drift_sum / (p * 10.0);
+        println!(
+            "RECALL GATE RESULT repo={repo} probes={} corpus={n} \
+             recall@10={recall10:.4} recall@30={recall30:.4} \
+             score_drift_mean={drift_mean:.5} score_drift_max={drift_max:.5} \
+             gate_recall10>=0.98={}",
+            probe_idxs.len(),
+            if recall10 >= 0.98 { "PASS" } else { "FAIL->mmap-fallback" }
+        );
+    }
+}
+
 #[cfg(test)]
 mod null_byte_skip_tests {
     use super::*;

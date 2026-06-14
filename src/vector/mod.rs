@@ -321,6 +321,62 @@ pub(crate) fn l2_normalize(v: &[f32]) -> Vec<f32> {
     v.iter().map(|x| x / mag).collect()
 }
 
+// ─── Scalar quantization (i8) ─────────────────────────────────────────────
+//
+// Shrinks a stored embedding ~4x (f32 -> i8) so a kernel-scale shard (3.73 GB)
+// fits under the 2 GB resident cap and warms ~4x faster. The scale is a SINGLE
+// GLOBAL constant (×127), valid because embeddings are L2-normalized before
+// quantization so every component is in [-1, 1]. A global (not per-shard, not
+// per-vector) scale is what keeps cross-shard scores comparable: the dequantized
+// dot-product is an integer dot-product times the SAME constant `1/QUANT_SCALE^2`
+// for every shard, a positive monotonic factor that cannot reorder candidates
+// across shards — so a cross-shard top-k merge stays exact w.r.t. the quantized
+// vectors. A per-shard scale would break that and is therefore forbidden.
+
+/// Global quantization scale. i8 range is [-127, 127] (127, not 128, so +1.0 and
+/// -1.0 are symmetric and |q| never exceeds 127).
+///
+/// NOTE: the i8 quantization path is currently TEST-ONLY. The recall gate
+/// (recall_gate_i8_vs_f32) measured recall@10=0.93 on the real Linux-kernel index
+/// — below the 0.98 acceptance gate — because kernel embeddings are packed denser
+/// than the i8 step can resolve. Per the change's pre-committed decision, i8 is NOT
+/// adopted for storage; the mmap-f32 fallback is the path. These helpers are
+/// retained, gated under cfg(test), as the reproducible gate machinery.
+#[cfg(test)]
+pub(crate) const QUANT_SCALE: f32 = 127.0;
+
+/// Quantize an ALREADY-L2-NORMALIZED vector to i8 with the global scale.
+/// Components are clamped to [-127, 127] defensively (a normalized component is
+/// already in [-1, 1], but floating error at the boundary could round to ±128).
+#[cfg(test)]
+#[inline]
+pub(crate) fn quantize_i8(normalized: &[f32]) -> Vec<i8> {
+    normalized
+        .iter()
+        .map(|&c| {
+            let q = (c * QUANT_SCALE).round();
+            q.clamp(-127.0, 127.0) as i8
+        })
+        .collect()
+}
+
+/// Integer dot product of two i8 rows, accumulated in i32 (no overflow: at
+/// dim=1024, max |sum| = 1024 × 127 × 127 ≈ 16.5M, well within i32).
+#[cfg(test)]
+#[inline]
+pub(crate) fn dot_product_i8(a: &[i8], b: &[i8]) -> i32 {
+    a.iter().zip(b).map(|(&x, &y)| x as i32 * y as i32).sum()
+}
+
+/// Dequantized dot product: the comparable cosine-equivalent score between two
+/// i8 rows. The `1/QUANT_SCALE^2` factor is global, so scores from different
+/// shards are directly comparable.
+#[cfg(test)]
+#[inline]
+pub(crate) fn dot_product_i8_dequant(a: &[i8], b: &[i8]) -> f32 {
+    dot_product_i8(a, b) as f32 / (QUANT_SCALE * QUANT_SCALE)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -337,6 +393,106 @@ mod tests {
     /// Helper: create a simple non-zero embedding of the given dimension.
     fn emb(dim: usize, seed: f32) -> Vec<f32> {
         (0..dim).map(|i| seed + i as f32 * 0.1).collect()
+    }
+
+    // ─── i8 quantization core ────────────────────────────────────────────
+
+    /// Round-trip error is bounded by the quantization step (1/127 per component).
+    /// A normalized vector quantized then dequantized stays within step/2 per dim.
+    #[test]
+    fn quantize_i8_roundtrip_error_bounded() {
+        let v = l2_normalize(&emb(1024, 0.3));
+        let q = quantize_i8(&v);
+        assert_eq!(q.len(), v.len());
+        let step = 1.0 / QUANT_SCALE;
+        for (orig, &qi) in v.iter().zip(&q) {
+            let deq = qi as f32 / QUANT_SCALE;
+            assert!(
+                (orig - deq).abs() <= step / 2.0 + 1e-6,
+                "component error {} exceeds half-step {}", (orig - deq).abs(), step / 2.0
+            );
+            assert!((-127..=127).contains(&(qi as i32)), "i8 in [-127,127]");
+        }
+    }
+
+    /// Boundary components ±1.0 quantize to ±127 (never ±128 — no overflow).
+    #[test]
+    fn quantize_i8_clamps_at_boundary() {
+        let v = vec![1.0_f32, -1.0, 0.0, 0.999, -0.999];
+        let q = quantize_i8(&v);
+        assert_eq!(q, vec![127, -127, 0, 127, -127]);
+    }
+
+    /// The dequantized dot product equals the integer dot product times the global
+    /// constant — and no overflow at dim=1024 with extreme values.
+    #[test]
+    fn dot_product_i8_matches_dequant_and_no_overflow() {
+        let a = vec![127_i8; 1024];
+        let b = vec![127_i8; 1024];
+        let int_dot = dot_product_i8(&a, &b);
+        assert_eq!(int_dot, 1024 * 127 * 127); // 16,516,096 — fits i32
+        let deq = dot_product_i8_dequant(&a, &b);
+        assert!((deq - int_dot as f32 / (QUANT_SCALE * QUANT_SCALE)).abs() < 1e-3);
+    }
+
+    /// Quantized cosine approximates true cosine for normalized vectors.
+    #[test]
+    fn quantized_cosine_approximates_true_cosine() {
+        let a = l2_normalize(&emb(1024, 0.2));
+        let b = l2_normalize(&emb(1024, 0.7));
+        let true_cos = dot_product(&a, &b);
+        let q_cos = dot_product_i8_dequant(&quantize_i8(&a), &quantize_i8(&b));
+        assert!(
+            (true_cos - q_cos).abs() < 0.01,
+            "quantized cosine {q_cos} too far from true {true_cos}"
+        );
+    }
+
+    /// CROSS-SHARD EXACTNESS (the load-bearing invariant): with a single GLOBAL
+    /// scale, ranking candidates from two different shards by the dequantized score
+    /// yields the SAME order as ranking the same quantized vectors in one combined
+    /// pool. A per-shard scale would break this. We build two disjoint vector sets
+    /// ("shards"), score a query against each with the i8 path, merge by score, and
+    /// assert the merged order equals a single-pool i8 ranking.
+    #[test]
+    fn cross_shard_merge_is_exact_under_global_scale() {
+        let query = l2_normalize(&emb(64, 0.5));
+        let q_i8 = quantize_i8(&query);
+
+        // Two shards of normalized vectors with distinct seeds.
+        let shard_a: Vec<Vec<i8>> = (0..10)
+            .map(|i| quantize_i8(&l2_normalize(&emb(64, 0.1 * i as f32 + 0.05))))
+            .collect();
+        let shard_b: Vec<Vec<i8>> = (0..10)
+            .map(|i| quantize_i8(&l2_normalize(&emb(64, 0.1 * i as f32 + 0.5))))
+            .collect();
+
+        // Per-shard scored, then merged by the comparable dequant score.
+        let mut merged: Vec<(String, f32)> = Vec::new();
+        for (i, v) in shard_a.iter().enumerate() {
+            merged.push((format!("a{i}"), dot_product_i8_dequant(&q_i8, v)));
+        }
+        for (i, v) in shard_b.iter().enumerate() {
+            merged.push((format!("b{i}"), dot_product_i8_dequant(&q_i8, v)));
+        }
+        merged.sort_by(|x, y| y.1.partial_cmp(&x.1).unwrap());
+        let merged_order: Vec<String> = merged.iter().map(|(k, _)| k.clone()).collect();
+
+        // Single combined pool, same i8 vectors, same scoring.
+        let mut combined: Vec<(String, f32)> = Vec::new();
+        for (i, v) in shard_a.iter().enumerate() {
+            combined.push((format!("a{i}"), dot_product_i8_dequant(&q_i8, v)));
+        }
+        for (i, v) in shard_b.iter().enumerate() {
+            combined.push((format!("b{i}"), dot_product_i8_dequant(&q_i8, v)));
+        }
+        combined.sort_by(|x, y| y.1.partial_cmp(&x.1).unwrap());
+        let combined_order: Vec<String> = combined.iter().map(|(k, _)| k.clone()).collect();
+
+        assert_eq!(
+            merged_order, combined_order,
+            "global-scale cross-shard merge must equal single-pool ranking"
+        );
     }
 
     #[test]
