@@ -929,6 +929,16 @@ async fn run_consumer(
                 if let Err(e) = store::ops::compute_and_cache_graph(&db).await {
                     warn!(repo = %repo, error = %format!("{e:#}"), "failed to refresh graph_cache after index");
                 }
+                // Refresh the cached /index-stats counts for the same reason as
+                // graph_cache: the four counts are a pure function of the index
+                // content (changed on full AND incremental runs), and each is a
+                // full-table count() GROUP ALL (~10s at kernel scale). Recompute
+                // once here so /index-stats doesn't pay three full scans per
+                // request. Best-effort: a failure must NOT abort the run — the
+                // serve path's cold-miss fallback recomputes on next request.
+                if let Err(e) = store::ops::compute_and_cache_stats(&db, &repo).await {
+                    warn!(repo = %repo, error = %format!("{e:#}"), "failed to refresh stats_cache after index");
+                }
                 // Clear needs_rebuild flag after successful rebuild.
                 if force_rebuild {
                     let _ = db.query("DELETE FROM index_meta WHERE key = 'needs_rebuild'").await;

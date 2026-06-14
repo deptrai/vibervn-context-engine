@@ -1,0 +1,23 @@
+{
+  "label": "optimized",
+  "timestamp": "2026-06-14T13:23:55Z",
+  "repo_id": "YzpcdXNlcnNcMHgzMTdcZG93bmxvYWRzXGxpbnV4",
+  "endpoint": "http://127.0.0.1:6699/api/repos/YzpcdXNlcnNcMHgzMTdcZG93bmxvYWRzXGxpbnV4/index-stats",
+  "iterations": 20,
+  "ok_samples": 20,
+  "failed_requests": 0,
+  "warmup_ms": 14.4,
+  "warmup_http": 200,
+  "percentile_method": "nearest-rank: rank=ceil(p/100*N) on ascending sort, 1-based",
+  "samples_ms": [1.4,15.2,1.5,17.5,1.4,1.4,23.6,1.3,1.4,20.5,17.3,1.4,17.1,1.3,1.3,1.3,1.4,1.3,1.4,1.4],
+  "min_ms": 1.3,
+  "p50_ms": 1.4,
+  "p95_ms": 20.5,
+  "max_ms": 23.6,
+  "http_status_counts": { "200": 20 },
+  "files": 79828,
+  "chunks": 909711,
+  "symbols": 2626446,
+  "gate_ms": 100,
+  "result": "PASS"
+}

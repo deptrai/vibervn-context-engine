@@ -892,6 +892,85 @@ pub async fn get_cached_graph(db: &Surreal<Db>) -> Result<Option<CallGraph>> {
     }
 }
 
+/// The cached `/index-stats` summary counts (files, chunks, symbols, embedding dim).
+///
+/// These four numbers are a pure function of the index content for a repo — they
+/// change only when an indexing run completes — and are stored as a single
+/// `index_meta` row (key [`STATS_CACHE_KEY`]). The non-cached fields the endpoint
+/// also returns (embedding model from settings, db path, live index state /
+/// last_indexed_at) are intentionally NOT part of this struct: they are read
+/// live so the endpoint reflects current config and run status.
+#[derive(Serialize, Deserialize)]
+pub struct StatsCache {
+    pub files: u64,
+    pub chunks: u64,
+    pub symbols: u64,
+    pub embedding_dim: u64,
+}
+
+/// `index_meta` key under which the `/index-stats` summary counts are cached.
+///
+/// The four counts are a pure function of the index content, which only changes
+/// when an indexing run completes (full OR incremental). Each count is a
+/// full-table `count() … GROUP ALL` aggregation; together they were measured at
+/// p50 ≈ 9.7s on the Linux-kernel repo when run on every `/index-stats` request.
+/// So they are computed once per successful index run and served from this cache.
+pub const STATS_CACHE_KEY: &str = "stats_cache";
+
+/// Compute the four `/index-stats` summary counts — a pure read, no persistence.
+///
+/// `count_indexed_files` is repo-scoped, hence the `repo` argument; the other
+/// counts are whole-DB (one DB per repo). Split out from
+/// [`compute_and_cache_stats`] so the serve-path cold miss can compute the counts
+/// and then persist the cache *best-effort*: a cache-write hiccup must never fail
+/// an `/index-stats` request whose counts are already correct (the old
+/// direct-count serve path never wrote, so it had no such failure mode — keep it
+/// that way). A genuine COUNT failure (DB error) still propagates, exactly as the
+/// old path errored on a count failure.
+pub async fn compute_stats(db: &Surreal<Db>, repo: &str) -> Result<StatsCache> {
+    Ok(StatsCache {
+        files: count_indexed_files(db, repo).await?,
+        chunks: count_chunks(db).await?,
+        symbols: count_symbols(db).await?,
+        embedding_dim: sample_embedding_dim(db).await?,
+    })
+}
+
+/// Persist already-computed `/index-stats` counts to the `stats_cache`
+/// `index_meta` key. The stored row is four integers — no scale concern.
+pub async fn persist_stats(db: &Surreal<Db>, stats: &StatsCache) -> Result<()> {
+    let json = serde_json::to_string(stats).context("serialize stats_cache")?;
+    set_meta(db, STATS_CACHE_KEY, &json).await
+}
+
+/// Compute the `/index-stats` summary counts, persist them to the `stats_cache`
+/// `index_meta` key, and return them.
+///
+/// Used by the index-completion hook (compute-once-on-index), where the caller
+/// already treats any failure as best-effort (logs a `warn!` and continues). The
+/// serve-path cold-miss fallback does NOT use this — it computes via
+/// [`compute_stats`] and persists via [`persist_stats`] best-effort so a
+/// cache-write failure never fails the request.
+pub async fn compute_and_cache_stats(db: &Surreal<Db>, repo: &str) -> Result<StatsCache> {
+    let stats = compute_stats(db, repo).await?;
+    persist_stats(db, &stats).await?;
+    Ok(stats)
+}
+
+/// Read the cached `/index-stats` counts, if present and well-formed.
+///
+/// Returns `Ok(None)` when the `stats_cache` key is absent (cold cache: a DB
+/// indexed under the old code before this key existed, or a repo whose first
+/// index hasn't finished) AND when a stored value fails to deserialize
+/// (corrupt/old shape) — in both cases the caller should recompute via
+/// [`compute_and_cache_stats`] rather than erroring.
+pub async fn get_cached_stats(db: &Surreal<Db>) -> Result<Option<StatsCache>> {
+    match get_meta(db, STATS_CACHE_KEY).await? {
+        Some(json) => Ok(serde_json::from_str::<StatsCache>(&json).ok()),
+        None => Ok(None),
+    }
+}
+
 /// Build a bounded node-link view of the `calls` relation.
 ///
 /// Strategy: degree-seeded hub subgraph. The prior approach took an arbitrary
@@ -1557,6 +1636,194 @@ mod call_graph_tests {
             get_cached_graph(&db).await.expect("get_cached_graph must not error").is_none(),
             "corrupt cache value must be treated as a miss"
         );
+    }
+}
+
+// ─── stats_cache tests ────────────────────────────────────────────────────
+//
+// The /index-stats summary counts are cached in `index_meta` (key
+// `stats_cache`) so the three full-table `count() GROUP ALL` scans (measured
+// p50 ≈ 9.7s at Linux-kernel scale) run once per index run instead of on every
+// request. These tests mirror the graph_cache tests: the cache stores the TRUE
+// counts (not zeros), and the cold-miss / corrupt-value paths behave as the
+// serve-path fallback expects.
+#[cfg(test)]
+mod stats_cache_tests {
+    use super::*;
+    use crate::store::open_db;
+    use tempfile::TempDir;
+
+    /// Insert one symbol row (mirrors call_graph_tests::insert_symbol).
+    async fn insert_symbol(db: &Surreal<Db>, fqn: &str, file: &str, name: &str) {
+        let thing = surrealdb::sql::Thing::from((
+            "symbol",
+            surrealdb::sql::Id::String(fqn.to_string()),
+        ));
+        db.query(
+            "CREATE $t SET name = $n, kind = 'function', file = $f, \
+             line_start = 1, line_end = 5, signature = NONE, parent = NONE",
+        )
+        .bind(("t", thing))
+        .bind(("n", name.to_string()))
+        .bind(("f", file.to_string()))
+        .await
+        .expect("insert symbol");
+    }
+
+    /// Insert one chunk row with an embedding of the given dimension.
+    async fn insert_chunk(db: &Surreal<Db>, file: &str, dim: usize) {
+        let embedding: Vec<f32> = vec![0.1; dim];
+        db.query(
+            "CREATE chunk SET file = $f, line_start = 1, line_end = 5, \
+             content = 'x', embedding = $e, symbol_ref = NONE",
+        )
+        .bind(("f", file.to_string()))
+        .bind(("e", embedding))
+        .await
+        .expect("insert chunk");
+    }
+
+    /// `compute_and_cache_stats` stores the SAME counts the direct count helpers
+    /// produce — and they are non-zero (not a degenerate/empty cache).
+    #[tokio::test]
+    async fn cache_matches_fresh_counts() {
+        let home = TempDir::new().unwrap();
+        let repo = "/test/stats_cache_match";
+        let db = open_db(home.path(), repo, 0).await.unwrap();
+
+        upsert_file_meta(
+            &db,
+            &FileMeta { path: "/a.rs".into(), mtime: 1, size: 2, repo: repo.into(), chunk_count: 2, chunker_version: 1 },
+        )
+        .await
+        .unwrap();
+        upsert_file_meta(
+            &db,
+            &FileMeta { path: "/b.rs".into(), mtime: 1, size: 2, repo: repo.into(), chunk_count: 1, chunker_version: 1 },
+        )
+        .await
+        .unwrap();
+        insert_chunk(&db, "/a.rs", 8).await;
+        insert_chunk(&db, "/a.rs", 8).await;
+        insert_chunk(&db, "/b.rs", 8).await;
+        insert_symbol(&db, "/a.rs::f", "/a.rs", "f").await;
+        insert_symbol(&db, "/b.rs::g", "/b.rs", "g").await;
+
+        let cached = compute_and_cache_stats(&db, repo).await.expect("compute_and_cache_stats");
+
+        // Anti-tautology: the cache equals what the direct helpers return.
+        assert_eq!(cached.files, count_indexed_files(&db, repo).await.unwrap());
+        assert_eq!(cached.chunks, count_chunks(&db).await.unwrap());
+        assert_eq!(cached.symbols, count_symbols(&db).await.unwrap());
+        assert_eq!(cached.embedding_dim, sample_embedding_dim(&db).await.unwrap());
+
+        // And the counts are the true, non-zero values.
+        assert_eq!(cached.files, 2);
+        assert_eq!(cached.chunks, 3);
+        assert_eq!(cached.symbols, 2);
+        assert_eq!(cached.embedding_dim, 8);
+
+        let stored = get_cached_stats(&db)
+            .await
+            .expect("get_cached_stats")
+            .expect("cache must be present after compute_and_cache_stats");
+        assert_eq!((stored.files, stored.chunks, stored.symbols, stored.embedding_dim), (2, 3, 2, 8));
+    }
+
+    /// Cold miss: a fresh DB with no `stats_cache` key returns `Ok(None)`; after
+    /// `compute_and_cache_stats` it returns `Ok(Some(_))` with the same counts.
+    #[tokio::test]
+    async fn cold_miss_returns_none_then_warms() {
+        let home = TempDir::new().unwrap();
+        let repo = "/test/stats_cache_cold";
+        let db = open_db(home.path(), repo, 0).await.unwrap();
+
+        insert_symbol(&db, "/a.rs::f", "/a.rs", "f").await;
+        insert_chunk(&db, "/a.rs", 4).await;
+
+        // Cold: no key yet.
+        assert!(
+            get_cached_stats(&db).await.expect("get_cached_stats").is_none(),
+            "fresh DB must report a cold cache miss"
+        );
+
+        let warmed = compute_and_cache_stats(&db, repo).await.expect("compute_and_cache_stats");
+        let after = get_cached_stats(&db)
+            .await
+            .expect("get_cached_stats")
+            .expect("cache must be present after warm");
+        assert_eq!(
+            (after.files, after.chunks, after.symbols, after.embedding_dim),
+            (warmed.files, warmed.chunks, warmed.symbols, warmed.embedding_dim)
+        );
+    }
+
+    /// A corrupt/unparseable cached value is treated as a MISS (`Ok(None)`), not
+    /// an error, so the serve-path fallback recomputes rather than 500-ing.
+    #[tokio::test]
+    async fn corrupt_cache_treated_as_miss() {
+        let home = TempDir::new().unwrap();
+        let db = open_db(home.path(), "/test/stats_cache_corrupt", 0).await.unwrap();
+
+        set_meta(&db, STATS_CACHE_KEY, "not json").await.expect("set_meta");
+        assert!(
+            get_cached_stats(&db).await.expect("get_cached_stats must not error").is_none(),
+            "corrupt cache value must be treated as a miss"
+        );
+    }
+
+    /// Staleness invariant: recomputing after the underlying data changes
+    /// OVERWRITES the cached counts — the cache never serves permanently-stale
+    /// numbers. This is exactly the property the index-completion hook relies on:
+    /// every successful run (full or incremental) calls `compute_and_cache_stats`,
+    /// and the new counts must replace the old, not append/be ignored.
+    #[tokio::test]
+    async fn recompute_after_data_change_overwrites_stale_cache() {
+        let home = TempDir::new().unwrap();
+        let repo = "/test/stats_cache_refresh";
+        let db = open_db(home.path(), repo, 0).await.unwrap();
+
+        // ── Initial data: 1 file, 1 chunk, 1 symbol. ──
+        upsert_file_meta(
+            &db,
+            &FileMeta { path: "/a.rs".into(), mtime: 1, size: 2, repo: repo.into(), chunk_count: 1, chunker_version: 1 },
+        )
+        .await
+        .unwrap();
+        insert_chunk(&db, "/a.rs", 8).await;
+        insert_symbol(&db, "/a.rs::f", "/a.rs", "f").await;
+
+        let first = compute_and_cache_stats(&db, repo).await.expect("first compute");
+        assert_eq!((first.files, first.chunks, first.symbols), (1, 1, 1));
+        let cached = get_cached_stats(&db).await.unwrap().expect("cache present");
+        assert_eq!((cached.files, cached.chunks, cached.symbols), (1, 1, 1));
+
+        // ── Mutate: add a second file (2 more chunks, 1 more symbol). True counts
+        // now differ from what's cached, so a stale cache would still read (1,1,1).
+        upsert_file_meta(
+            &db,
+            &FileMeta { path: "/b.rs".into(), mtime: 1, size: 2, repo: repo.into(), chunk_count: 2, chunker_version: 1 },
+        )
+        .await
+        .unwrap();
+        insert_chunk(&db, "/b.rs", 8).await;
+        insert_chunk(&db, "/b.rs", 8).await;
+        insert_symbol(&db, "/b.rs::g", "/b.rs", "g").await;
+
+        // ── Recompute: the hook's call. The cache MUST now reflect the new truth. ──
+        let second = compute_and_cache_stats(&db, repo).await.expect("second compute");
+        assert_eq!((second.files, second.chunks, second.symbols), (2, 3, 2));
+
+        let refreshed = get_cached_stats(&db).await.unwrap().expect("cache present");
+        assert_eq!(
+            (refreshed.files, refreshed.chunks, refreshed.symbols),
+            (2, 3, 2),
+            "recompute must OVERWRITE the stale (1,1,1) cache with the new counts"
+        );
+        // And the cache agrees with the direct count helpers (no drift).
+        assert_eq!(refreshed.files, count_indexed_files(&db, repo).await.unwrap());
+        assert_eq!(refreshed.chunks, count_chunks(&db).await.unwrap());
+        assert_eq!(refreshed.symbols, count_symbols(&db).await.unwrap());
     }
 }
 

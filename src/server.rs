@@ -604,21 +604,33 @@ async fn get_index_stats(
         Err(r) => return r,
     };
 
-    let files = match store::ops::count_indexed_files(&db, &repo).await {
-        Ok(v) => v,
-        Err(e) => return db_error("count files", e),
-    };
-    let chunks = match store::ops::count_chunks(&db).await {
-        Ok(v) => v,
-        Err(e) => return db_error("count chunks", e),
-    };
-    let symbols = match store::ops::count_symbols(&db).await {
-        Ok(v) => v,
-        Err(e) => return db_error("count symbols", e),
-    };
-    let embedding_dim = match store::ops::sample_embedding_dim(&db).await {
-        Ok(v) => v,
-        Err(e) => return db_error("sample embedding dim", e),
+    // The four summary counts are a pure function of the index content, so they
+    // are computed once at the end of each successful index run and cached in
+    // `index_meta` (key `stats_cache`). Fast path: serve the cached counts — no
+    // three full-table `count() GROUP ALL` scans (measured p50 ≈ 9.7s at kernel
+    // scale). Cold miss (DB indexed before this key existed, or a first index not
+    // yet finished): compute live ONCE, then persist the cache BEST-EFFORT — so
+    // the slow path happens at most once per repo after upgrade, then warm
+    // forever. The persist is best-effort on purpose: the old direct-count serve
+    // path never wrote, so it had no write-failure mode; a transient cache-write
+    // hiccup must NOT 500 a request whose counts are already correct (mirrors how
+    // /graph's cold miss recomputes). A genuine COUNT failure still errors, as the
+    // old path did.
+    let stats = match store::ops::get_cached_stats(&db).await {
+        Ok(Some(s)) => s,
+        _ => match store::ops::compute_stats(&db, &repo).await {
+            Ok(s) => {
+                if let Err(e) = store::ops::persist_stats(&db, &s).await {
+                    tracing::warn!(
+                        repo = %repo,
+                        error = %format!("{e:#}"),
+                        "failed to persist stats_cache on /index-stats cold miss; serving computed counts anyway"
+                    );
+                }
+                s
+            }
+            Err(e) => return db_error("compute index stats", e),
+        },
     };
 
     let status = state.index_engine.repo_status(&repo).await;
@@ -637,11 +649,11 @@ async fn get_index_stats(
 
     Json(json!({
         "repo": repo,
-        "files": files,
-        "chunks": chunks,
-        "symbols": symbols,
+        "files": stats.files,
+        "chunks": stats.chunks,
+        "symbols": stats.symbols,
         "embedding_model": embedding_model,
-        "embedding_dim": embedding_dim,
+        "embedding_dim": stats.embedding_dim,
         "db_path": db_dir.to_string_lossy(),
         "state": state_str,
         "last_indexed_at": last_indexed_at,
