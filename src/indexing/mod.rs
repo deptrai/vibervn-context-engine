@@ -917,6 +917,18 @@ async fn run_consumer(
                 // Persist durable timestamp so the MCP tool can check freshness
                 // without relying on in-memory state.
                 let _ = set_meta(&db, "last_indexed_at", &chrono::Utc::now().to_rfc3339()).await;
+                // Refresh the cached call-graph payload. The graph is a pure
+                // function of the `calls` table, which changes on BOTH full
+                // rebuilds and incremental runs, so recompute it once here and
+                // persist it (key `graph_cache`) instead of paying ~80s of
+                // full-table GROUP BY aggregation on every `/graph` request.
+                // Best-effort: a failure to build/store the cache must NOT abort
+                // the index run — the serve path's cold-miss fallback will
+                // recompute on the next graph open. Log a warn so a broken cache
+                // build stays visible rather than silently degrading.
+                if let Err(e) = store::ops::compute_and_cache_graph(&db).await {
+                    warn!(repo = %repo, error = %format!("{e:#}"), "failed to refresh graph_cache after index");
+                }
                 // Clear needs_rebuild flag after successful rebuild.
                 if force_rebuild {
                     let _ = db.query("DELETE FROM index_meta WHERE key = 'needs_rebuild'").await;

@@ -830,11 +830,22 @@ async fn get_repo_graph(
         Err(r) => return r,
     };
 
-    const EDGE_LIMIT: usize = 600;
-    const NODE_LIMIT: usize = 250;
-    match store::ops::call_graph(&db, EDGE_LIMIT, NODE_LIMIT).await {
-        Ok(graph) => Json(graph).into_response(),
-        Err(e) => db_error("build graph", e),
+    // The bounded call-graph payload is a pure function of the `calls` table,
+    // so it is computed once at the end of each successful index run and cached
+    // in `index_meta` (key `graph_cache`). Fast path: serve the cached payload
+    // directly — no `call_graph` recompute (two full-table GROUP BY aggregations,
+    // ~80s at kernel scale). Cold miss (DB indexed before this key existed, or a
+    // first index not yet finished): compute live ONCE, store it, and return —
+    // so the slow path happens at most once per repo after upgrade, then warm
+    // forever. Note: the canonical node/edge limits live in `store::ops`
+    // (GRAPH_NODE_LIMIT / GRAPH_EDGE_LIMIT) and are shared with the index-time
+    // cache refresh so the cached payload matches this endpoint's contract.
+    match store::ops::get_cached_graph(&db).await {
+        Ok(Some(graph)) => Json(graph).into_response(),
+        _ => match store::ops::compute_and_cache_graph(&db).await {
+            Ok(graph) => Json(graph).into_response(),
+            Err(e) => db_error("build graph", e),
+        },
     }
 }
 

@@ -817,7 +817,7 @@ pub async fn chunks_for_file(
 }
 
 /// A node in the call graph (one symbol).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GraphNode {
     pub id: String,
     pub name: String,
@@ -828,19 +828,68 @@ pub struct GraphNode {
 }
 
 /// An edge in the call graph (caller → callee).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GraphEdge {
     pub source: String,
     pub target: String,
 }
 
 /// The call graph payload: nodes + edges, both bounded.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CallGraph {
     pub nodes: Vec<GraphNode>,
     pub edges: Vec<GraphEdge>,
     /// True if the result was capped (more edges/symbols exist in the index).
     pub truncated: bool,
+}
+
+/// Canonical bound on the number of nodes in the bounded call-graph payload.
+///
+/// This MUST be the single source of truth shared by the serve path
+/// (`get_repo_graph`), the cold-miss fallback, and the index-completion cache
+/// refresh — otherwise the persisted `graph_cache` payload would not match the
+/// endpoint contract.
+pub const GRAPH_NODE_LIMIT: usize = 250;
+
+/// Canonical bound on the number of edges in the bounded call-graph payload.
+/// See [`GRAPH_NODE_LIMIT`] for why this is centralized.
+pub const GRAPH_EDGE_LIMIT: usize = 600;
+
+/// `index_meta` key under which the bounded call-graph payload is cached.
+///
+/// The call-graph payload is a pure function of the `calls` table, which only
+/// changes when an indexing run completes. Computing it costs two full-table
+/// `GROUP BY count()` aggregations (~80s at Linux-kernel scale), so it is
+/// computed once per successful index run and served from this cache.
+pub const GRAPH_CACHE_KEY: &str = "graph_cache";
+
+/// Compute the bounded call graph with the canonical limits, persist it to the
+/// `graph_cache` `index_meta` key, and return it.
+///
+/// Used both by the index-completion hook (compute-once-on-index) and by the
+/// serve-path cold-miss fallback (so the first graph open after an upgrade
+/// warms the cache for all subsequent requests). The payload is bounded
+/// (≤ [`GRAPH_NODE_LIMIT`] nodes / ≤ [`GRAPH_EDGE_LIMIT`] edges), so the stored
+/// row is only a few KB — no scale concern.
+pub async fn compute_and_cache_graph(db: &Surreal<Db>) -> Result<CallGraph> {
+    let graph = call_graph(db, GRAPH_EDGE_LIMIT, GRAPH_NODE_LIMIT).await?;
+    let json = serde_json::to_string(&graph).context("serialize graph_cache")?;
+    set_meta(db, GRAPH_CACHE_KEY, &json).await?;
+    Ok(graph)
+}
+
+/// Read the cached bounded call graph, if present and well-formed.
+///
+/// Returns `Ok(None)` when the `graph_cache` key is absent (cold cache: a DB
+/// indexed under the old code before this key existed, or a repo whose first
+/// index hasn't finished) AND when a stored value fails to deserialize
+/// (corrupt/old shape) — in both cases the caller should recompute via
+/// [`compute_and_cache_graph`] rather than erroring.
+pub async fn get_cached_graph(db: &Surreal<Db>) -> Result<Option<CallGraph>> {
+    match get_meta(db, GRAPH_CACHE_KEY).await? {
+        Some(json) => Ok(serde_json::from_str::<CallGraph>(&json).ok()),
+        None => Ok(None),
+    }
 }
 
 /// Build a bounded node-link view of the `calls` relation.
@@ -1412,6 +1461,101 @@ mod call_graph_tests {
         assert_eq!(
             caller_callee, 1,
             "5 duplicate call sites must collapse to exactly 1 edge, got {caller_callee}"
+        );
+    }
+
+    // ─── graph_cache tests ────────────────────────────────────────────────
+    //
+    // The bounded call-graph payload is cached in `index_meta` (key
+    // `graph_cache`) so the ~80s full-table GROUP BY aggregation runs once per
+    // index run instead of on every request. These tests prove the cache
+    // stores the TRUE answer (not a degenerate/empty one) and that the
+    // cold-miss / corrupt-value paths behave as the serve-path fallback expects.
+
+    /// Sort node ids and edge (source,target) pairs so two `CallGraph`s can be
+    /// compared as sets without adding `PartialEq` to the public types.
+    fn graph_fingerprint(g: &CallGraph) -> (Vec<String>, Vec<(String, String)>) {
+        let mut nodes: Vec<String> = g.nodes.iter().map(|n| n.id.clone()).collect();
+        nodes.sort();
+        let mut edges: Vec<(String, String)> =
+            g.edges.iter().map(|e| (e.source.clone(), e.target.clone())).collect();
+        edges.sort();
+        (nodes, edges)
+    }
+
+    /// `compute_and_cache_graph` stores the SAME payload a fresh direct
+    /// `call_graph(db, GRAPH_EDGE_LIMIT, GRAPH_NODE_LIMIT)` produces — same node
+    /// set, same edge set. Anti-tautology: proves the cache is the true answer.
+    #[tokio::test]
+    async fn cache_matches_fresh_call_graph() {
+        let home = TempDir::new().unwrap();
+        let db = open_db(home.path(), "/test/graph_cache_match", 0).await.unwrap();
+
+        insert_symbol(&db, "/a.cpp::hub", "/a.cpp", "hub").await;
+        for i in 0..10 {
+            let caller = format!("/a.cpp::c{i}");
+            insert_symbol(&db, &caller, "/a.cpp", &format!("c{i}")).await;
+            insert_call(&db, &caller, "/a.cpp::hub").await;
+        }
+        insert_call(&db, "/a.cpp::c0", "/a.cpp::c1").await;
+
+        let cached = compute_and_cache_graph(&db).await.expect("compute_and_cache_graph");
+        let fresh = call_graph(&db, GRAPH_EDGE_LIMIT, GRAPH_NODE_LIMIT)
+            .await
+            .expect("fresh call_graph");
+        let stored = get_cached_graph(&db)
+            .await
+            .expect("get_cached_graph")
+            .expect("cache must be present after compute_and_cache_graph");
+
+        // The returned, the freshly-computed, and the stored payloads must all
+        // agree as sets — and must be non-empty (not a degenerate cache).
+        assert!(!cached.nodes.is_empty(), "cached graph must have nodes");
+        assert!(!cached.edges.is_empty(), "cached graph must have edges");
+        assert_eq!(graph_fingerprint(&cached), graph_fingerprint(&fresh));
+        assert_eq!(graph_fingerprint(&stored), graph_fingerprint(&fresh));
+        assert_eq!(cached.truncated, fresh.truncated);
+    }
+
+    /// Cold miss: a fresh DB with no `graph_cache` key returns `Ok(None)`; after
+    /// `compute_and_cache_graph` it returns `Ok(Some(_))` with the same payload.
+    #[tokio::test]
+    async fn cold_miss_returns_none_then_warms() {
+        let home = TempDir::new().unwrap();
+        let db = open_db(home.path(), "/test/graph_cache_cold", 0).await.unwrap();
+
+        insert_symbol(&db, "/a.cpp::hub", "/a.cpp", "hub").await;
+        for i in 0..5 {
+            let caller = format!("/a.cpp::c{i}");
+            insert_symbol(&db, &caller, "/a.cpp", &format!("c{i}")).await;
+            insert_call(&db, &caller, "/a.cpp::hub").await;
+        }
+
+        // Cold: no key yet.
+        assert!(
+            get_cached_graph(&db).await.expect("get_cached_graph").is_none(),
+            "fresh DB must report a cold cache miss"
+        );
+
+        let warmed = compute_and_cache_graph(&db).await.expect("compute_and_cache_graph");
+        let after = get_cached_graph(&db)
+            .await
+            .expect("get_cached_graph")
+            .expect("cache must be present after warm");
+        assert_eq!(graph_fingerprint(&after), graph_fingerprint(&warmed));
+    }
+
+    /// A corrupt/unparseable cached value is treated as a MISS (`Ok(None)`), not
+    /// an error, so the serve-path fallback recomputes rather than 500-ing.
+    #[tokio::test]
+    async fn corrupt_cache_treated_as_miss() {
+        let home = TempDir::new().unwrap();
+        let db = open_db(home.path(), "/test/graph_cache_corrupt", 0).await.unwrap();
+
+        set_meta(&db, GRAPH_CACHE_KEY, "not json").await.expect("set_meta");
+        assert!(
+            get_cached_graph(&db).await.expect("get_cached_graph must not error").is_none(),
+            "corrupt cache value must be treated as a miss"
         );
     }
 }

@@ -1,0 +1,23 @@
+{
+  "label": "baseline",
+  "timestamp": "2026-06-14T12:15:39Z",
+  "repo_id": "YzpcdXNlcnNcMHgzMTdcZG93bmxvYWRzXGxpbnV4",
+  "endpoint": "http://127.0.0.1:6699/api/repos/YzpcdXNlcnNcMHgzMTdcZG93bmxvYWRzXGxpbnV4/graph",
+  "iterations": 5,
+  "ok_samples": 5,
+  "failed_requests": 0,
+  "warmup_ms": 79946.7,
+  "warmup_http": 200,
+  "percentile_method": "nearest-rank: rank=ceil(p/100*N) on ascending sort, 1-based",
+  "samples_ms": [81337.2,81438.6,82035.9,82878.3,82346.2],
+  "min_ms": 81337.2,
+  "p50_ms": 82035.9,
+  "p95_ms": 82878.3,
+  "max_ms": 82878.3,
+  "http_status_counts": { "200": 5 },
+  "nodes": 250,
+  "edges": 152,
+  "truncated": true,
+  "gate_ms": 200,
+  "result": "FAIL"
+}
