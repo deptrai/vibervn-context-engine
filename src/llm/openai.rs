@@ -274,23 +274,9 @@ pub enum ToolTurnResult {
     ToolCalls(Vec<ToolCallMessage>),
 }
 
-/// Send a multi-turn tool-calling request to OpenAI.
-#[allow(clippy::too_many_arguments)]
-pub async fn complete_with_tools(
-    http: &Client,
-    model: &str,
-    api_key: &str,
-    system: &str,
-    contents: &[super::ChatMessage],
-    tools: &[ToolDef],
-    temperature: f32,
-    force_tool_use: bool,
-    prompt_cache_key: Option<&str>,
-    base_url: Option<&str>,
-    force_tool_use_on_custom: bool,
-) -> Result<ToolTurnResult> {
-    let url = chat_url(base_url);
-
+/// Build the OpenAI `messages` array (system prefix + conversation) shared by
+/// the streaming and non-streaming tool-calling paths.
+fn build_messages(system: &str, contents: &[super::ChatMessage]) -> Vec<Message> {
     let mut messages: Vec<Message> = Vec::with_capacity(contents.len() + 1);
     messages.push(Message::Standard { role: "system".to_owned(), content: system.to_owned() });
 
@@ -298,6 +284,9 @@ pub async fn complete_with_tools(
         match msg {
             super::ChatMessage::User(text) => {
                 messages.push(Message::Standard { role: "user".to_owned(), content: text.clone() });
+            }
+            super::ChatMessage::Model(text) => {
+                messages.push(Message::Standard { role: "assistant".to_owned(), content: text.clone() });
             }
             super::ChatMessage::ModelToolCalls(calls) => {
                 let tool_calls: Vec<ToolCallMessage> = calls.iter().map(|c| ToolCallMessage {
@@ -325,15 +314,50 @@ pub async fn complete_with_tools(
             }
         }
     }
+    messages
+}
 
-    let openai_tools: Vec<OpenAITool> = tools.iter().map(|t| OpenAITool {
+/// Map our tool definitions into OpenAI's function-tool schema.
+fn build_tools(tools: &[ToolDef]) -> Vec<OpenAITool> {
+    tools.iter().map(|t| OpenAITool {
         kind: "function".to_owned(),
         function: OpenAIFunction {
             name: t.name.clone(),
             description: t.description.clone(),
             parameters: t.parameters.clone(),
         },
-    }).collect();
+    }).collect()
+}
+
+/// Resolve `tool_choice` given the force flag and whether a custom base URL is
+/// in use (custom endpoints default to "auto" unless explicitly opted in).
+fn resolve_tool_choice(force_tool_use: bool, base_url: Option<&str>, force_on_custom: bool) -> Option<String> {
+    if !force_tool_use {
+        return None;
+    }
+    let is_custom = base_url.is_some_and(|u| !u.trim().is_empty());
+    Some(if !is_custom || force_on_custom { "required".to_owned() } else { "auto".to_owned() })
+}
+
+/// Send a multi-turn tool-calling request to OpenAI.
+#[allow(clippy::too_many_arguments)]
+pub async fn complete_with_tools(
+    http: &Client,
+    model: &str,
+    api_key: &str,
+    system: &str,
+    contents: &[super::ChatMessage],
+    tools: &[ToolDef],
+    temperature: f32,
+    force_tool_use: bool,
+    prompt_cache_key: Option<&str>,
+    base_url: Option<&str>,
+    force_tool_use_on_custom: bool,
+) -> Result<ToolTurnResult> {
+    let url = chat_url(base_url);
+
+    let messages = build_messages(system, contents);
+    let openai_tools = build_tools(tools);
 
     let body = ChatRequest {
         model: model.to_owned(),
@@ -342,12 +366,7 @@ pub async fn complete_with_tools(
         stream: false,
         response_format: None,
         tools: Some(openai_tools),
-        tool_choice: if force_tool_use {
-            let is_custom = base_url.is_some_and(|u| !u.trim().is_empty());
-            Some(if !is_custom || force_tool_use_on_custom { "required".to_owned() } else { "auto".to_owned() })
-        } else {
-            None
-        },
+        tool_choice: resolve_tool_choice(force_tool_use, base_url, force_tool_use_on_custom),
         prompt_cache_key: prompt_cache_key.map(|s| s.to_owned()),
         reasoning: Some(Reasoning { effort: "low".to_owned() }),
     };
@@ -431,6 +450,222 @@ pub async fn complete_with_tools(
             Ok(ToolTurnResult::Text(c.message.content.unwrap_or_default()))
         }
         None => Ok(ToolTurnResult::Text(String::new())),
+    }
+}
+
+// ─── Streaming tool-calling ───────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct StreamChunk {
+    choices: Option<Vec<StreamChoice>>,
+    error: Option<OpenAIError>,
+}
+
+#[derive(Deserialize)]
+struct StreamChoice {
+    delta: StreamDelta,
+}
+
+#[derive(Deserialize, Default)]
+struct StreamDelta {
+    content: Option<String>,
+    tool_calls: Option<Vec<StreamToolCallDelta>>,
+}
+
+#[derive(Deserialize)]
+struct StreamToolCallDelta {
+    /// Index of the tool call this fragment belongs to (deltas for the same
+    /// call share an index across chunks).
+    index: usize,
+    id: Option<String>,
+    function: Option<StreamFnDelta>,
+}
+
+#[derive(Deserialize)]
+struct StreamFnDelta {
+    name: Option<String>,
+    arguments: Option<String>,
+}
+
+/// Accumulator that reassembles a tool call from streamed fragments.
+#[derive(Default)]
+struct ToolCallAccum {
+    id: String,
+    name: String,
+    arguments: String,
+}
+
+/// Streaming variant of [`complete_with_tools`]. Parses the SSE response,
+/// forwarding `content` deltas to `on_token` as they arrive and reassembling
+/// any `tool_calls` fragments. `started` is set to `true` the moment the HTTP
+/// status is confirmed 2xx and we begin reading the body, so the caller knows
+/// whether a failure is safe to retry on another key.
+#[allow(clippy::too_many_arguments)]
+pub async fn complete_with_tools_streaming(
+    http: &Client,
+    model: &str,
+    api_key: &str,
+    system: &str,
+    contents: &[super::ChatMessage],
+    tools: &[ToolDef],
+    temperature: f32,
+    force_tool_use: bool,
+    prompt_cache_key: Option<&str>,
+    base_url: Option<&str>,
+    force_tool_use_on_custom: bool,
+    on_token: &super::TokenSink<'_>,
+    started: &std::sync::atomic::AtomicBool,
+) -> Result<ToolTurnResult> {
+    use std::sync::atomic::Ordering;
+    use futures::StreamExt;
+
+    let url = chat_url(base_url);
+    let messages = build_messages(system, contents);
+    let openai_tools = build_tools(tools);
+
+    let body = ChatRequest {
+        model: model.to_owned(),
+        messages,
+        temperature,
+        stream: true,
+        response_format: None,
+        tools: Some(openai_tools),
+        tool_choice: resolve_tool_choice(force_tool_use, base_url, force_tool_use_on_custom),
+        prompt_cache_key: prompt_cache_key.map(|s| s.to_owned()),
+        reasoning: Some(Reasoning { effort: "low".to_owned() }),
+    };
+
+    let resp = match http
+        .post(&url)
+        .header("Authorization", format!("Bearer {api_key}"))
+        .json(&body)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(
+                url = %url,
+                model = %model,
+                error = %e,
+                is_timeout = e.is_timeout(),
+                is_connect = e.is_connect(),
+                "openai streaming: connection-level failure"
+            );
+            return Err(e).context("OpenAI streaming HTTP request failed");
+        }
+    };
+
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        tracing::error!(
+            url = %url,
+            model = %model,
+            status = %status,
+            response_body = %text,
+            "openai streaming HTTP error"
+        );
+        bail!("OpenAI API returned HTTP {status}: {text}");
+    }
+
+    // Body confirmed — from here on tokens may reach the caller, so a failure
+    // is no longer safe to retry on a different key.
+    started.store(true, Ordering::Relaxed);
+
+    let mut text_acc = String::new();
+    let mut tool_accs: Vec<ToolCallAccum> = Vec::new();
+    let mut buf = String::new();
+    let mut stream = resp.bytes_stream();
+
+    while let Some(chunk) = stream.next().await {
+        let bytes = match chunk {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::error!(
+                    url = %url,
+                    model = %model,
+                    error = %e,
+                    bytes_streamed = text_acc.len(),
+                    "openai streaming: mid-stream read error"
+                );
+                return Err(e).context("OpenAI stream read error");
+            }
+        };
+        buf.push_str(&String::from_utf8_lossy(&bytes));
+
+        // SSE frames are separated by "\n\n"; process every complete frame and
+        // keep the trailing partial in `buf`.
+        while let Some(pos) = buf.find("\n\n") {
+            let frame = buf[..pos].to_owned();
+            buf.drain(..pos + 2);
+            for line in frame.lines() {
+                let line = line.trim_start();
+                let Some(data) = line.strip_prefix("data:") else { continue };
+                let data = data.trim();
+                if data == "[DONE]" {
+                    break;
+                }
+                let parsed: StreamChunk = match serde_json::from_str(data) {
+                    Ok(p) => p,
+                    Err(_) => continue, // skip keep-alive/non-JSON frames
+                };
+                if let Some(err) = parsed.error {
+                    tracing::error!(
+                        url = %url,
+                        model = %model,
+                        api_error = %err.message,
+                        "openai streaming: error frame in SSE body"
+                    );
+                    bail!("OpenAI API error: {}", err.message);
+                }
+                let Some(choice) = parsed.choices.and_then(|c| c.into_iter().next()) else { continue };
+                if let Some(content) = choice.delta.content
+                    && !content.is_empty()
+                {
+                    on_token(&content);
+                    text_acc.push_str(&content);
+                }
+                if let Some(tcs) = choice.delta.tool_calls {
+                    for tc in tcs {
+                        if tool_accs.len() <= tc.index {
+                            tool_accs.resize_with(tc.index + 1, ToolCallAccum::default);
+                        }
+                        let acc = &mut tool_accs[tc.index];
+                        if let Some(id) = tc.id {
+                            acc.id = id;
+                        }
+                        if let Some(f) = tc.function {
+                            if let Some(name) = f.name {
+                                acc.name.push_str(&name);
+                            }
+                            if let Some(args) = f.arguments {
+                                acc.arguments.push_str(&args);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let tool_calls: Vec<ToolCallMessage> = tool_accs
+        .into_iter()
+        .filter(|a| !a.name.is_empty())
+        .map(|a| ToolCallMessage {
+            id: a.id,
+            kind: "function".to_owned(),
+            function: ToolCallFunction {
+                name: a.name,
+                arguments: if a.arguments.is_empty() { "{}".to_owned() } else { a.arguments },
+            },
+        })
+        .collect();
+
+    if !tool_calls.is_empty() {
+        Ok(ToolTurnResult::ToolCalls(tool_calls))
+    } else {
+        Ok(ToolTurnResult::Text(text_acc))
     }
 }
 

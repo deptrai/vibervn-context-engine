@@ -252,28 +252,22 @@ pub enum ToolTurnResult {
     ToolCalls(Vec<GeminiToolCall>),
 }
 
-/// Send a multi-turn tool-calling request. `contents` is the full conversation
-/// history (user/model/functionResponse turns). Returns either a text response
-/// or a list of function calls the model wants executed.
-#[allow(clippy::too_many_arguments)]
-pub async fn complete_with_tools(
-    http: &Client,
-    model: &str,
-    api_key: &str,
+/// Build the Gemini request body shared by the streaming and non-streaming
+/// tool-calling paths.
+fn build_tool_request(
     system: &str,
     contents: &[super::ChatMessage],
     tools: &[ToolDef],
     temperature: f32,
     force_tool_use: bool,
-) -> Result<ToolTurnResult> {
-    let url = format!(
-        "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
-        model, api_key
-    );
-
+) -> GeminiRequest {
     let gemini_contents: Vec<Content> = contents.iter().map(|m| match m {
         super::ChatMessage::User(text) => Content {
             role: "user".to_owned(),
+            parts: vec![Part::Text { text: text.clone() }],
+        },
+        super::ChatMessage::Model(text) => Content {
+            role: "model".to_owned(),
             parts: vec![Part::Text { text: text.clone() }],
         },
         super::ChatMessage::ModelToolCalls(calls) => Content {
@@ -306,7 +300,7 @@ pub async fn complete_with_tools(
         parameters: t.parameters.clone(),
     }).collect();
 
-    let body = GeminiRequest {
+    GeminiRequest {
         system_instruction: SystemInstruction {
             parts: vec![Part::Text { text: system.to_owned() }],
         },
@@ -324,7 +318,29 @@ pub async fn complete_with_tools(
                 mode: if force_tool_use { "ANY" } else { "AUTO" }.to_owned(),
             },
         }),
-    };
+    }
+}
+
+/// Send a multi-turn tool-calling request. `contents` is the full conversation
+/// history (user/model/functionResponse turns). Returns either a text response
+/// or a list of function calls the model wants executed.
+#[allow(clippy::too_many_arguments)]
+pub async fn complete_with_tools(
+    http: &Client,
+    model: &str,
+    api_key: &str,
+    system: &str,
+    contents: &[super::ChatMessage],
+    tools: &[ToolDef],
+    temperature: f32,
+    force_tool_use: bool,
+) -> Result<ToolTurnResult> {
+    let url = format!(
+        "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
+        model, api_key
+    );
+
+    let body = build_tool_request(system, contents, tools, temperature, force_tool_use);
 
     let resp = http
         .post(&url)
@@ -377,6 +393,140 @@ pub async fn complete_with_tools(
         Ok(ToolTurnResult::ToolCalls(function_calls))
     } else {
         Ok(ToolTurnResult::Text(text_parts.join("\n")))
+    }
+}
+
+// ─── Streaming tool-calling ───────────────────────────────────────────────
+
+/// Streaming variant of [`complete_with_tools`]. Hits `streamGenerateContent`
+/// with `alt=sse`, forwarding text-part deltas to `on_token` as they arrive and
+/// collecting any function-call parts. `started` flips to `true` once the body
+/// begins so the caller knows a failure is no longer safe to retry.
+#[allow(clippy::too_many_arguments)]
+pub async fn complete_with_tools_streaming(
+    http: &Client,
+    model: &str,
+    api_key: &str,
+    system: &str,
+    contents: &[super::ChatMessage],
+    tools: &[ToolDef],
+    temperature: f32,
+    force_tool_use: bool,
+    on_token: &super::TokenSink<'_>,
+    started: &std::sync::atomic::AtomicBool,
+) -> Result<ToolTurnResult> {
+    use std::sync::atomic::Ordering;
+    use futures::StreamExt;
+
+    let url = format!(
+        "https://generativelanguage.googleapis.com/v1beta/models/{}:streamGenerateContent?alt=sse&key={}",
+        model, api_key
+    );
+
+    let body = build_tool_request(system, contents, tools, temperature, force_tool_use);
+
+    let resp = match http
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            // NOTE: never log `url` — it carries the API key as a query param.
+            tracing::error!(
+                model = %model,
+                error = %e,
+                is_timeout = e.is_timeout(),
+                is_connect = e.is_connect(),
+                "gemini streaming: connection-level failure"
+            );
+            return Err(e).context("Gemini streaming HTTP request failed");
+        }
+    };
+
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        tracing::error!(
+            model = %model,
+            status = %status,
+            response_body = %text,
+            "gemini streaming HTTP error"
+        );
+        bail!("Gemini API returned HTTP {status}: {text}");
+    }
+
+    started.store(true, Ordering::Relaxed);
+
+    let mut text_acc = String::new();
+    let mut function_calls: Vec<GeminiToolCall> = Vec::new();
+    let mut buf = String::new();
+    let mut stream = resp.bytes_stream();
+
+    while let Some(chunk) = stream.next().await {
+        let bytes = match chunk {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::error!(
+                    model = %model,
+                    error = %e,
+                    bytes_streamed = text_acc.len(),
+                    "gemini streaming: mid-stream read error"
+                );
+                return Err(e).context("Gemini stream read error");
+            }
+        };
+        buf.push_str(&String::from_utf8_lossy(&bytes));
+
+        while let Some(pos) = buf.find("\n\n") {
+            let frame = buf[..pos].to_owned();
+            buf.drain(..pos + 2);
+            for line in frame.lines() {
+                let line = line.trim_start();
+                let Some(data) = line.strip_prefix("data:") else { continue };
+                let data = data.trim();
+                if data.is_empty() {
+                    continue;
+                }
+                let parsed: GeminiResponse = match serde_json::from_str(data) {
+                    Ok(p) => p,
+                    Err(_) => continue,
+                };
+                if let Some(err) = parsed.error {
+                    tracing::error!(
+                        model = %model,
+                        api_error = %err.message,
+                        "gemini streaming: error frame in SSE body"
+                    );
+                    bail!("Gemini API error: {}", err.message);
+                }
+                let parts = parsed.candidates
+                    .and_then(|c| c.into_iter().next())
+                    .and_then(|c| c.content)
+                    .map(|c| c.parts)
+                    .unwrap_or_default();
+                for part in parts {
+                    if let Some(fc) = part.function_call {
+                        function_calls.push(GeminiToolCall {
+                            call: fc,
+                            thought_signature: part.thought_signature,
+                        });
+                    } else if let Some(t) = part.text
+                        && !t.is_empty()
+                    {
+                        on_token(&t);
+                        text_acc.push_str(&t);
+                    }
+                }
+            }
+        }
+    }
+
+    if !function_calls.is_empty() {
+        Ok(ToolTurnResult::ToolCalls(function_calls))
+    } else {
+        Ok(ToolTurnResult::Text(text_acc))
     }
 }
 

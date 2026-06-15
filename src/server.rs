@@ -98,6 +98,8 @@ pub struct AppState {
     pub settings: Arc<RwLock<crate::config::Settings>>,
     /// Per-repo MCP services, lazily created on first access.
     pub repo_mcp_services: Arc<RwLock<HashMap<String, RepoMcpService>>>,
+    /// In-memory, LRU-bounded chat conversation store (repo detail chat).
+    pub conversations: Arc<crate::chat::ConversationStore>,
 }
 
 // ─── Router ────────────────────────────────────────────────────────────────
@@ -119,6 +121,7 @@ pub fn build_router(
         repo_dbs: repo_dbs.clone(),
         settings: settings.clone(),
         repo_mcp_services: Arc::new(RwLock::new(HashMap::new())),
+        conversations: Arc::new(crate::chat::ConversationStore::new()),
     };
 
     // Build the StreamableHttpService for the /mcp endpoint.
@@ -180,6 +183,8 @@ pub fn build_router(
         .route("/api/repos/:repo_id/graph", get(get_repo_graph))
         .route("/api/repos/:repo_id/chunks", get(get_repo_chunks))
         .route("/api/repos/:repo_id/index-events", get(get_index_events))
+        .route("/api/repos/:repo_id/chat", post(post_repo_chat))
+        .route("/api/repos/:repo_id/chat/:conversation_id", delete(delete_repo_chat))
         .route("/api/index-all", post(post_index_all))
         .route("/api/index-status", get(get_index_status))
         .route("/api/query", post(post_query))
@@ -1204,7 +1209,107 @@ async fn get_index_events(
     Sse::new(keepalive_stream).into_response()
 }
 
-// ─── Embedding cache purge ────────────────────────────────────────────────
+// ─── Repo chat (streaming, tool-calling agent) ────────────────────────────
+
+#[derive(Deserialize)]
+struct ChatRequest {
+    conversation_id: String,
+    message: String,
+}
+
+/// POST /api/repos/:repo_id/chat — stream an answer for one chat message.
+///
+/// Returns an SSE stream of `ChatEvent` JSON frames (tool_call, tool_result,
+/// token, done, error). The conversation transcript is held in memory keyed by
+/// `conversation_id`; closing the dialog (DELETE below) drops it.
+async fn post_repo_chat(
+    State(state): State<AppState>,
+    Path(repo_id): Path<String>,
+    Json(req): Json<ChatRequest>,
+) -> Response {
+    let repo = match decode_repo_id(&repo_id) {
+        Ok(r) => r,
+        Err(r) => return r,
+    };
+
+    let conversation_id = req.conversation_id.trim().to_owned();
+    let message = req.message.trim().to_owned();
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<crate::chat::ChatEvent>();
+
+    // Validate inputs up front; emit an Error frame (not an HTTP error) so the
+    // dialog always renders a message instead of a dead stream.
+    if conversation_id.is_empty() || message.is_empty() {
+        let _ = tx.send(crate::chat::ChatEvent::Error {
+            message: "conversation_id and message are required.".to_owned(),
+        });
+        return chat_sse_response(rx);
+    }
+
+    // Build the LLM client from settings.llm. Missing keys → concise error frame.
+    let settings = state.settings.read().await.clone();
+    let llm = match crate::llm::LlmClient::new(&settings.llm) {
+        Some(c) => c,
+        None => {
+            let _ = tx.send(crate::chat::ChatEvent::Error {
+                message: "No LLM API key configured. Add a provider key in Settings to use chat."
+                    .to_owned(),
+            });
+            return chat_sse_response(rx);
+        }
+    };
+
+    let deps = crate::chat::ChatTurnDeps {
+        home_dir: state.home_dir.clone(),
+        data_dir: state.data_dir.clone(),
+        index_engine: state.index_engine.clone(),
+        repo_dbs: state.repo_dbs.clone(),
+        settings,
+        conversations: state.conversations.clone(),
+    };
+
+    // Drive the agent on a background task; the SSE stream drains `rx`.
+    //
+    // Client-disconnect handling: when the dialog is closed (or the connection
+    // drops), axum drops the SSE response body → drops the stream → drops `rx`.
+    // We race the agent against `tx.closed()` (resolves once every receiver is
+    // gone) so a disconnect cancels `run_chat_turn` at its next await point —
+    // cutting an in-flight LLM stream or tool call instead of burning tokens to
+    // completion for a client that already left.
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = crate::chat::run_chat_turn(&deps, &llm, &repo, &conversation_id, &message, &tx) => {}
+            _ = tx.closed() => {
+                tracing::debug!(%repo, "chat client disconnected — agent loop cancelled");
+            }
+        }
+    });
+
+    chat_sse_response(rx)
+}
+
+/// Wrap a `ChatEvent` receiver into an SSE response. Each event is one
+/// `data:` frame of JSON; the stream ends after a `done`/`error` event when the
+/// sender is dropped.
+fn chat_sse_response(rx: tokio::sync::mpsc::UnboundedReceiver<crate::chat::ChatEvent>) -> Response {
+    let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(rx).map(|ev| {
+        let data = serde_json::to_string(&ev).unwrap_or_default();
+        Ok::<_, Infallible>(Event::default().data(data))
+    });
+    Sse::new(stream).into_response()
+}
+
+/// DELETE /api/repos/:repo_id/chat/:conversation_id — drop a conversation when
+/// the dialog is closed. `repo_id` is accepted for route symmetry but the
+/// conversation id is globally unique, so only the id is needed.
+async fn delete_repo_chat(
+    State(state): State<AppState>,
+    Path((_repo_id, conversation_id)): Path<(String, String)>,
+) -> Response {
+    state.conversations.drop_conversation(&conversation_id).await;
+    Json(json!({ "ok": true })).into_response()
+}
+
 
 /// DELETE /api/embedding-cache?older_than=all|30d
 ///

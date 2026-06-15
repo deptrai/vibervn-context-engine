@@ -264,6 +264,7 @@ fn agentic_tool_definitions() -> Vec<ToolDef> {
 fn estimate_history_bytes(messages: &[ChatMessage]) -> usize {
     messages.iter().map(|m| match m {
         ChatMessage::User(t) => t.len(),
+        ChatMessage::Model(t) => t.len(),
         ChatMessage::ModelToolCalls(calls) => calls.iter().map(|c| c.name.len() + c.args.to_string().len() + 50).sum(),
         ChatMessage::ToolResults(results) => results.iter().map(|r| r.name.len() + r.content.len() + 50).sum(),
     }).sum()

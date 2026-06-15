@@ -44,6 +44,9 @@ pub struct ToolResult {
 /// Conversation messages for multi-turn tool-calling.
 pub enum ChatMessage {
     User(String),
+    /// A plain-text assistant turn (no tool calls). Used to replay prior answers
+    /// when continuing a multi-turn chat conversation.
+    Model(String),
     ModelToolCalls(Vec<ToolCall>),
     ToolResults(Vec<ToolResult>),
 }
@@ -272,6 +275,144 @@ impl LlmClient {
             match self.call_provider_with_tools(system, contents, tools, temperature, force_tool_use, key, prompt_cache_key).await {
                 Ok(response) => return Ok(response),
                 Err(e) => {
+                    last_err = Some(e);
+                }
+            }
+        }
+
+        Err(last_err.unwrap())
+    }
+}
+
+// ─── Streaming tool-calling ───────────────────────────────────────────────
+
+/// Sink for streamed assistant text deltas. Each call carries the next token(s)
+/// the model produced. Decoupled from any higher-level event type so the `llm`
+/// module stays self-contained; the chat layer maps these into SSE events.
+pub type TokenSink<'a> = dyn Fn(&str) + Send + Sync + 'a;
+
+impl LlmClient {
+    /// Dispatch to the provider-specific streaming tool-calling function.
+    #[allow(clippy::too_many_arguments)]
+    async fn call_provider_with_tools_streaming(
+        &self,
+        system: &str,
+        contents: &[ChatMessage],
+        tools: &[ToolDef],
+        temperature: f32,
+        force_tool_use: bool,
+        key: &str,
+        prompt_cache_key: Option<&str>,
+        on_token: &TokenSink<'_>,
+        started: &std::sync::atomic::AtomicBool,
+    ) -> Result<ToolTurnResult> {
+        match self.provider.as_str() {
+            "google" => {
+                let r = google::complete_with_tools_streaming(
+                    &self.http, &self.model, key, system, contents, tools, temperature,
+                    force_tool_use, on_token, started,
+                ).await?;
+                match r {
+                    google::ToolTurnResult::Text(t) => Ok(ToolTurnResult::Text(t)),
+                    google::ToolTurnResult::ToolCalls(calls) => Ok(ToolTurnResult::ToolCalls(
+                        calls.into_iter().map(|c| ToolCall {
+                            name: c.call.name,
+                            id: c.call.id,
+                            args: c.call.args,
+                            thought_signature: c.thought_signature,
+                        }).collect()
+                    )),
+                }
+            }
+            "openai" => {
+                let r = openai::complete_with_tools_streaming(
+                    &self.http, &self.model, key, system, contents, tools, temperature,
+                    force_tool_use, prompt_cache_key, self.openai_base_url.as_deref(),
+                    self.openai_force_tool_use, on_token, started,
+                ).await?;
+                match r {
+                    openai::ToolTurnResult::Text(t) => Ok(ToolTurnResult::Text(t)),
+                    openai::ToolTurnResult::ToolCalls(calls) => Ok(ToolTurnResult::ToolCalls(
+                        calls.into_iter().map(|c| {
+                            let args = serde_json::from_str(&c.function.arguments).unwrap_or(serde_json::Value::Object(Default::default()));
+                            ToolCall { name: c.function.name, id: Some(c.id), args, thought_signature: None }
+                        }).collect()
+                    )),
+                }
+            }
+            other => bail!("unsupported LLM provider for tool-calling: {other}"),
+        }
+    }
+
+    /// Streaming variant of [`complete_with_tools`]. Text deltas are delivered
+    /// to `on_token` as they arrive; the final assembled result (full text OR
+    /// the requested tool calls) is returned.
+    ///
+    /// Key-rotation rule: a key is only retried if the failure happened
+    /// **before any token was streamed** (`started` still false). Once the
+    /// provider has begun streaming the body, partial text has already reached
+    /// the caller, so retrying on another key would duplicate output — such a
+    /// mid-stream failure is returned verbatim for the UI to surface.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn complete_with_tools_streaming(
+        &self,
+        system: &str,
+        contents: &[ChatMessage],
+        tools: &[ToolDef],
+        temperature: f32,
+        force_tool_use: bool,
+        prompt_cache_key: Option<&str>,
+        on_token: &TokenSink<'_>,
+    ) -> Result<ToolTurnResult> {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let n_keys = self.api_keys.len();
+        let start_cursor = self.key_cursor.fetch_add(1, Ordering::Relaxed) % n_keys;
+
+        let mut last_err = None;
+        let mut rate_limited: Vec<bool> = vec![false; n_keys];
+
+        for offset in 0..n_keys {
+            let key_idx = (start_cursor + offset) % n_keys;
+            let key = &self.api_keys[key_idx];
+            let started = AtomicBool::new(false);
+            match self.call_provider_with_tools_streaming(
+                system, contents, tools, temperature, force_tool_use, key,
+                prompt_cache_key, on_token, &started,
+            ).await {
+                Ok(response) => return Ok(response),
+                Err(e) => {
+                    // Tokens already emitted on this key — cannot retry without
+                    // duplicating output. Surface the error to the caller.
+                    if started.load(Ordering::Relaxed) {
+                        return Err(e);
+                    }
+                    if is_rate_limited(&e) {
+                        rate_limited[key_idx] = true;
+                    }
+                    warn!(key_index = key_idx, error = %e, "LLM streaming tool-call failed pre-stream — trying next key");
+                    last_err = Some(e);
+                }
+            }
+        }
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        for offset in 0..n_keys {
+            let key_idx = (start_cursor + offset) % n_keys;
+            if rate_limited[key_idx] {
+                continue;
+            }
+            let key = &self.api_keys[key_idx];
+            let started = AtomicBool::new(false);
+            match self.call_provider_with_tools_streaming(
+                system, contents, tools, temperature, force_tool_use, key,
+                prompt_cache_key, on_token, &started,
+            ).await {
+                Ok(response) => return Ok(response),
+                Err(e) => {
+                    if started.load(Ordering::Relaxed) {
+                        return Err(e);
+                    }
                     last_err = Some(e);
                 }
             }

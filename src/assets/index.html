@@ -48,6 +48,39 @@
     .cancel-state:hover {
       background-color: rgba(239, 68, 68, 0.1) !important;
     }
+    /* Rendered-markdown chat answers — tight vertical rhythm, token-aligned. */
+    .chat-md > :first-child { margin-top: 0; }
+    .chat-md > :last-child { margin-bottom: 0; }
+    .chat-md p { margin: 0.5em 0; }
+    .chat-md h1, .chat-md h2, .chat-md h3,
+    .chat-md h4, .chat-md h5, .chat-md h6 {
+      font-weight: 600; line-height: 1.3; margin: 0.9em 0 0.4em;
+    }
+    .chat-md h1 { font-size: 1.15em; }
+    .chat-md h2 { font-size: 1.08em; }
+    .chat-md h3 { font-size: 1em; }
+    .chat-md h4, .chat-md h5, .chat-md h6 { font-size: 0.95em; }
+    .chat-md ul, .chat-md ol { margin: 0.5em 0; padding-left: 1.4em; }
+    .chat-md ul { list-style: disc; }
+    .chat-md ol { list-style: decimal; }
+    .chat-md li { margin: 0.15em 0; }
+    .chat-md a { color: #2563eb; }
+    .dark .chat-md a { color: #6b9fce; }
+    .chat-md code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 0.88em; padding: 0.1em 0.35em; border-radius: 3px;
+      background: rgba(0, 0, 0, 0.06);
+    }
+    .dark .chat-md code { background: rgba(255, 255, 255, 0.08); }
+    .chat-md pre {
+      margin: 0.6em 0; padding: 0.65em 0.8em; border-radius: 4px;
+      overflow-x: auto; background: rgba(0, 0, 0, 0.05);
+      border: 1px solid rgba(0, 0, 0, 0.08);
+    }
+    .dark .chat-md pre {
+      background: #101418; border-color: #2e3a42;
+    }
+    .chat-md pre code { background: none; padding: 0; font-size: 0.85em; }
   </style>
 </head>
 <body class="bg-gray-50 dark:bg-wiki-bg text-gray-900 dark:text-wiki-text min-h-screen transition-colors duration-200">
@@ -732,6 +765,13 @@
         &larr; Back
       </button>
       <span id="search-repo-name" class="font-mono text-sm text-gray-800 dark:text-wiki-text truncate"></span>
+      <button id="btn-open-chat" data-i18n="chat.open"
+              class="ml-auto inline-flex items-center gap-1.5 px-3 py-1.5 text-sm rounded
+                     bg-blue-600 dark:bg-wiki-border-active/20 dark:border dark:border-wiki-border-active text-white dark:text-wiki-link
+                     hover:bg-blue-700 dark:hover:bg-wiki-border-active/30 focus:outline-none focus:ring-2 focus:ring-blue-400">
+        <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" aria-hidden="true"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+        Chat
+      </button>
     </div>
 
     <!-- Sub-tab switcher (Index Explorer / Search) -->
@@ -1092,6 +1132,54 @@
   </div>
 </div>
 
+<!-- Chat Dialog -->
+<div id="modal-chat" class="hidden fixed inset-0 z-[120] flex items-center justify-center bg-black/60 backdrop-blur-sm"
+     role="dialog" aria-modal="true" aria-labelledby="chat-title">
+  <div class="w-full max-w-2xl mx-4 bg-white dark:bg-wiki-surface border border-gray-200 dark:border-wiki-border rounded-lg shadow-2xl flex flex-col"
+       style="height: min(80vh, 720px);">
+    <!-- Header -->
+    <div class="flex items-center justify-between px-4 py-3 border-b border-gray-200 dark:border-wiki-border">
+      <h3 id="chat-title" data-i18n="chat.title" class="text-sm font-medium text-gray-900 dark:text-wiki-heading">Chat</h3>
+      <span id="chat-repo-name" class="font-mono text-xs text-gray-400 dark:text-wiki-text-muted truncate flex-1 mx-3 text-right"></span>
+      <button id="btn-close-chat" aria-label="Close"
+              class="text-gray-400 dark:text-wiki-text-muted hover:text-gray-700 dark:hover:text-wiki-text focus:outline-none focus:ring-2 focus:ring-blue-400 rounded p-1">
+        <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 18L18 6M6 6l12 12"/></svg>
+      </button>
+    </div>
+    <!-- Messages -->
+    <div id="chat-messages" class="flex-1 overflow-y-auto px-4 py-4 space-y-4" aria-live="polite">
+      <!-- Empty state -->
+      <div id="chat-empty" class="h-full flex flex-col items-center justify-center text-center gap-2">
+        <svg class="w-10 h-10 text-gray-300 dark:text-wiki-text-muted" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24" aria-hidden="true"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+        <p data-i18n="chat.emptyTitle" class="font-wiki text-lg text-gray-700 dark:text-wiki-heading">Ask about this repository</p>
+        <p data-i18n="chat.emptyHint" class="text-xs text-gray-400 dark:text-wiki-text-muted max-w-sm">
+          The assistant searches the index with codebase-retrieval and file-retrieval to answer.
+        </p>
+      </div>
+    </div>
+    <!-- Composer -->
+    <div class="border-t border-gray-200 dark:border-wiki-border px-4 py-3">
+      <form id="form-chat" class="flex items-end gap-2" onsubmit="return false;">
+        <textarea id="chat-input" rows="1" data-i18n-ph="chat.placeholder"
+                  placeholder="Ask anything about this repo…"
+                  class="flex-1 resize-none border border-gray-200 dark:border-wiki-border bg-white dark:bg-wiki-bg rounded px-3 py-2 text-sm
+                         text-gray-900 dark:text-wiki-text placeholder:text-gray-400 dark:placeholder:text-wiki-text-muted
+                         focus:outline-none focus:ring-2 focus:ring-blue-400 focus:border-blue-400 dark:focus:border-wiki-border-active
+                         max-h-32 overflow-y-auto"></textarea>
+        <button type="submit" id="btn-send-chat" data-i18n="chat.send"
+                class="px-4 py-2 bg-blue-600 dark:bg-wiki-border-active/20 dark:border dark:border-wiki-border-active text-white dark:text-wiki-link text-sm rounded
+                       hover:bg-blue-700 dark:hover:bg-wiki-border-active/30 focus:outline-none focus:ring-2 focus:ring-blue-400
+                       disabled:opacity-50 disabled:cursor-not-allowed">
+          Send
+        </button>
+      </form>
+      <p data-i18n="chat.disclaimer" class="text-[11px] text-gray-400 dark:text-wiki-text-muted mt-1.5">
+        Answers are generated from the index and may be incomplete. Verify against the source.
+      </p>
+    </div>
+  </div>
+</div>
+
 <script>
 // ─── State ────────────────────────────────────────────────────────────────
 let cfg = null;
@@ -1391,6 +1479,23 @@ const STR = {
                          zh: `在终端中运行此命令，将 MCP 服务器注册到 Claude Code（项目范围）。` },
   'repo.rebuild':      { en: `Rebuild Index`, vi: `Rebuild Index`, zh: `重建索引` },
   'repo.incremental':  { en: `Incremental Update`, vi: `Incremental Update`, zh: `增量更新` },
+  // Repo chat
+  'chat.open':         { en: `Chat`, vi: `Chat`, zh: `对话` },
+  'chat.title':        { en: `Chat`, vi: `Chat`, zh: `对话` },
+  'chat.emptyTitle':   { en: `Ask about this repository`, vi: `Hỏi về repo này`, zh: `询问此仓库` },
+  'chat.emptyHint':    { en: `The assistant searches the index with codebase-retrieval and file-retrieval to answer.`,
+                         vi: `Trợ lý dùng codebase-retrieval và file-retrieval để tìm trong index và trả lời.`,
+                         zh: `助手通过 codebase-retrieval 和 file-retrieval 搜索索引来回答。` },
+  'chat.placeholder':  { en: `Ask anything about this repo…`, vi: `Hỏi bất cứ điều gì về repo này…`, zh: `询问关于此仓库的任何问题…` },
+  'chat.send':         { en: `Send`, vi: `Gửi`, zh: `发送` },
+  'chat.disclaimer':   { en: `Answers are generated from the index and may be incomplete. Verify against the source.`,
+                         vi: `Câu trả lời được tạo từ index và có thể chưa đầy đủ. Hãy kiểm chứng với source.`,
+                         zh: `回答基于索引生成，可能不完整。请对照源代码核实。` },
+  'chat.thinking':     { en: `Thinking…`, vi: `Đang suy nghĩ…`, zh: `思考中…` },
+  'chat.toolCodebase': { en: `Searching codebase`, vi: `Đang tìm trong codebase`, zh: `正在搜索代码库` },
+  'chat.toolFile':     { en: `Reading file`, vi: `Đang đọc file`, zh: `正在读取文件` },
+  'chat.toolFailed':   { en: `failed`, vi: `thất bại`, zh: `失败` },
+  'chat.connErr':      { en: `Connection lost. Please try again.`, vi: `Mất kết nối. Vui lòng thử lại.`, zh: `连接中断，请重试。` },
   'graph.heading':     { en: `Call graph`, vi: `Call graph`, zh: `调用图` },
   'graph.loading':     { en: `Loading call graph…`, vi: `Đang tải call graph…`, zh: `正在加载调用图…` },
   'graph.empty':       { en: `No call relationships in the index yet.`, vi: `Index chưa có quan hệ lời gọi nào.`, zh: `索引中尚无调用关系。` },
@@ -2076,6 +2181,82 @@ function renderAll() {
 
 function escHtml(str) {
   return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+// ─── Minimal Markdown renderer (no external deps) ────────────────────────────
+// Handles the subset LLM chat answers actually emit: headings, bold/italic,
+// inline code, fenced code blocks, ordered/unordered lists, links, paragraphs.
+// HTML is escaped before any formatting, so output is XSS-safe.
+function mdInline(text) {
+  // Protect inline code first so `*`/`_` inside it isn't treated as emphasis.
+  const codes = [];
+  let s = text.replace(/`([^`]+)`/g, (m, c) => {
+    codes.push(escHtml(c));
+    return ' ' + (codes.length - 1) + ' ';
+  });
+  s = escHtml(s);
+  s = s.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (m, label, url) => {
+    // escHtml has already run, so '&' in the captured url is '&amp;' etc.
+    // Only allow safe schemes — block javascript:/data:/vbscript: which escaping
+    // alone does not stop. Relative and anchor links are allowed.
+    const scheme = (url.match(/^([a-z][a-z0-9+.-]*):/i) || [])[1];
+    if (scheme && !/^(https?|mailto)$/i.test(scheme)) return label;
+    return '<a href="' + url + '" target="_blank" rel="noopener" class="text-blue-600 dark:text-wiki-link hover:underline">' + label + '</a>';
+  });
+  s = s.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+  s = s.replace(/__([^_]+)__/g, '<strong>$1</strong>');
+  s = s.replace(/(^|[^*])\*([^*\n]+)\*/g, '$1<em>$2</em>');
+  s = s.replace(/(^|[^_\w])_([^_\n]+)_/g, '$1<em>$2</em>');
+  s = s.replace(/ (\d+) /g, (m, i) => codes[+i] !== undefined ? '<code>' + codes[+i] + '</code>' : m);
+  return s;
+}
+
+function renderMarkdown(src) {
+  const lines = src.replace(/\r\n?/g, '\n').split('\n');
+  let html = '';
+  let para = [];      // pending paragraph lines
+  let listType = null; // 'ul' | 'ol' | null
+  let inFence = false;
+  let fence = [];
+
+  const flushPara = () => {
+    if (para.length) { html += '<p>' + para.map(mdInline).join('<br>') + '</p>'; para = []; }
+  };
+  const closeList = () => { if (listType) { html += '</' + listType + '>'; listType = null; } };
+
+  for (const line of lines) {
+    if (inFence) {
+      if (/^\s*```/.test(line)) { html += '<pre><code>' + escHtml(fence.join('\n')) + '</code></pre>'; fence = []; inFence = false; }
+      else { fence.push(line); }
+      continue;
+    }
+    if (/^\s*```/.test(line)) { flushPara(); closeList(); inFence = true; continue; }
+
+    const heading = line.match(/^(#{1,6})\s+(.*)$/);
+    if (heading) {
+      flushPara(); closeList();
+      const lvl = heading[1].length;
+      html += '<h' + lvl + '>' + mdInline(heading[2].trim()) + '</h' + lvl + '>';
+      continue;
+    }
+
+    const ul = line.match(/^\s*[-*+]\s+(.*)$/);
+    const ol = line.match(/^\s*\d+\.\s+(.*)$/);
+    if (ul || ol) {
+      flushPara();
+      const type = ul ? 'ul' : 'ol';
+      if (listType !== type) { closeList(); html += '<' + type + '>'; listType = type; }
+      html += '<li>' + mdInline((ul ? ul[1] : ol[1]).trim()) + '</li>';
+      continue;
+    }
+
+    if (line.trim() === '') { flushPara(); closeList(); continue; }
+    closeList();
+    para.push(line.trim());
+  }
+  if (inFence) { html += '<pre><code>' + escHtml(fence.join('\n')) + '</code></pre>'; }
+  flushPara(); closeList();
+  return html;
 }
 
 // ─── Save ──────────────────────────────────────────────────────────────────
@@ -3070,6 +3251,10 @@ function openRepoSearch(repo) {
 
 function closeRepoSearch() {
   currentSearchRepo = null;
+  // Close any open chat dialog so its conversation is ended too.
+  if (!document.getElementById('modal-chat').classList.contains('hidden')) {
+    closeChat();
+  }
   resetCallGraph();
   searchToken++;   // invalidate any in-flight repo search so it can't render into the next view
   document.getElementById('search-page').classList.add('hidden');
@@ -4689,6 +4874,290 @@ function formatDuration(ms) {
   const s = (ms / 1000).toFixed(1);
   return s + 's';
 }
+
+// ─── Repo Chat (streaming, tool-calling agent) ──────────────────────────────
+let chatConversationId = null;
+let chatRepo = null;
+let chatAbort = null;     // AbortController for the in-flight stream
+let chatBusy = false;
+
+function genConversationId() {
+  if (window.crypto && crypto.randomUUID) return crypto.randomUUID();
+  return 'c-' + Date.now() + '-' + Math.random().toString(16).slice(2);
+}
+
+function openChat() {
+  if (!currentSearchRepo) return;
+  chatRepo = currentSearchRepo;
+  chatConversationId = genConversationId();
+  document.getElementById('chat-repo-name').textContent = chatRepo;
+  // Fresh conversation each open.
+  const msgs = document.getElementById('chat-messages');
+  msgs.innerHTML = '';
+  msgs.appendChild(buildChatEmptyState());
+  document.getElementById('chat-input').value = '';
+  document.getElementById('modal-chat').classList.remove('hidden');
+  setTimeout(() => document.getElementById('chat-input').focus(), 50);
+}
+
+function buildChatEmptyState() {
+  const wrap = document.createElement('div');
+  wrap.id = 'chat-empty';
+  wrap.className = 'h-full flex flex-col items-center justify-center text-center gap-2';
+  wrap.innerHTML =
+    '<svg class="w-10 h-10 text-gray-300 dark:text-wiki-text-muted" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24" aria-hidden="true"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>' +
+    '<p class="font-wiki text-lg text-gray-700 dark:text-wiki-heading">' + escHtml(t('chat.emptyTitle')) + '</p>' +
+    '<p class="text-xs text-gray-400 dark:text-wiki-text-muted max-w-sm">' + escHtml(t('chat.emptyHint')) + '</p>';
+  return wrap;
+}
+
+function closeChat() {
+  document.getElementById('modal-chat').classList.add('hidden');
+  // Abort any in-flight stream.
+  if (chatAbort) { try { chatAbort.abort(); } catch (e) {} chatAbort = null; }
+  chatBusy = false;
+  // Drop the conversation server-side; closing == ending it.
+  if (chatRepo && chatConversationId) {
+    const repoId = encodeRepoId(chatRepo);
+    fetch(`/api/repos/${repoId}/chat/${encodeURIComponent(chatConversationId)}`, { method: 'DELETE' })
+      .catch(() => {});
+  }
+  chatConversationId = null;
+  chatRepo = null;
+}
+
+// ── Message DOM builders ──
+function chatScrollToBottom() {
+  const msgs = document.getElementById('chat-messages');
+  msgs.scrollTop = msgs.scrollHeight;
+}
+
+function appendUserMessage(text) {
+  const empty = document.getElementById('chat-empty');
+  if (empty) empty.remove();
+  const msgs = document.getElementById('chat-messages');
+  const row = document.createElement('div');
+  row.className = 'flex justify-end';
+  const bubble = document.createElement('div');
+  bubble.className = 'max-w-[85%] rounded-lg px-3 py-2 text-sm whitespace-pre-wrap break-words bg-blue-600 text-white dark:bg-wiki-border-active/30 dark:text-wiki-text';
+  bubble.textContent = text;
+  row.appendChild(bubble);
+  msgs.appendChild(row);
+  chatScrollToBottom();
+}
+
+// Build an assistant turn container holding (optional) tool steps + answer.
+function appendAssistantTurn() {
+  const msgs = document.getElementById('chat-messages');
+  const row = document.createElement('div');
+  row.className = 'flex flex-col items-start gap-2';
+
+  const steps = document.createElement('div');
+  steps.className = 'chat-steps flex flex-col gap-1 w-full';
+
+  const status = document.createElement('div');
+  status.className = 'chat-status flex items-center gap-2 text-xs text-gray-400 dark:text-wiki-text-muted';
+  status.innerHTML = '<span class="inline-block w-3 h-3 rounded-full border-2 border-gray-300 dark:border-wiki-border border-t-blue-500 animate-spin"></span><span>' + escHtml(t('chat.thinking')) + '</span>';
+
+  const answer = document.createElement('div');
+  answer.className = 'chat-answer chat-md max-w-[85%] rounded-lg px-3 py-2 text-sm break-words bg-gray-100 text-gray-900 dark:bg-wiki-surface dark:text-wiki-text hidden';
+
+  row.appendChild(steps);
+  row.appendChild(status);
+  row.appendChild(answer);
+  msgs.appendChild(row);
+  chatScrollToBottom();
+  return { row, steps, status, answer };
+}
+
+function toolLabel(name) {
+  if (name === 'codebase-retrieval') return t('chat.toolCodebase');
+  if (name === 'file-retrieval') return t('chat.toolFile');
+  return name;
+}
+
+function addToolStep(turn, name, summary) {
+  const step = document.createElement('div');
+  step.className = 'chat-step border border-gray-200 dark:border-wiki-border rounded bg-white dark:bg-wiki-bg px-2.5 py-1.5 text-xs';
+  const head = document.createElement('div');
+  head.className = 'flex items-center gap-2 text-gray-600 dark:text-wiki-text-muted';
+  head.innerHTML =
+    '<span class="chat-step-spin inline-block w-3 h-3 rounded-full border-2 border-gray-300 dark:border-wiki-border border-t-blue-500 animate-spin"></span>' +
+    '<span class="font-medium text-gray-700 dark:text-wiki-text">' + escHtml(toolLabel(name)) + '</span>' +
+    '<code class="font-mono text-[11px] text-gray-400 dark:text-wiki-text-muted truncate">' + escHtml(name) + '</code>';
+  step.appendChild(head);
+  if (summary) {
+    const sub = document.createElement('div');
+    sub.className = 'mt-0.5 pl-5 text-gray-400 dark:text-wiki-text-muted truncate';
+    sub.textContent = summary;
+    step.appendChild(sub);
+  }
+  turn.steps.appendChild(step);
+  chatScrollToBottom();
+  return step;
+}
+
+function markToolDone(step, ok) {
+  const spin = step.querySelector('.chat-step-spin');
+  if (spin) {
+    spin.className = 'chat-step-done inline-block w-3 h-3';
+    spin.innerHTML = ok
+      ? '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" class="text-green-500 w-3 h-3"><path d="M5 13l4 4L19 7"/></svg>'
+      : '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" class="text-red-500 w-3 h-3"><path d="M6 18L18 6M6 6l12 12"/></svg>';
+  }
+  if (!ok) {
+    const head = step.querySelector('div');
+    if (head) {
+      const badge = document.createElement('span');
+      badge.className = 'text-red-500 text-[11px]';
+      badge.textContent = '(' + t('chat.toolFailed') + ')';
+      head.appendChild(badge);
+    }
+  }
+}
+
+function setTurnError(turn, message) {
+  if (turn.status) turn.status.remove();
+  turn.answer.classList.remove('hidden');
+  turn.answer.className = 'chat-answer max-w-[85%] rounded-lg px-3 py-2 text-sm whitespace-pre-wrap break-words bg-red-50 text-red-700 border border-red-200 dark:bg-red-900/20 dark:text-red-300 dark:border-red-800';
+  turn.answer.textContent = message;
+  chatScrollToBottom();
+}
+
+async function sendChat() {
+  if (chatBusy) return;
+  const input = document.getElementById('chat-input');
+  const message = input.value.trim();
+  if (!message || !chatRepo || !chatConversationId) return;
+
+  chatBusy = true;
+  const sendBtn = document.getElementById('btn-send-chat');
+  sendBtn.disabled = true;
+  input.value = '';
+  input.style.height = 'auto';
+
+  appendUserMessage(message);
+  const turn = appendAssistantTurn();
+  const activeSteps = {}; // name -> last pending step element
+
+  chatAbort = new AbortController();
+  const repoId = encodeRepoId(chatRepo);
+
+  try {
+    const res = await fetch(`/api/repos/${repoId}/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ conversation_id: chatConversationId, message }),
+      signal: chatAbort.signal,
+    });
+    if (!res.ok || !res.body) {
+      setTurnError(turn, t('err.networkShort') + ' (HTTP ' + res.status + ')');
+      finishChatTurn(sendBtn);
+      return;
+    }
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+    let gotToken = false;
+
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      // SSE frames separated by blank line.
+      let idx;
+      while ((idx = buf.indexOf('\n\n')) !== -1) {
+        const frame = buf.slice(0, idx);
+        buf = buf.slice(idx + 2);
+        const dataLines = frame.split('\n')
+          .filter(l => l.startsWith('data:'))
+          .map(l => l.slice(5).trim());
+        if (!dataLines.length) continue;
+        let ev;
+        try { ev = JSON.parse(dataLines.join('')); } catch (e) { continue; }
+        gotToken = handleChatEvent(turn, ev, activeSteps, gotToken) || gotToken;
+      }
+    }
+    // Stream ended without an explicit done/error (e.g. server closed early).
+    if (!turn.answer.textContent && !turn.row.querySelector('.chat-answer:not(.hidden)')) {
+      // If we never got a terminal event, clean up the spinner gracefully.
+      if (turn.status && document.body.contains(turn.status)) {
+        if (gotToken) { turn.status.remove(); }
+        else { setTurnError(turn, t('chat.connErr')); }
+      }
+    }
+  } catch (e) {
+    if (e && e.name === 'AbortError') {
+      // Dialog closed mid-stream — nothing to show.
+    } else {
+      setTurnError(turn, t('chat.connErr'));
+    }
+  }
+  finishChatTurn(sendBtn);
+}
+
+function finishChatTurn(sendBtn) {
+  chatBusy = false;
+  if (chatAbort) chatAbort = null;
+  sendBtn.disabled = false;
+  document.getElementById('chat-input').focus();
+}
+
+// Returns true if a token was appended (so caller can track streaming progress).
+function handleChatEvent(turn, ev, activeSteps, gotToken) {
+  switch (ev.type) {
+    case 'tool_call': {
+      const step = addToolStep(turn, ev.name, ev.summary || '');
+      activeSteps[ev.name] = step;
+      return false;
+    }
+    case 'tool_result': {
+      const step = activeSteps[ev.name];
+      if (step) { markToolDone(step, ev.ok); delete activeSteps[ev.name]; }
+      return false;
+    }
+    case 'token': {
+      if (turn.status) {
+        turn.status.remove();
+        turn.status = null;
+      }
+      turn.answer.classList.remove('hidden');
+      turn.raw = (turn.raw || '') + ev.text;
+      turn.answer.innerHTML = renderMarkdown(turn.raw);
+      chatScrollToBottom();
+      return true;
+    }
+    case 'done': {
+      if (turn.status) { turn.status.remove(); turn.status = null; }
+      return false;
+    }
+    case 'error': {
+      setTurnError(turn, ev.message || t('chat.connErr'));
+      return false;
+    }
+  }
+  return false;
+}
+
+// ── Wiring ──
+document.getElementById('btn-open-chat').addEventListener('click', openChat);
+document.getElementById('btn-close-chat').addEventListener('click', closeChat);
+document.getElementById('form-chat').addEventListener('submit', (e) => { e.preventDefault(); sendChat(); });
+document.getElementById('chat-input').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendChat(); }
+});
+// Auto-grow the textarea.
+document.getElementById('chat-input').addEventListener('input', (e) => {
+  e.target.style.height = 'auto';
+  e.target.style.height = Math.min(e.target.scrollHeight, 128) + 'px';
+});
+// ESC closes the dialog (and ends the conversation).
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && !document.getElementById('modal-chat').classList.contains('hidden')) {
+    closeChat();
+  }
+});
 </script>
 </body>
 </html>
