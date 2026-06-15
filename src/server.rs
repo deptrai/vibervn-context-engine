@@ -1166,6 +1166,8 @@ async fn get_index_events(
                         crate::indexing::events::IndexEvent::FileIndexed { .. } => true,
                         crate::indexing::events::IndexEvent::Phase2Start { repo } => *repo == repo_filter,
                         crate::indexing::events::IndexEvent::Phase2Done { repo, .. } => *repo == repo_filter,
+                        crate::indexing::events::IndexEvent::SymbolIndexStart { repo } => *repo == repo_filter,
+                        crate::indexing::events::IndexEvent::SymbolIndexDone { repo, .. } => *repo == repo_filter,
                         crate::indexing::events::IndexEvent::Completed { repo, .. } => *repo == repo_filter,
                         crate::indexing::events::IndexEvent::Failed { repo, .. } => *repo == repo_filter,
                         crate::indexing::events::IndexEvent::Cancelled { repo } => *repo == repo_filter,

@@ -50,6 +50,10 @@ pub enum IndexEvent {
     Phase2Start { repo: String },
     /// Phase 2 edge resolution done.
     Phase2Done { repo: String, elapsed_ms: u64 },
+    /// Symbol-index rebuild started (post-embedding, full rebuild only).
+    SymbolIndexStart { repo: String },
+    /// Symbol-index rebuild done.
+    SymbolIndexDone { repo: String, elapsed_ms: u64 },
     /// Indexing completed successfully.
     Completed {
         repo: String,

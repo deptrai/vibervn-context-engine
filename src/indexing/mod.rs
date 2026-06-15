@@ -41,6 +41,30 @@ pub enum IndexState {
     Error,
 }
 
+/// Which stage of an in-flight run the pipeline is currently in.
+///
+/// The file-count progress bar (`indexed_files / total_files`) only describes
+/// the `Embedding` stage. After every file is embedded the bar pins at 100% but
+/// the run is NOT done: `SymbolIndex` (concurrent index rebuild) and
+/// `ResolveEdges` (Phase 2) run for many minutes at kernel scale with no
+/// file-count motion. This enum lets the UI show what's happening past 100%.
+///
+/// Only meaningful while `state == Indexing`; `Idle` otherwise.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IndexPhase {
+    /// Not in an indexing run (state is Idle/Error), or run hasn't started a stage.
+    Idle,
+    /// Parse → embed → store loop. Progress = `indexed_files / total_files`.
+    Embedding,
+    /// Rebuilding symbol indexes (concurrent `DEFINE INDEX`). Indeterminate —
+    /// a single blocking DB op with no sub-progress to report.
+    SymbolIndex,
+    /// Phase 2 edge resolution. Progress = `phase_done / phase_total` (edges)
+    /// when `phase_total > 0`; indeterminate while `phase_total == 0`.
+    ResolveEdges,
+}
+
 /// Per-repo status snapshot returned by `GET /api/index-status`.
 ///
 /// Dual-meaning fields (state-gated contract):
@@ -56,6 +80,21 @@ pub struct RepoStatus {
     pub total_files: u64,
     pub last_indexed_at: Option<DateTime<Utc>>,
     pub error: Option<String>,
+    /// Current pipeline stage. `Idle` unless `state == Indexing`.
+    #[serde(default = "default_phase")]
+    pub phase: IndexPhase,
+    /// Sub-progress numerator for `phase == ResolveEdges` (edges resolved so far).
+    /// `0` for all other phases. Paired with `phase_total`.
+    #[serde(default)]
+    pub phase_done: u64,
+    /// Sub-progress denominator for `phase == ResolveEdges` (total edges to
+    /// resolve). `0` means indeterminate (show a pulsing bar, no percentage).
+    #[serde(default)]
+    pub phase_total: u64,
+}
+
+fn default_phase() -> IndexPhase {
+    IndexPhase::Idle
 }
 
 impl Default for RepoStatus {
@@ -66,6 +105,9 @@ impl Default for RepoStatus {
             total_files: 0,
             last_indexed_at: None,
             error: None,
+            phase: IndexPhase::Idle,
+            phase_done: 0,
+            phase_total: 0,
         }
     }
 }
@@ -81,6 +123,13 @@ pub struct ProgressHandle {
 }
 
 impl ProgressHandle {
+    /// Test-only constructor over a bare status map, so pipeline tests can
+    /// observe phase/sub-progress transitions without booting the full engine.
+    #[cfg(test)]
+    pub fn new_for_test(statuses: Arc<RwLock<HashMap<String, RepoStatus>>>, repo: String) -> Self {
+        Self { statuses, repo }
+    }
+
     /// Set the denominator once the parsed file set is known.
     pub async fn set_run_total(&self, total: u64) {
         let mut map = self.statuses.write().await;
@@ -94,6 +143,33 @@ impl ProgressHandle {
         let s = map.entry(self.repo.clone()).or_default();
         if processed > s.indexed_files {
             s.indexed_files = processed;
+        }
+    }
+
+    /// Move the run to a new pipeline stage. Resets the edge sub-progress
+    /// counters (only `ResolveEdges` populates them).
+    pub async fn set_phase(&self, phase: IndexPhase) {
+        let mut map = self.statuses.write().await;
+        let s = map.entry(self.repo.clone()).or_default();
+        s.phase = phase;
+        s.phase_done = 0;
+        s.phase_total = 0;
+    }
+
+    /// Set the edge-resolution denominator at the start of Phase 2.
+    pub async fn set_phase_total(&self, total: u64) {
+        let mut map = self.statuses.write().await;
+        let s = map.entry(self.repo.clone()).or_default();
+        s.phase_total = total;
+    }
+
+    /// Advance the edge-resolution numerator. Monotonic — never decreases.
+    /// Called throttled (every N batches) to bound RwLock churn at scale.
+    pub async fn set_phase_done(&self, done: u64) {
+        let mut map = self.statuses.write().await;
+        let s = map.entry(self.repo.clone()).or_default();
+        if done > s.phase_done {
+            s.phase_done = done;
         }
     }
 }
@@ -984,6 +1060,9 @@ async fn run_consumer(
             status.error = None;
             status.indexed_files = 0;
             status.total_files = 0;
+            status.phase = IndexPhase::Embedding;
+            status.phase_done = 0;
+            status.phase_total = 0;
         }
 
         // Build embedding client — reject if no keys configured.
@@ -994,6 +1073,9 @@ async fn run_consumer(
             let s = statuses.entry(repo.clone()).or_default();
             s.state = IndexState::Error;
             s.error = Some(msg.clone());
+            s.phase = IndexPhase::Idle;
+            s.phase_done = 0;
+            s.phase_total = 0;
             engine_ref.event_bus.emit(IndexEvent::Failed {
                 repo: repo.clone(),
                 error: msg,
@@ -1013,6 +1095,9 @@ async fn run_consumer(
                     let s = statuses.entry(repo.clone()).or_default();
                     s.state = IndexState::Error;
                     s.error = Some(e.to_string());
+                    s.phase = IndexPhase::Idle;
+                    s.phase_done = 0;
+                    s.phase_total = 0;
                     engine_ref.event_bus.emit(IndexEvent::Failed {
                         repo: repo.clone(),
                         error: e.to_string(),
@@ -1155,6 +1240,9 @@ async fn run_consumer(
                     s.total_files = stats.total_files;
                     s.last_indexed_at = Some(Utc::now());
                     s.error = None;
+                    s.phase = IndexPhase::Idle;
+                    s.phase_done = 0;
+                    s.phase_total = 0;
                 } // <-- statuses write guard dropped here: "done" is now observable.
                 // Persist durable timestamp so the MCP tool can check freshness
                 // without relying on in-memory state. Runs OFF the statuses lock.
@@ -1218,6 +1306,9 @@ async fn run_consumer(
                     let s = statuses.entry(repo.clone()).or_default();
                     s.state = IndexState::Idle;
                     s.error = None;
+                    s.phase = IndexPhase::Idle;
+                    s.phase_done = 0;
+                    s.phase_total = 0;
                     engine_ref.event_bus.emit(IndexEvent::Cancelled {
                         repo: repo.clone(),
                     });
@@ -1230,6 +1321,9 @@ async fn run_consumer(
                     let s = statuses.entry(repo.clone()).or_default();
                     s.state = IndexState::Error;
                     s.error = Some(err_str.clone());
+                    s.phase = IndexPhase::Idle;
+                    s.phase_done = 0;
+                    s.phase_total = 0;
                     engine_ref.event_bus.emit(IndexEvent::Failed {
                         repo: repo.clone(),
                         error: err_str,

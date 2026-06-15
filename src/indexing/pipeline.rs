@@ -671,7 +671,7 @@ impl IndexPipeline {
                 } else {
                     // Normal Phase 2 replay: raw_edges are in DB (overflow path or incremental).
                     info!(repo = %self.repo, raw_edge_total, "edges_resolved marker absent — replaying Phase 2 from DB");
-                    self.resolve_edges_phase2(db, cancel_token.as_ref()).await
+                    self.resolve_edges_phase2(db, progress.as_ref(), cancel_token.as_ref()).await
                         .context("edges Phase 2 replay on no-change run")?;
                     // (replay path discards Phase2Stats — no aggregate stats returned here)
                 }
@@ -801,6 +801,7 @@ impl IndexPipeline {
             .context("full_rebuild: streaming_index")?;
 
         // Phase 2: resolve raw edges into denormalized calls rows.
+        // (The ResolveEdges UI phase is set inside the resolve fns themselves.)
         if let Some(bus) = event_bus {
             bus.emit(IndexEvent::Phase2Start { repo: self.repo.clone() });
         }
@@ -809,12 +810,12 @@ impl IndexPipeline {
             // Fast path: all raw_edges are in RAM — skip DB scan entirely. Pass the
             // in-RAM symbol buffer so Phase 2 reuses it instead of reloading every
             // symbol from the DB (None when the buffer overflowed → DB reload).
-            self.resolve_edges_from_ram(db, ram_raw_edges, ram_symbols, cancel_token)
+            self.resolve_edges_from_ram(db, ram_raw_edges, ram_symbols, progress, cancel_token)
                 .await
                 .context("full_rebuild: resolve_edges_from_ram")?
         } else {
             // DB path: overflow or incremental — use keyset scan as before.
-            self.resolve_edges_phase2(db, cancel_token)
+            self.resolve_edges_phase2(db, progress, cancel_token)
                 .await
                 .context("full_rebuild: resolve_edges_phase2")?
         };
@@ -956,6 +957,11 @@ impl IndexPipeline {
 
         // Phase 2: resolve only edges in the gated blast radius —
         // O(changed + callers_of_removed_surface + callers_of_added_names).
+        // Incremental edge sets are small (blast radius only), so we report this
+        // phase indeterminately rather than threading a per-edge numerator.
+        if let Some(ph) = progress {
+            ph.set_phase(crate::indexing::IndexPhase::ResolveEdges).await;
+        }
         if let Some(bus) = event_bus {
             bus.emit(IndexEvent::Phase2Start { repo: self.repo.clone() });
         }
@@ -1702,6 +1708,14 @@ impl IndexPipeline {
         // calls-index drop/rebuild (different table, different indexes) — the two must
         // not be conflated. Gated on `is_full_rebuild` to pair with the drop above (D5).
         if is_full_rebuild {
+            // Surface the post-100% "Symbol Index" stage to the UI. Indeterminate:
+            // build_index_concurrently is a single blocking op with no sub-progress.
+            if let Some(ph) = progress {
+                ph.set_phase(crate::indexing::IndexPhase::SymbolIndex).await;
+            }
+            if let Some(bus) = event_bus {
+                bus.emit(IndexEvent::SymbolIndexStart { repo: self.repo.clone() });
+            }
             let t_sym_idx_rebuild = Instant::now();
             // Build CONCURRENTLY + poll to ready (see store::build_index_concurrently).
             // A plain foreground `DEFINE INDEX` backfills all symbol rows in ONE
@@ -1716,6 +1730,12 @@ impl IndexPipeline {
                 .await.context("streaming_index: build idx_symbol_name")?;
             sym_idx_rebuild_ms = t_sym_idx_rebuild.elapsed().as_millis() as u64;
             info!(repo = %self.repo, sym_idx_rebuild_ms, "stage3: rebuilt symbol indexes concurrently (full rebuild)");
+            if let Some(bus) = event_bus {
+                bus.emit(IndexEvent::SymbolIndexDone {
+                    repo: self.repo.clone(),
+                    elapsed_ms: sym_idx_rebuild_ms,
+                });
+            }
         }
 
         if !pending_chunk_batch.is_empty() {
@@ -1991,7 +2011,7 @@ impl IndexPipeline {
     /// the index seek and achieves O(N) total.
     ///
     /// Writes the `edges_resolved` marker in `index_meta` only after all pages commit.
-    async fn resolve_edges_phase2(&self, db: &Surreal<Db>, cancel_token: Option<&CancellationToken>) -> Result<Phase2Stats> {
+    async fn resolve_edges_phase2(&self, db: &Surreal<Db>, progress: Option<&ProgressHandle>, cancel_token: Option<&CancellationToken>) -> Result<Phase2Stats> {
         use serde::Deserialize;
         let mut p2 = Phase2Stats::default();
 
@@ -2007,6 +2027,10 @@ impl IndexPipeline {
             .take(0)?;
         let total = count_rows.first().map(|r| r.count).unwrap_or(0);
         info!(repo = %self.repo, total_raw_edges = total, "phase2: starting edge resolution");
+        if let Some(ph) = progress {
+            ph.set_phase(crate::indexing::IndexPhase::ResolveEdges).await;
+            ph.set_phase_total(total.max(0) as u64).await;
+        }
 
         if total == 0 {
             set_meta(db, EDGES_RESOLVED_KEY, "1")
@@ -2083,6 +2107,10 @@ impl IndexPipeline {
         let mut edge_batch: Vec<(String, String, i64, String, String, String, String)> = Vec::new();
         let mut pages_processed: u64 = 0;
         let mut scan_ms_total: u64 = 0;
+        // Throttled progress: count raw_edge rows scanned (numerator over `total`).
+        // Reported to the UI every PROGRESS_REPORT_PAGES pages to bound RwLock churn.
+        let mut raw_edges_scanned: u64 = 0;
+        const PROGRESS_REPORT_PAGES: u64 = 8;
         let mut resolve_ms_total: u64 = 0;
 
         loop {
@@ -2148,6 +2176,13 @@ impl IndexPipeline {
             }
 
             pages_processed += 1;
+            raw_edges_scanned += batch.len() as u64;
+            // Throttled UI progress: numerator = raw_edge rows scanned so far.
+            if let Some(ph) = progress
+                && pages_processed.is_multiple_of(PROGRESS_REPORT_PAGES)
+            {
+                ph.set_phase_done(raw_edges_scanned).await;
+            }
 
             // Resolve this batch in-memory against the pre-loaded symbol map.
             let t_resolve = Instant::now();
@@ -2264,11 +2299,16 @@ impl IndexPipeline {
         db: &Surreal<Db>,
         raw_edges: Vec<RawEdgeRecord>,
         ram_symbols: Option<HashMap<String, SymbolWithPos>>,
+        progress: Option<&ProgressHandle>,
         cancel_token: Option<&CancellationToken>,
     ) -> Result<Phase2Stats> {
         let mut p2 = Phase2Stats::default();
         let total = raw_edges.len();
         info!(repo = %self.repo, total_raw_edges = total, "phase2(ram): starting in-RAM edge resolution");
+        if let Some(ph) = progress {
+            ph.set_phase(crate::indexing::IndexPhase::ResolveEdges).await;
+            ph.set_phase_total(total as u64).await;
+        }
 
         if total == 0 {
             set_meta(db, EDGES_RESOLVED_KEY, "1")
@@ -2345,6 +2385,13 @@ impl IndexPipeline {
             {
                 info!(repo = %self.repo, "phase2(ram): cancelled mid-resolution");
                 return Err(PipelineAbort::Cancelled.into());
+            }
+            // Throttled UI progress: numerator = raw edges processed so far. Same
+            // batch cadence as the cancellation check, so no extra modulo cost.
+            if i % EDGE_RELATE_BATCH_SIZE == 0
+                && let Some(ph) = progress
+            {
+                ph.set_phase_done(i as u64).await;
             }
             // Resolve this edge using the symbol map.
             let candidates = match name_bucket.get(&re.to_name) {
@@ -4731,7 +4778,7 @@ mod incremental_phase2_tests {
         insert_raw_edge(&db, "/b.rs", "b_fn", "c_fn").await;
 
         // Run a full Phase 2 to establish baseline calls rows.
-        pipeline.resolve_edges_phase2(&db, None).await.expect("initial full phase2");
+        pipeline.resolve_edges_phase2(&db, None, None).await.expect("initial full phase2");
 
         let initial_calls = all_calls(&db).await;
         println!("Initial calls: {:?}", initial_calls);
@@ -4837,7 +4884,7 @@ mod incremental_phase2_tests {
         insert_raw_edge(&db, "/x_caller.rs", "x_fn", "foo").await;
 
         // Full Phase 2: X→foo resolves to Z (the only candidate).
-        pipeline.resolve_edges_phase2(&db, None).await.expect("initial full phase2");
+        pipeline.resolve_edges_phase2(&db, None, None).await.expect("initial full phase2");
 
         let initial_calls = all_calls(&db).await;
         println!("Initial calls: {:?}", initial_calls);
@@ -4919,7 +4966,7 @@ mod incremental_phase2_tests {
         insert_raw_edge(&db, "/x.rs", "x_fn", "bar").await;
 
         // Full Phase 2: X→bar→W (W is lex-first).
-        pipeline.resolve_edges_phase2(&db, None).await.expect("initial full phase2");
+        pipeline.resolve_edges_phase2(&db, None, None).await.expect("initial full phase2");
 
         let initial_calls = all_calls(&db).await;
         println!("Initial calls: {:?}", initial_calls);
@@ -5017,7 +5064,7 @@ mod incremental_phase2_tests {
         insert_raw_edge(&db, "/x.rs", "x_fn", "foo").await;
 
         // Full Phase 2: X→foo→W.
-        pipeline.resolve_edges_phase2(&db, None).await.expect("initial full phase2");
+        pipeline.resolve_edges_phase2(&db, None, None).await.expect("initial full phase2");
 
         let initial_calls = all_calls(&db).await;
         assert_eq!(initial_calls.len(), 1, "initial: 1 calls edge");
@@ -5223,7 +5270,7 @@ mod incremental_correctness_oracle {
         let db = open_db(home.path(), repo, 0).await.unwrap();
         let pipeline = IndexPipeline::new(repo.to_string(), None);
         write_state(&db, state).await;
-        pipeline.resolve_edges_phase2(&db, None).await.expect("full phase2");
+        pipeline.resolve_edges_phase2(&db, None, None).await.expect("full phase2");
         calls_set(&db).await
     }
 
@@ -5244,7 +5291,7 @@ mod incremental_correctness_oracle {
 
         // Initial state + full resolve (this populates raw_edge for ALL files).
         write_state(&db, initial).await;
-        pipeline.resolve_edges_phase2(&db, None).await.expect("initial full phase2");
+        pipeline.resolve_edges_phase2(&db, None, None).await.expect("initial full phase2");
 
         let to_process: Vec<String> = changed.iter().map(|s| s.to_string()).collect();
         let to_delete: Vec<String> = deleted.iter().map(|s| s.to_string()).collect();
@@ -6021,7 +6068,7 @@ mod ram_path_fqn_tests {
 
         let pipeline = IndexPipeline::new(repo.to_string(), None);
         pipeline
-            .resolve_edges_from_ram(&db, raw_edges, None, None)
+            .resolve_edges_from_ram(&db, raw_edges, None, None, None)
             .await
             .expect("resolve_edges_from_ram");
 
@@ -6079,7 +6126,7 @@ mod ram_path_fqn_tests {
 
         let pipeline = IndexPipeline::new(repo.to_string(), None);
         let err = pipeline
-            .resolve_edges_from_ram(&db, raw_edges, None, Some(&token))
+            .resolve_edges_from_ram(&db, raw_edges, None, None, Some(&token))
             .await
             .expect_err("pre-cancelled token must abort Phase 2");
         assert!(
@@ -6125,7 +6172,7 @@ mod ram_path_fqn_tests {
 
         let pipeline = IndexPipeline::new(repo.to_string(), None);
         let err = pipeline
-            .resolve_edges_phase2(&db, Some(&token))
+            .resolve_edges_phase2(&db, None, Some(&token))
             .await
             .expect_err("pre-cancelled token must abort DB-scan Phase 2");
         assert!(
@@ -6207,6 +6254,81 @@ mod ram_symbol_buffer_invariance_tests {
         buf
     }
 
+    /// Phase-2 progress reporting: the RAM resolve path must set the
+    /// ResolveEdges denominator (= total raw edges) and, on completion, leave a
+    /// monotonic numerator. This is what drives the post-100% "Resolving call
+    /// graph N%" bar in the UI; a regression here silently freezes the bar.
+    #[tokio::test]
+    async fn ram_phase2_reports_edge_progress() {
+        use crate::indexing::{IndexPhase, ProgressHandle, RepoStatus};
+        use std::collections::HashMap as StdHashMap;
+        use tokio::sync::RwLock;
+
+        let lib_compute = mk_symbol("/lib.cpp", "compute", 1, 5);
+        let caller = mk_symbol("/a.cpp", "caller", 1, 5);
+        let symbols = vec![lib_compute, caller];
+
+        let raw_edges = vec![RawEdgeRecord {
+            from_file: "/a.cpp".to_string(),
+            from_name: "caller".to_string(),
+            from_fqn: "/a.cpp::caller".to_string(),
+            to_name: "compute".to_string(),
+            kind: "calls".to_string(),
+            line: 3,
+            import_path: None,
+        }];
+
+        let home = TempDir::new().unwrap();
+        let repo = "/test/p2_progress";
+        let db = open_db(home.path(), repo, 0).await.unwrap();
+        flush_symbol_batch_native(&db, &symbols).await.unwrap();
+
+        let statuses: Arc<RwLock<StdHashMap<String, RepoStatus>>> = Arc::new(RwLock::new(StdHashMap::new()));
+        let progress = ProgressHandle::new_for_test(statuses.clone(), repo.to_string());
+
+        let pipeline = IndexPipeline::new(repo.to_string(), None);
+        pipeline
+            .resolve_edges_from_ram(&db, raw_edges.clone(), None, Some(&progress), None)
+            .await
+            .expect("resolve with progress");
+
+        let map = statuses.read().await;
+        let s = map.get(repo).expect("status recorded");
+        assert_eq!(s.phase, IndexPhase::ResolveEdges, "phase must be ResolveEdges");
+        assert_eq!(s.phase_total, raw_edges.len() as u64, "denominator = total raw edges");
+        assert!(s.phase_done <= s.phase_total, "numerator never exceeds denominator");
+    }
+
+    /// Zero-edge repo (empty / no call edges): Phase 2 must still mark the phase
+    /// but leave `phase_total == 0` so the UI shows an indeterminate pulse rather
+    /// than dividing `phase_done / 0` (NaN). Guards the `total == 0` early return.
+    #[tokio::test]
+    async fn ram_phase2_zero_edges_no_div_by_zero() {
+        use crate::indexing::{IndexPhase, ProgressHandle, RepoStatus};
+        use std::collections::HashMap as StdHashMap;
+        use tokio::sync::RwLock;
+
+        let home = TempDir::new().unwrap();
+        let repo = "/test/p2_zero";
+        let db = open_db(home.path(), repo, 0).await.unwrap();
+
+        let statuses: Arc<RwLock<StdHashMap<String, RepoStatus>>> = Arc::new(RwLock::new(StdHashMap::new()));
+        let progress = ProgressHandle::new_for_test(statuses.clone(), repo.to_string());
+
+        let pipeline = IndexPipeline::new(repo.to_string(), None);
+        // No symbols, no raw edges → total == 0 → early return.
+        pipeline
+            .resolve_edges_from_ram(&db, vec![], None, Some(&progress), None)
+            .await
+            .expect("resolve empty edge set");
+
+        let map = statuses.read().await;
+        let s = map.get(repo).expect("status recorded");
+        assert_eq!(s.phase, IndexPhase::ResolveEdges, "phase set even with zero edges");
+        assert_eq!(s.phase_total, 0, "denominator stays 0 → UI shows indeterminate pulse");
+        assert_eq!(s.phase_done, 0, "numerator never advanced");
+    }
+
     /// Build the name→sorted-candidates bucket map the SAME way
     /// `resolve_edges_from_ram` does, so two symbol *sources* can be compared at
     /// the resolution-input layer (not just the `calls` output layer).
@@ -6286,7 +6408,7 @@ mod ram_symbol_buffer_invariance_tests {
         flush_symbol_batch_native(&db1, &symbols).await.unwrap();
         let pipeline = IndexPipeline::new(repo.to_string(), None);
         pipeline
-            .resolve_edges_from_ram(&db1, raw_edges.clone(), None, None)
+            .resolve_edges_from_ram(&db1, raw_edges.clone(), None, None, None)
             .await
             .expect("resolve via DB reload");
         let calls_db = dump_calls(&db1).await;
@@ -6299,7 +6421,7 @@ mod ram_symbol_buffer_invariance_tests {
         // table to prove no reload happens.
         let buffer = build_buffer(&symbols);
         pipeline
-            .resolve_edges_from_ram(&db2, raw_edges.clone(), Some(buffer), None)
+            .resolve_edges_from_ram(&db2, raw_edges.clone(), Some(buffer), None, None)
             .await
             .expect("resolve via in-RAM buffer");
         let calls_buf = dump_calls(&db2).await;
@@ -6350,7 +6472,7 @@ mod ram_symbol_buffer_invariance_tests {
         let db_buf = open_db(home_buf.path(), "/test/overflow", 0).await.unwrap();
         let buffer = build_buffer(&symbols);
         pipeline
-            .resolve_edges_from_ram(&db_buf, raw_edges.clone(), Some(buffer), None)
+            .resolve_edges_from_ram(&db_buf, raw_edges.clone(), Some(buffer), None, None)
             .await
             .unwrap();
         let calls_buf = dump_calls(&db_buf).await;
@@ -6360,7 +6482,7 @@ mod ram_symbol_buffer_invariance_tests {
         let db_of = open_db(home_of.path(), "/test/overflow", 0).await.unwrap();
         flush_symbol_batch_native(&db_of, &symbols).await.unwrap();
         pipeline
-            .resolve_edges_from_ram(&db_of, raw_edges.clone(), None, None)
+            .resolve_edges_from_ram(&db_of, raw_edges.clone(), None, None, None)
             .await
             .unwrap();
         let calls_of = dump_calls(&db_of).await;

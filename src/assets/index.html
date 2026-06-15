@@ -1283,6 +1283,8 @@ const STR = {
   'repos.indexAll':    { en: `Index All`, vi: `Index tất cả`, zh: `索引全部` },
   'repos.cancelAll':   { en: `Cancel All`, vi: `Hủy tất cả`, zh: `全部取消` },
   'repos.indexing':    { en: `Indexing…`, vi: `Đang index…`, zh: `正在索引…` },
+  'phase.symbolIndex': { en: `Building symbol index…`, vi: `Đang build symbol index…`, zh: `正在构建符号索引…` },
+  'phase.resolveEdges': { en: `Resolving call graph…`, vi: `Đang resolve call graph…`, zh: `正在解析调用图…` },
   'repos.filter':      { en: `Filter repositories…`, vi: `Lọc repo…`, zh: `筛选仓库…` },
   'repos.empty':       { en: `No repositories configured. Add an absolute path above.`, vi: `Chưa có repo nào. Thêm một đường dẫn tuyệt đối ở trên.`, zh: `尚未配置任何仓库。请在上方添加绝对路径。` },
   'repos.noMatch':     { en: `No repositories match the filter.`, vi: `Không có repo nào khớp bộ lọc.`, zh: `没有符合筛选条件的仓库。` },
@@ -1675,7 +1677,28 @@ function updateRepoIndexUI() {
       return;
     }
     if (s.state === 'indexing') {
-      if (s.total_files > 0) {
+      const phase = s.phase || 'embedding';
+      if (phase === 'symbol_index' || (phase === 'resolve_edges' && !(s.phase_total > 0))) {
+        // Post-100% stage with no sub-progress: pulsing bar + phase label.
+        const label = phase === 'symbol_index' ? t('phase.symbolIndex') : t('phase.resolveEdges');
+        statusEl.innerHTML =
+          '<span class="inline-flex items-center gap-1.5">' +
+            '<span class="inline-block w-20 h-1.5 bg-gray-200 dark:bg-wiki-border rounded overflow-hidden align-middle">' +
+              '<span class="block h-full w-full bg-blue-600 dark:bg-wiki-border-active rounded animate-pulse"></span>' +
+            '</span>' +
+            '<span class="text-xs text-gray-400 dark:text-wiki-text-muted">' + escHtml(label) + '</span>' +
+          '</span>';
+      } else if (phase === 'resolve_edges' && s.phase_total > 0) {
+        // Post-100% stage: Phase 2 edge resolution with a real percentage.
+        const pct = Math.min(100, Math.round((s.phase_done / s.phase_total) * 100));
+        statusEl.innerHTML =
+          '<span class="inline-flex items-center gap-1.5">' +
+            '<span class="inline-block w-20 h-1.5 bg-gray-200 dark:bg-wiki-border rounded overflow-hidden align-middle">' +
+              '<span class="block h-full bg-blue-600 dark:bg-wiki-border-active rounded transition-[width] duration-200" style="width:' + pct + '%"></span>' +
+            '</span>' +
+            '<span class="text-xs text-gray-400 dark:text-wiki-text-muted">' + escHtml(t('phase.resolveEdges')) + ' ' + pct + '%</span>' +
+          '</span>';
+      } else if (s.total_files > 0) {
         const pct = Math.min(100, Math.round((s.indexed_files / s.total_files) * 100));
         statusEl.innerHTML =
           '<span class="inline-flex items-center gap-1.5">' +
@@ -4324,9 +4347,18 @@ function watchIndexingThenReload() {
     await pollIndexStatus();
     const s = indexStatuses[currentSearchRepo];
     if (s && s.state === 'indexing') {
-      setExplorerActionStatus(s.total_files > 0
-        ? t('explorer.indexingN', { indexed: s.indexed_files, total: s.total_files })
-        : t('stat.statusIndexing'));
+      const phase = s.phase || 'embedding';
+      if (phase === 'symbol_index') {
+        setExplorerActionStatus(t('phase.symbolIndex'));
+      } else if (phase === 'resolve_edges') {
+        setExplorerActionStatus(s.phase_total > 0
+          ? t('phase.resolveEdges') + ' ' + Math.min(100, Math.round((s.phase_done / s.phase_total) * 100)) + '%'
+          : t('phase.resolveEdges'));
+      } else {
+        setExplorerActionStatus(s.total_files > 0
+          ? t('explorer.indexingN', { indexed: s.indexed_files, total: s.total_files })
+          : t('stat.statusIndexing'));
+      }
       explorerWatchTimer = setTimeout(tick, 1200);
     } else {
       setExplorerActionStatus(s && s.state === 'error' ? t('explorer.indexFailed') : t('explorer.indexUpdated'), s && s.state === 'error');
@@ -4570,6 +4602,14 @@ function handleIndexEvent(event) {
 
     case 'phase2_done':
       line = `<span class="text-blue-400">[${ts}]</span> <span class="text-green-400">Phase 2 done</span> — ${event.elapsed_ms}ms`;
+      break;
+
+    case 'symbol_index_start':
+      line = `<span class="text-blue-400">[${ts}]</span> <span class="text-yellow-400">Symbol Index</span> rebuilding symbol indexes…`;
+      break;
+
+    case 'symbol_index_done':
+      line = `<span class="text-blue-400">[${ts}]</span> <span class="text-green-400">Symbol Index done</span> — ${event.elapsed_ms}ms`;
       break;
 
     case 'completed':
