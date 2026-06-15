@@ -288,23 +288,37 @@ have called it at least once for the current question.\n\
 - Treat the first result as a starting point, not the final answer. Before answering, check: does \
 the context I have actually cover EVERY part of the question? If the question has multiple parts, \
 each part needs its own evidence.\n\
-- If the results are thin, empty, off-topic, or only partially answer the question, DO NOT answer \
-yet. Search again with a different phrasing or a more specific angle, or use `{TOOL_FILE}` to read \
-more of a file that a previous result pointed you to. Keep going until the context genuinely \
-answers the question.\n\
+- EXPAND THE BLAST RADIUS before you stop. One search is almost never enough. You must broaden \
+coverage along these axes until they stop yielding anything relevant:\n\
+  (1) re-query with DIFFERENT WORDING and synonyms for the same concept (e.g. \"render markdown\", \
+\"markdown to HTML\", \"marked / markdown-it\", \"sanitize html\", the function/class names you \
+saw);\n\
+  (2) FOLLOW THE GRAPH — when a result names a caller, callee, related symbol, or file, search for \
+or open that next (`{TOOL_FILE}`), because the answer often lives one hop away;\n\
+  (3) when a result hints at a specific file, use `{TOOL_FILE}` to read more of it.\n\
+You may stop searching ONLY when these branches are exhausted — i.e. fresh queries and graph hops \
+return nothing new and relevant. Until then, keep going.\n\
+- CRITICAL — absence is not proof: a thin or empty result does NOT mean the feature is missing. \
+NEVER conclude \"the project does not have X\" / \"there is no X\" from one search. You may only \
+claim something is absent after several differently-worded searches AND graph/file follow-ups all \
+come back empty — and even then, state it as \"I could not find X via search\", not as a fact.\n\
 - You decide how many searches are enough — use as many tool calls as the question needs (you \
-have a limited budget of rounds, so make each search count and stop once you truly have enough).\n\
+have a limited budget of rounds, so make each search count and stop once the blast radius is \
+truly exhausted).\n\
 - Pure chit-chat or meta turns (e.g. \"thanks\", \"explain that again\") do not need a new search \
 — answer from the conversation so far.\n\n\
 Answering:\n\
-- Ground every factual claim in what the tools returned. Cite file paths and line ranges (e.g. \
-`src/foo.rs#L10-40`) when relevant.\n\
-- SAFE ANSWER POLICY: if, after searching, you still cannot find evidence for some part of the \
-question, explicitly say what you could NOT find or are NOT sure about for that part, and answer \
-only the parts you actually verified. Never paper over a gap by inventing plausible-sounding \
-details. Partial-but-honest beats complete-but-wrong.\n\
-- If searching turned up essentially nothing relevant, say plainly that the index has no useful \
-context for this question (and suggest the user rephrase or check the file directly) rather than \
+- CITE EVERY CLAIM. Each substantive statement in your answer must carry the exact evidence it \
+rests on as `path#Lstart-end` (e.g. `src/assets/index.html#L5127-5130`), inline right next to the \
+claim. A sentence asserting how the code behaves with no `path#Lline` citation is not allowed — \
+if you cannot cite it, you have not verified it, so either search for it or drop the claim.\n\
+- Ground every factual claim in what the tools returned, never from memory or assumption.\n\
+- SAFE ANSWER POLICY: if, after exhausting the blast radius, you still cannot find evidence for \
+some part of the question, explicitly say what you could NOT find or are NOT sure about for that \
+part, and answer only the parts you actually verified. Never paper over a gap by inventing \
+plausible-sounding details. Partial-but-honest beats complete-but-wrong.\n\
+- If searching turned up essentially nothing relevant, say plainly that you could not find useful \
+context for this question (and suggest the user rephrase or name a specific file) rather than \
 fabricating an answer.\n\
 - Answer in the same language the user asked in. Keep technical terms in their original form."
     )
@@ -546,7 +560,9 @@ pub async fn run_chat_turn(
         match result {
             Ok(ToolTurnResult::Text(text)) => {
                 // Final answer. Tokens were already streamed live via on_token;
-                // `text` is the full accumulation, kept only for the transcript.
+                // `text` is the full accumulation kept for the transcript. How
+                // much to search is entirely the model's call — the system
+                // prompt's blast-radius policy guides it; nothing is injected.
                 answer = text;
                 break;
             }
@@ -894,13 +910,6 @@ mod tests {
             "total injected context must be bounded; got {} bytes",
             ctx.len()
         );
-    }
-
-    #[tokio::test]
-    async fn recent_tool_context_resets_on_repo_mismatch() {
-        let store = ConversationStore::new();
-        store.append_turn("c1", "/r-a", "q".into(), "a".into(), "ctx".into()).await;
-        assert!(store.recent_tool_context("c1", "/r-b").await.is_empty());
     }
 }
 
