@@ -8,6 +8,7 @@ pub mod engine_ops;
 pub mod indexing;
 pub mod llm;
 pub mod mcp;
+pub mod mcp_session_store;
 pub mod parsing;
 pub mod query;
 pub mod server;

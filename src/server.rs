@@ -26,7 +26,38 @@ use rmcp::transport::streamable_http_server::{
     session::local::LocalSessionManager,
 };
 
+use crate::mcp_session_store::{BoundedSessionStore, SharedSessionStore};
+
 type RepoMcpService = StreamableHttpService<RepoMcpHandler, LocalSessionManager>;
+
+/// Build the streamable-HTTP config with our bounded session store attached.
+///
+/// ## The bug this fixes
+///
+/// rmcp's `LocalSessionManager` keeps live sessions in memory with a
+/// `keep_alive` idle timeout (default 5 min). After that idle window the
+/// session worker exits and `close_session` drops the entry. *Without a store*,
+/// the next request bearing the now-stale `mcp-session-id` finds no session and
+/// the client gets `404 "Session not found"`. Clients (Claude Code) hold a
+/// session id across long idle gaps, so for an always-on server that runs for
+/// weeks this surfaces intermittently — and MCP must never break that way.
+///
+/// ## Why a store, not a longer timeout
+///
+/// Bumping `keep_alive` only widens the window; a long-enough idle gap (or the
+/// process being restarted as a service) still 404s, and pinning workers alive
+/// for hours keeps O(clients) live channels/tasks resident. The correct fix is
+/// rmcp's restore path: with a store configured, an idle timeout drops only the
+/// *live worker* (keeping resident workers bounded under the short default
+/// timeout), the store entry survives, and the next stale request transparently
+/// restores the session via `try_restore_from_store` — no client-visible error.
+/// The store is LRU-bounded ([`BoundedSessionStore`]) so memory stays bounded
+/// no matter how many clients connect over the server's lifetime, and session
+/// ids are globally unique so every client/connection is independent.
+fn mcp_config_with_store(mut base: StreamableHttpServerConfig, store: SharedSessionStore) -> StreamableHttpServerConfig {
+    base.session_store = Some(store);
+    base
+}
 
 use crate::config::{
     ConfigError, CURRENT_VERSION, Settings, ensure_dir_and_load, write_settings_atomic,
@@ -98,6 +129,11 @@ pub struct AppState {
     pub settings: Arc<RwLock<crate::config::Settings>>,
     /// Per-repo MCP services, lazily created on first access.
     pub repo_mcp_services: Arc<RwLock<HashMap<String, RepoMcpService>>>,
+    /// Shared bounded session store backing every MCP service (the global
+    /// `/mcp` endpoint and each lazily-created per-repo service). Session ids
+    /// are globally unique, so one store safely serves all clients; it enables
+    /// transparent session restore after idle timeout (see `mcp_config_with_store`).
+    pub mcp_session_store: SharedSessionStore,
     /// In-memory, LRU-bounded chat conversation store (repo detail chat).
     pub conversations: Arc<crate::chat::ConversationStore>,
 }
@@ -121,6 +157,7 @@ pub fn build_router(
         repo_dbs: repo_dbs.clone(),
         settings: settings.clone(),
         repo_mcp_services: Arc::new(RwLock::new(HashMap::new())),
+        mcp_session_store: Arc::new(BoundedSessionStore::new()),
         conversations: Arc::new(crate::chat::ConversationStore::new()),
     };
 
@@ -135,7 +172,7 @@ pub fn build_router(
     let mcp_config = {
         // DNS-rebinding protection: if bind is non-loopback, add it to allowed_hosts.
         let is_loopback = matches!(bind_host, "127.0.0.1" | "localhost" | "::1");
-        if is_loopback {
+        let base = if is_loopback {
             StreamableHttpServerConfig::default()
         } else {
             StreamableHttpServerConfig::default().with_allowed_hosts(vec![
@@ -144,7 +181,10 @@ pub fn build_router(
                 "127.0.0.1".to_string(),
                 "::1".to_string(),
             ])
-        }
+        };
+        // Attach the shared session store so idle-dropped sessions self-heal
+        // via rmcp's restore path instead of 404-ing "Session not found".
+        mcp_config_with_store(base, state.mcp_session_store.clone())
     };
 
     let session_manager = Arc::new(LocalSessionManager::default());
@@ -1125,7 +1165,10 @@ async fn handle_repo_mcp(
                     ))
                 },
                 Arc::new(LocalSessionManager::default()),
-                StreamableHttpServerConfig::default(),
+                mcp_config_with_store(
+                    StreamableHttpServerConfig::default(),
+                    state.mcp_session_store.clone(),
+                ),
             );
             state.repo_mcp_services.write().await.insert(repo.clone(), new_service.clone());
             new_service
