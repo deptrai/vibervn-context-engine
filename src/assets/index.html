@@ -5185,29 +5185,31 @@ function appendUserMessage(text) {
   chatScrollToBottom();
 }
 
-// Build an assistant turn container holding (optional) tool steps + answer.
+// Build an assistant turn container. A single `flow` holds text bubbles and
+// tool-call boxes appended IN STREAM ORDER (the model interleaves preamble text
+// and tool calls within one turn) — never fixed steps→answer slots, which would
+// strand any pre-tool-call preamble below the boxes. The status spinner always
+// rides at the flow tail and is removed once a terminal event arrives.
 function appendAssistantTurn() {
   const msgs = document.getElementById('chat-messages');
   const row = document.createElement('div');
   row.className = 'flex flex-col items-start gap-2';
 
-  const steps = document.createElement('div');
-  steps.className = 'chat-steps flex flex-col gap-1 w-full';
+  const flow = document.createElement('div');
+  flow.className = 'chat-flow flex flex-col gap-2 w-full';
 
   const status = document.createElement('div');
   status.className = 'chat-status flex items-center gap-2 text-xs text-gray-400 dark:text-wiki-text-muted';
   status.innerHTML = '<span class="inline-block w-3 h-3 rounded-full border-2 border-gray-300 dark:border-wiki-border border-t-blue-500 animate-spin"></span><span>' + escHtml(t('chat.thinking')) + '</span><span class="chat-elapsed font-mono tabular-nums text-gray-400 dark:text-wiki-text-muted">0.0s</span>';
 
-  const answer = document.createElement('div');
-  answer.className = 'chat-answer chat-md max-w-[85%] min-w-0 overflow-hidden rounded-lg px-3 py-2 text-sm break-words bg-gray-100 text-gray-900 dark:bg-wiki-surface dark:text-wiki-text hidden';
-
-  row.appendChild(steps);
-  row.appendChild(status);
-  row.appendChild(answer);
+  flow.appendChild(status);
+  row.appendChild(flow);
   msgs.appendChild(row);
   chatScrollToBottom();
 
-  const turn = { row, steps, status, answer };
+  // `seg` = the currently-open text bubble (null until a token arrives or after
+  // a tool box closes it); `seg.raw` accumulates that bubble's own markdown.
+  const turn = { row, flow, status, seg: null };
   // Tick a live elapsed-seconds readout beside "Thinking…" until the status row goes away.
   const startedAt = performance.now();
   const elapsedEl = status.querySelector('.chat-elapsed');
@@ -5228,6 +5230,25 @@ function toolLabel(name) {
   return name;
 }
 
+// Keep the status spinner (if still present) as the last child of the flow, so
+// it trails whatever segment/box was just appended.
+function statusToTail(turn) {
+  if (turn.status && turn.flow.contains(turn.status)) turn.flow.appendChild(turn.status);
+}
+
+// Open a fresh text bubble at the flow tail and make it the current segment.
+// Each bubble renders its OWN markdown (turn.seg.raw), so preamble and final
+// answer are independent blocks rather than one concatenated bubble.
+function appendTextSegment(turn) {
+  const seg = document.createElement('div');
+  seg.className = 'chat-answer chat-md max-w-[85%] min-w-0 overflow-hidden rounded-lg px-3 py-2 text-sm break-words bg-gray-100 text-gray-900 dark:bg-wiki-surface dark:text-wiki-text';
+  seg.raw = '';
+  turn.flow.appendChild(seg);
+  turn.seg = seg;
+  statusToTail(turn);
+  return seg;
+}
+
 function addToolStep(turn, name, summary) {
   const step = document.createElement('div');
   step.className = 'chat-step border border-gray-200 dark:border-wiki-border rounded bg-white dark:bg-wiki-bg px-2.5 py-1.5 text-xs';
@@ -5244,7 +5265,11 @@ function addToolStep(turn, name, summary) {
     sub.textContent = summary;
     step.appendChild(sub);
   }
-  turn.steps.appendChild(step);
+  turn.flow.appendChild(step);
+  // Close the current text segment: the next token starts a NEW bubble after
+  // this box, so post-tool answer text renders below the box, preamble above.
+  turn.seg = null;
+  statusToTail(turn);
   chatScrollToBottom();
   return step;
 }
@@ -5270,10 +5295,12 @@ function markToolDone(step, ok) {
 
 function setTurnError(turn, message) {
   stopChatTimer(turn);
-  if (turn.status) turn.status.remove();
-  turn.answer.classList.remove('hidden');
-  turn.answer.className = 'chat-answer max-w-[85%] rounded-lg px-3 py-2 text-sm whitespace-pre-wrap break-words bg-red-50 text-red-700 border border-red-200 dark:bg-red-900/20 dark:text-red-300 dark:border-red-800';
-  turn.answer.textContent = message;
+  if (turn.status) { turn.status.remove(); turn.status = null; }
+  turn.seg = null;
+  const err = document.createElement('div');
+  err.className = 'chat-answer max-w-[85%] rounded-lg px-3 py-2 text-sm whitespace-pre-wrap break-words bg-red-50 text-red-700 border border-red-200 dark:bg-red-900/20 dark:text-red-300 dark:border-red-800';
+  err.textContent = message;
+  turn.flow.appendChild(err);
   chatScrollToBottom();
 }
 
@@ -5339,10 +5366,10 @@ async function sendChat() {
       }
     }
     // Stream ended without an explicit done/error (e.g. server closed early).
-    if (!turn.answer.textContent && !turn.row.querySelector('.chat-answer:not(.hidden)')) {
+    if (!turn.seg || !turn.seg.raw) {
       // If we never got a terminal event, clean up the spinner gracefully.
       if (turn.status && document.body.contains(turn.status)) {
-        if (gotToken) { stopChatTimer(turn); turn.status.remove(); }
+        if (gotToken) { stopChatTimer(turn); turn.status.remove(); turn.status = null; }
         else { setTurnError(turn, t('chat.connErr')); }
       }
     }
@@ -5378,14 +5405,12 @@ function handleChatEvent(turn, ev, activeSteps, gotToken) {
       return false;
     }
     case 'token': {
-      if (turn.status) {
-        stopChatTimer(turn);
-        turn.status.remove();
-        turn.status = null;
-      }
-      turn.answer.classList.remove('hidden');
-      turn.raw = (turn.raw || '') + ev.text;
-      turn.answer.innerHTML = renderMarkdown(turn.raw);
+      // First token after a tool box (or at turn start) opens a fresh bubble;
+      // subsequent tokens accumulate into that same bubble's own markdown.
+      if (!turn.seg) appendTextSegment(turn);
+      turn.seg.raw += ev.text;
+      turn.seg.innerHTML = renderMarkdown(turn.seg.raw);
+      statusToTail(turn);
       chatScrollToBottom();
       return true;
     }
