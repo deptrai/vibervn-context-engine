@@ -5662,6 +5662,9 @@ function handleChatEvent(turn, ev, activeSteps, gotToken) {
     }
     case 'done': {
       if (turn.status) { stopChatTimer(turn); turn.status.remove(); turn.status = null; }
+      // The chat turn spent Search (LLM) quota — refresh now so the header
+      // reflects it immediately instead of waiting for the next 30s poll tick.
+      if (hasLivePlan()) fetchAllPlanUsage();
       return false;
     }
     case 'error': {
