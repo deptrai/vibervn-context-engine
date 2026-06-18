@@ -122,7 +122,9 @@
     <div>
       <h1 class="font-wiki text-3xl dark:text-wiki-heading text-gray-900">Context Engine</h1>
     </div>
-    <div class="flex items-center gap-1">
+    <div class="flex items-center gap-2">
+    <!-- Search quota / Buy Plan (filled by renderHeaderQuota) -->
+    <div id="header-search-quota" class="hidden mr-3"></div>
     <!-- Language switcher -->
     <div class="relative">
       <button id="btn-lang" data-i18n-aria="lang.select" data-i18n-title="lang.select" aria-label="Select language"
@@ -1395,6 +1397,9 @@ function applyI18n() {
   document.querySelectorAll('[data-i18n-ph]').forEach(el => { el.placeholder = t(el.dataset.i18nPh, params); });
   document.querySelectorAll('[data-i18n-aria]').forEach(el => { el.setAttribute('aria-label', t(el.dataset.i18nAria, params)); });
   document.querySelectorAll('[data-i18n-title]').forEach(el => { el.setAttribute('title', t(el.dataset.i18nTitle, params)); });
+  // Header search-quota text carries a {n} param, so data-i18n can't re-render it;
+  // do it explicitly. Guarded on cfg so it stays hidden until config loads.
+  if (typeof cfg !== 'undefined' && cfg) renderHeaderQuota();
 }
 
 // ─── Translation strings ────────────────────────────────────────────────────
@@ -1403,6 +1408,8 @@ const STR = {
   'app.title':        { en: `Context Engine Settings`, vi: `Cài đặt Context Engine`, zh: `Context Engine 设置` },
   'lang.select':      { en: `Select language`, vi: `Chọn ngôn ngữ`, zh: `选择语言` },
   'theme.toggle':     { en: `Toggle dark mode`, vi: `Chuyển chế độ tối`, zh: `切换深色模式` },
+  'header.searchLeft': { en: `Search: {n} left`, vi: `Search: còn {n}`, zh: `Search: 剩 {n}` },
+  'header.buyPlan':   { en: `Buy Plan`, vi: `Mua gói`, zh: `购买套餐` },
 
   // Common actions
   'action.add':       { en: `Add`, vi: `Thêm`, zh: `添加` },
@@ -3037,12 +3044,16 @@ function removePurchasedPlan(invoice) {
   renderPurchasedPlans();
 }
 
+// Cache of per-key Search (openai) remaining, keyed by proxy_key, populated by
+// fetchPlanUsage. renderHeaderQuota sums the live (non-expired) entries.
+const planUsageCache = {};
+
 function renderPurchasedPlans() {
   const plans = loadPurchasedPlans();
   const section = document.getElementById('plan-purchased-section');
   const list = document.getElementById('plan-purchased-list');
   section.classList.remove('hidden');
-  if (!plans.length) { list.innerHTML = ''; return; }
+  if (!plans.length) { list.innerHTML = ''; renderHeaderQuota(); return; }
   list.innerHTML = plans.map(p => {
     const masked = p.proxy_key ? '••••••••' + p.proxy_key.slice(-4) : '—';
     const dateStr = p.purchased_at ? new Date(p.purchased_at).toLocaleDateString() : '';
@@ -3077,6 +3088,7 @@ function renderPurchasedPlans() {
       </div>
     </div>`;
   }).join('');
+  renderHeaderQuota();
   fetchAllPlanUsage();
 }
 
@@ -3095,11 +3107,15 @@ function renderUsageBar(label, remaining, budget) {
 
 function fetchAllPlanUsage() {
   const rows = document.querySelectorAll('.plan-usage-row[data-proxy-key]');
+  const fetches = [];
   rows.forEach(row => {
     const key = row.dataset.proxyKey;
     if (!key) return;
-    fetchPlanUsage(row, key);
+    fetches.push(fetchPlanUsage(row, key));
   });
+  // Re-render the header quota once every per-key usage call has resolved so the
+  // summed "Search remaining" reflects fresh numbers, not the previous render.
+  Promise.allSettled(fetches).then(renderHeaderQuota);
 }
 
 async function fetchPlanUsage(el, proxyKey) {
@@ -3109,6 +3125,9 @@ async function fetchPlanUsage(el, proxyKey) {
     });
     if (!res.ok) { el.innerHTML = ''; return; }
     const data = await res.json();
+    // Cache openai_remaining per key so renderHeaderQuota can sum across plans
+    // without re-fetching.
+    planUsageCache[proxyKey] = { openai_remaining: data.openai_remaining || 0 };
     el.innerHTML = `<div class="space-y-1">
       ${renderUsageBar('Embeddings', data.voyage_remaining, data.voyage_budget)}
       ${renderUsageBar('Search', data.openai_remaining, data.openai_budget)}
@@ -3130,6 +3149,47 @@ async function fetchPlanUsage(el, proxyKey) {
     }
   } catch (_) { el.innerHTML = ''; }
 }
+
+// Header "Search remaining" slot. Sums openai_remaining across all non-expired
+// plans (free trial included). If no live plan exists, shows a "Buy Plan" button
+// instead. Both states are clickable and open Settings → Plans (see openPlansSection).
+function renderHeaderQuota() {
+  const el = document.getElementById('header-search-quota');
+  if (!el) return;
+  const plans = loadPurchasedPlans();
+  const now = Date.now();
+  const live = plans.filter(p => !p.expires_at || now <= p.expires_at);
+  el.classList.remove('hidden');
+  if (!live.length) {
+    el.innerHTML = `<button id="btn-header-buy-plan" data-i18n="header.buyPlan"
+      class="px-2.5 py-1 text-xs rounded font-medium border border-amber-400 dark:border-amber-500 text-amber-600 dark:text-amber-400
+             hover:bg-amber-50 dark:hover:bg-amber-500/10
+             focus:outline-none focus:ring-2 focus:ring-amber-400 transition-colors">${t('header.buyPlan')}</button>`;
+  } else {
+    // Sum the cached remaining for live plans; a plan whose usage hasn't loaded
+    // yet contributes 0 until its fetch resolves and re-renders the header.
+    const total = live.reduce((sum, p) => {
+      const u = p.proxy_key && planUsageCache[p.proxy_key];
+      return sum + (u ? u.openai_remaining : 0);
+    }, 0);
+    el.innerHTML = `<button id="btn-header-search-quota"
+      class="px-2 py-1 text-xs rounded text-gray-600 dark:text-wiki-text-muted hover:bg-gray-100 dark:hover:bg-wiki-surface
+             hover:text-gray-900 dark:hover:text-wiki-text focus:outline-none focus:ring-2 focus:ring-blue-400 transition-colors whitespace-nowrap">${t('header.searchLeft', { n: total.toLocaleString() })}</button>`;
+  }
+}
+
+// Open Settings tab, force-expand the Plans card, and scroll it into view.
+// Shared by both header states (Buy Plan button and Search-remaining text).
+function openPlansSection() {
+  activateTab(2); // tab-settings
+  expandPlanCard();
+  const section = document.getElementById('section-buy-plan');
+  if (section) section.scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+document.getElementById('header-search-quota').addEventListener('click', (e) => {
+  if (e.target.closest('#btn-header-buy-plan, #btn-header-search-quota')) openPlansSection();
+});
 
 async function planLookupInvoice() {
   const input = document.getElementById('plan-lookup-input');
@@ -3252,7 +3312,9 @@ document.getElementById('plan-purchased-list').addEventListener('click', (e) => 
 // Purchased plans render after cfg loads (see loadConfig) — they live in
 // settings.json now, so there's nothing to show before the first config fetch.
 
-// Plan card collapse toggle
+// Plan card collapse toggle. expandPlanCard is hoisted to module scope so the
+// header "Buy Plan" / "Search remaining" controls can force-open the card.
+function expandPlanCard() {}
 (function() {
   const btn = document.getElementById('plan-card-toggle');
   const body = document.getElementById('plan-card-body');
@@ -3268,6 +3330,7 @@ document.getElementById('plan-purchased-list').addEventListener('click', (e) => 
     localStorage.setItem(KEY, next ? '1' : '0');
     applyState(next);
   });
+  expandPlanCard = () => { localStorage.setItem(KEY, '0'); applyState(false); };
 })();
 
 // ─── End Buy Plan ──────────────────────────────────────────────────────────
