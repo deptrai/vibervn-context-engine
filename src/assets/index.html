@@ -2513,6 +2513,7 @@ async function loadConfig() {
       if (await saveNow()) localStorage.removeItem('purchased_plans');
     }
     renderPurchasedPlans();
+    startQuotaPolling();
     navigateIfFirstUse();
     planFetchPackages();
     planLoadFreeTrial();
@@ -3189,6 +3190,50 @@ function openPlansSection() {
 
 document.getElementById('header-search-quota').addEventListener('click', (e) => {
   if (e.target.closest('#btn-header-buy-plan, #btn-header-search-quota')) openPlansSection();
+});
+
+// ─── Quota polling ───────────────────────────────────────────────────────────
+// Keep the header "Search remaining" (and the in-card usage bars) fresh while the
+// page sits open: re-fetch /api/plan/usage every QUOTA_POLL_MS. Mirrors the index
+// poller — a self-rescheduling setTimeout (never setInterval), clearTimeout-first
+// so it can't double-schedule. Pauses while the tab is hidden and fetches
+// immediately on re-focus, so a backgrounded tab makes no requests.
+const QUOTA_POLL_MS = 30000;
+let quotaPollTimer = null;
+
+function hasLivePlan() {
+  const now = Date.now();
+  return loadPurchasedPlans().some(p => !p.expires_at || now <= p.expires_at);
+}
+
+function pollQuotaUsage() {
+  // fetchAllPlanUsage walks the .plan-usage-row nodes (present even when the
+  // Plans card is collapsed or another tab is active) and refreshes the header
+  // via renderHeaderQuota when the per-key fetches resolve.
+  if (hasLivePlan()) fetchAllPlanUsage();
+  scheduleQuotaPoll();
+}
+
+function scheduleQuotaPoll() {
+  clearTimeout(quotaPollTimer);
+  // No timer while hidden — visibilitychange resumes it on return.
+  if (document.hidden) return;
+  quotaPollTimer = setTimeout(pollQuotaUsage, QUOTA_POLL_MS);
+}
+
+function startQuotaPolling() {
+  clearTimeout(quotaPollTimer);
+  scheduleQuotaPoll();
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    clearTimeout(quotaPollTimer);
+  } else {
+    // Back in view — refresh now, don't wait out the rest of the interval.
+    if (hasLivePlan()) fetchAllPlanUsage();
+    scheduleQuotaPoll();
+  }
 });
 
 async function planLookupInvoice() {
