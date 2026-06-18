@@ -2067,13 +2067,21 @@ TABS.forEach((t, i) => {
   document.getElementById(t.btn).addEventListener('click', () => activateTab(i));
 });
 
-// Logo doubles as a "home" shortcut → Repositories tab.
+// Logo doubles as a "home" shortcut → Repositories tab. If a repo-detail
+// overlay is open it covers the tabs, so close it first (closeRepoSearch swaps
+// search-page back to main-content) — otherwise the tab switch happens unseen.
 (function() {
   const logo = document.getElementById('app-logo');
   if (!logo) return;
-  logo.addEventListener('click', () => activateTab(0));
+  function goHome() {
+    if (!document.getElementById('search-page').classList.contains('hidden')) {
+      closeRepoSearch();
+    }
+    activateTab(0);
+  }
+  logo.addEventListener('click', goHome);
   logo.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); activateTab(0); }
+    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); goHome(); }
   });
 })();
 
