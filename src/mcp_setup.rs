@@ -120,6 +120,7 @@ pub fn run_setup(repo_root: &Path, target: Target, endpoint_url: &str) -> Vec<Fi
         Target::Claude => vec![
             write_claude_mcp_json(repo_root, endpoint_url),
             write_claude_settings_local(repo_root),
+            ensure_gitignored(repo_root, ".claude/settings.local.json"),
             write_prompt_file(repo_root, "CLAUDE.md"),
         ],
         Target::Codex => vec![
@@ -284,6 +285,67 @@ fn write_claude_settings_local(repo_root: &Path) -> FileAction {
     }
 
     commit_json(&path, REL, &root, existed, changed)
+}
+
+// ─── .gitignore ────────────────────────────────────────────────────────────
+
+/// Ensure `entry` is listed in the repo's `.gitignore`, appending it if absent
+/// and creating the file if it doesn't exist.
+///
+/// `settings.local.json` holds machine-local MCP-enablement state, so it should
+/// not be committed. Matching is line-exact against the trimmed entry (so a
+/// pre-existing `.claude/settings.local.json` line — with or without a leading
+/// `/` — is respected and not duplicated); we never rewrite existing lines.
+fn ensure_gitignored(repo_root: &Path, entry: &str) -> FileAction {
+    const REL: &str = ".gitignore";
+    let path = match safe_join(repo_root, REL) {
+        Ok(p) => p,
+        Err(e) => return error_action(REL, e),
+    };
+    let existed = path.exists();
+    let current = match fs::read_to_string(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return error_action(REL, format!("read: {e}")),
+        Ok(t) => t,
+    };
+
+    // Already ignored? Accept the bare path or a leading-slash anchored form.
+    let anchored = format!("/{entry}");
+    let already = current.lines().any(|l| {
+        let l = l.trim();
+        l == entry || l == anchored
+    });
+    if already {
+        return FileAction {
+            file: rel_label(REL),
+            status: if existed {
+                FileStatus::Unchanged
+            } else {
+                FileStatus::Created
+            },
+            detail: None,
+        };
+    }
+
+    let mut out = current.clone();
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(entry);
+    out.push('\n');
+
+    match atomic_write(&path, &out) {
+        Ok(()) => FileAction {
+            file: rel_label(REL),
+            status: if existed {
+                FileStatus::Updated
+            } else {
+                FileStatus::Created
+            },
+            detail: None,
+        },
+        Err(e) => error_action(REL, e),
+    }
 }
 
 // ─── Opencode: opencode.json ───────────────────────────────────────────────
@@ -608,6 +670,51 @@ mod tests {
         assert_eq!(status_of(&actions, ".mcp.json"), FileStatus::Error);
         // File left byte-for-byte intact.
         assert_eq!(read(&dir, ".mcp.json"), bad);
+    }
+
+    #[test]
+    fn claude_creates_gitignore_with_settings_local() {
+        let dir = TempDir::new().unwrap();
+        let actions = run_setup(dir.path(), Target::Claude, URL);
+        assert_eq!(status_of(&actions, ".gitignore"), FileStatus::Created);
+        let gi = read(&dir, ".gitignore");
+        assert!(gi.contains(".claude/settings.local.json"));
+    }
+
+    #[test]
+    fn claude_appends_gitignore_preserving_existing() {
+        let dir = TempDir::new().unwrap();
+        let pre = "node_modules/\ntarget/\n";
+        fs::write(dir.path().join(".gitignore"), pre).unwrap();
+
+        let actions = run_setup(dir.path(), Target::Claude, URL);
+        assert_eq!(status_of(&actions, ".gitignore"), FileStatus::Updated);
+        let gi = read(&dir, ".gitignore");
+        assert!(gi.contains("node_modules/")); // existing kept
+        assert!(gi.contains("target/"));
+        assert!(gi.contains(".claude/settings.local.json"));
+    }
+
+    #[test]
+    fn claude_gitignore_idempotent_and_respects_anchored_form() {
+        let dir = TempDir::new().unwrap();
+        // Pre-existing leading-slash anchored entry must not be duplicated.
+        fs::write(
+            dir.path().join(".gitignore"),
+            "/.claude/settings.local.json\n",
+        )
+        .unwrap();
+        let actions = run_setup(dir.path(), Target::Claude, URL);
+        assert_eq!(status_of(&actions, ".gitignore"), FileStatus::Unchanged);
+        let gi = read(&dir, ".gitignore");
+        assert_eq!(gi.matches("settings.local.json").count(), 1);
+    }
+
+    #[test]
+    fn non_claude_targets_do_not_touch_gitignore() {
+        let dir = TempDir::new().unwrap();
+        run_setup(dir.path(), Target::Codex, URL);
+        assert!(!dir.path().join(".gitignore").exists());
     }
 
     // ── Codex ───────────────────────────────────────────────────────────
