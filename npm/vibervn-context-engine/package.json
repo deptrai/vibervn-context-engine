@@ -2,7 +2,7 @@
   "name": "vibervn-context-engine",
   "version": "0.0.0",
   "description": "Local semantic code context engine — indexes large repos and serves a codebase-retrieval MCP tool",
-  "license": "MIT",
+  "license": "SEE LICENSE IN LICENSE",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/nullmastermind/vibervn-context-engine.git"
@@ -10,7 +10,7 @@
   "bin": {
     "vibervn-context-engine": "bin/cli.js"
   },
-  "files": ["bin"],
+  "files": ["bin", "LICENSE", "README.md"],
   "engines": {
     "node": ">=18"
   },
