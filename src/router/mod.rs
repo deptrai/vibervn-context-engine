@@ -180,6 +180,31 @@ pub async fn build_router_app(opts: RouterBootOptions) -> Result<Router> {
         });
     }
 
+    // Registry SELF-HEAL watchdog. The router learns a worker died only when a
+    // request next probes its entry; under scale-to-zero a repo can sit idle for
+    // a long time after its worker idle-exits, leaving a stale `Ready` entry —
+    // and a `Spawning` entry can orphan if a spawn driver is dropped mid-flight.
+    // This periodic sweep drops both (dead `Ready` → absent, over-age `Spawning`
+    // → absent + wake awaiters) so the registry converges to the truth without
+    // waiting for a request. Cheap: a single write-locked `retain` over a map
+    // that holds at most one entry per repo, on a coarse timer. (The orphan-age
+    // cutoff `SPAWN_ORPHAN_AFTER` can never reap a live in-flight spawn — see its
+    // docs.)
+    {
+        let registry = state.proxy.registry.clone();
+        tokio::spawn(async move {
+            // Coarse cadence: orphans are rare and self-heal is not latency-
+            // sensitive (read routes already reap dead `Ready` on access via
+            // `peek_ready`; this is the backstop). Tick well under the orphan
+            // cutoff so a true orphan is cleared within ~one cutoff window.
+            let tick = std::time::Duration::from_secs(15);
+            loop {
+                tokio::time::sleep(tick).await;
+                registry.reap(spawn::SPAWN_ORPHAN_AFTER).await;
+            }
+        });
+    }
+
     let app = Router::new()
         // ── Global endpoints served NATIVELY (no worker, no DB) ──────────────
         .route("/", get(serve_index))

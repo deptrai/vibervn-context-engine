@@ -35,6 +35,21 @@ use super::worker::READY_PREFIX;
 /// spawn that lands inside this window leaves ample budget for the actual query.
 pub const SPAWN_READY_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// Cutoff after which the registry's orphan watchdog (`Registry::reap`) drops a
+/// `Spawning` entry whose driver vanished without publishing or abandoning it
+/// (e.g. the spawning request was dropped mid-flight, or the driver task was
+/// cancelled). DERIVED from `SPAWN_READY_TIMEOUT` (3×), not a guessed constant,
+/// so it tracks any change to the spawn budget automatically.
+///
+/// Why 3× makes a false positive STRUCTURALLY impossible: a legitimate spawn
+/// driver always resolves its `Spawning` entry — `spawn_worker` self-times-out
+/// at `SPAWN_READY_TIMEOUT` and the caller then `publish_ready`s (success) or
+/// `abandon_spawn`s (failure/timeout) immediately. So no valid in-flight spawn
+/// can keep an entry in `Spawning` past `SPAWN_READY_TIMEOUT` + ε, let alone to
+/// 3× it. Any `Spawning` older than this cutoff therefore has NO live driver and
+/// is safe to reap; the watchdog never kills a merely-slow but live spawn.
+pub const SPAWN_ORPHAN_AFTER: Duration = SPAWN_READY_TIMEOUT.saturating_mul(3);
+
 /// Parsed readiness handshake from a worker's stdout.
 struct ReadyLine {
     port: u16,

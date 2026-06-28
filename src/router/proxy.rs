@@ -97,19 +97,16 @@ pub async fn acquire_and_proxy(ctx: &ProxyCtx, repo: &str, req: Request) -> Resp
 /// the spawn path). A worker present but mid-request still proxies (fresh data);
 /// absent → cold.
 pub async fn proxy_if_live(ctx: &ProxyCtx, repo: &str, req: Request) -> Option<Response> {
-    // Cheap residency check — does NOT spawn. Mirrors the registry's ready set.
-    if !ctx.registry.ready_repos().await.iter().any(|r| r == repo) {
-        return None;
-    }
-    // A worker is live: fetch its handle (Ready path of acquire is spawn-free
-    // when the entry is already Ready) and proxy. If it raced to death between
-    // the check and here, obtain_worker would re-spawn — so guard against that
-    // by only proceeding on the Ready fast-path; on any miss, fall back to cold.
-    match ctx.registry.acquire(repo).await {
-        super::registry::Acquire::Ready(w) => Some(proxy_to(ctx, &w, req).await),
-        // The worker died in the race window; do NOT spawn for a view route —
-        // serve cold instead (the caller's None branch).
-        _ => None,
+    // NON-MUTATING liveness check. `peek_ready` returns a live worker or `None`,
+    // reaping a dead `Ready` entry to absent as a side effect — but NEVER
+    // electing a spawn. (The old `ready_repos()` + `acquire` pair was the
+    // "stuck Indexing… after idle" bug: `acquire` on a dead `Ready` transitions
+    // the entry to `Spawning` and returns `SpawnElected`, which this spawn-free
+    // route discarded — orphaning the entry in `Spawning` forever.)
+    match ctx.registry.peek_ready(repo).await {
+        Some(w) => Some(proxy_to(ctx, &w, req).await),
+        // No live worker (absent, mid-spawn, or just-reaped dead) → serve cold.
+        None => None,
     }
 }
 
@@ -155,14 +152,10 @@ pub async fn forward_json_to_worker(
 /// object directly, not an MCP `{result}` envelope). Used by `get_index_status`
 /// to read a live worker's authoritative status without spawning.
 pub async fn get_json_if_live(ctx: &ProxyCtx, repo: &str, path: &str) -> Option<serde_json::Value> {
-    // Spawn-free: only proceed if a worker is already Ready.
-    if !ctx.registry.ready_repos().await.iter().any(|r| r == repo) {
-        return None;
-    }
-    let worker = match ctx.registry.acquire(repo).await {
-        super::registry::Acquire::Ready(w) => w,
-        _ => return None, // raced to death — serve cold, don't spawn
-    };
+    // Spawn-free liveness via `peek_ready` (reaps a dead `Ready` to absent, never
+    // elects a spawn). Replaces the old `ready_repos()` + `acquire` pair that
+    // orphaned dead entries into `Spawning` on a status poll.
+    let worker = ctx.registry.peek_ready(repo).await?;
     let url = format!("http://127.0.0.1:{}{}", worker.port, path);
     let resp = ctx.client.get(&url).send().await.ok()?;
     if !resp.status().is_success() {
@@ -182,10 +175,23 @@ pub(crate) async fn obtain_worker(ctx: &ProxyCtx, repo: &str) -> Result<Arc<Read
                 // awaiters; on failure abandon so another request can retry.
                 match spawn_worker(&ctx.exe, repo, &ctx.worker_args, &ctx.job).await {
                     Ok(worker) => {
-                        ctx.registry
+                        // publish_ready returns false if this spawn was SUPERSEDED
+                        // — the orphan watchdog reaped our `Spawning` entry (we
+                        // were slow) and a waiter may have re-elected a fresh
+                        // spawn. Our worker is now reachable by nobody yet holds
+                        // the RocksDB LOCK, so we MUST kill it (else it would
+                        // deadlock the re-elected spawn's open_db), then loop to
+                        // re-acquire the new state (Ready, or a fresh Spawning).
+                        if ctx
+                            .registry
                             .publish_ready(repo, worker.clone(), &ready)
-                            .await;
-                        return Ok(worker);
+                            .await
+                        {
+                            return Ok(worker);
+                        }
+                        warn!(repo = %repo, "spawn superseded (entry reaped/re-elected); killing orphan worker and re-acquiring");
+                        worker.kill_and_wait().await;
+                        continue;
                     }
                     Err(e) => {
                         ctx.registry.abandon_spawn(repo, &ready).await;
