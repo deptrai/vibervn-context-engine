@@ -551,3 +551,49 @@ async fn put_config_without_new_repo_does_not_spawn() {
         "a PUT that adds NO new repo must not spawn a worker (worker_active stayed false)"
     );
 }
+
+/// Booting the router on a brand-new (empty) home dir must seed + persist
+/// `machine_id` into settings.json — so the always-on router (not just an
+/// on-demand worker) initializes the per-machine dedup id that `/api/plan/*`
+/// checkout/free-trial reads. Regression guard for the "machine_id not
+/// initialized" checkout 500 on a machine that never booted a worker.
+#[tokio::test]
+async fn router_boot_on_empty_home_persists_machine_id() {
+    let home = TempDir::new().unwrap();
+
+    // Fresh home: ensure_dir_and_load bootstraps a default settings.json whose
+    // machine_id is None. Confirm that precondition so the test proves the
+    // router DID the seeding (not some pre-existing value).
+    let before = context_engine_rs::config::ensure_dir_and_load(home.path()).unwrap();
+    assert!(
+        before
+            .machine_id
+            .as_deref()
+            .map(str::is_empty)
+            .unwrap_or(true),
+        "precondition: fresh home has no machine_id yet"
+    );
+
+    // Boot the router (build_router_app runs inside start_router).
+    let _addr = start_router(&home).await;
+
+    // machine_id must now be persisted to disk, non-empty.
+    let after = context_engine_rs::config::ensure_dir_and_load(home.path()).unwrap();
+    let mid = after
+        .machine_id
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    assert!(
+        mid.is_some(),
+        "router boot must persist a non-empty machine_id into settings.json"
+    );
+
+    // Idempotent: a second load reads the SAME id (it was persisted, not
+    // recomputed per boot).
+    let reloaded = context_engine_rs::config::ensure_dir_and_load(home.path()).unwrap();
+    assert_eq!(
+        reloaded.machine_id, mid,
+        "persisted machine_id must be stable across reloads"
+    );
+}

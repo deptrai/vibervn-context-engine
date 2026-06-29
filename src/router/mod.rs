@@ -36,7 +36,9 @@ use rmcp::transport::streamable_http_server::{
 };
 use serde_json::json;
 
-use crate::config::{Settings, default_data_dir, default_embeddings_dir, ensure_dir_and_load};
+use crate::config::{
+    Settings, default_data_dir, default_embeddings_dir, ensure_dir_and_load, ensure_machine_id,
+};
 use crate::engine_boot::set_rocksdb_memory_bounds;
 use crate::store::normalize_repo_path;
 
@@ -87,7 +89,30 @@ pub async fn build_router_app(opts: RouterBootOptions) -> Result<Router> {
         Some(h) => h,
         None => dirs::home_dir().context("could not determine home directory")?,
     };
-    let settings = ensure_dir_and_load(&home_dir).context("could not load settings")?;
+    let mut settings = ensure_dir_and_load(&home_dir).context("could not load settings")?;
+
+    // Populate + persist `machine_id` if missing — the same first-boot seeding
+    // `boot_engine` does, but the ROUTER must do it too: in process-per-project
+    // mode the router (not a worker) is the always-on process that serves the UI
+    // and the `/api/plan/*` checkout/free-trial routes, and those read
+    // `machine_id` fresh from settings.json (per-machine dedup). A worker only
+    // boots on demand, so a fresh machine that has never indexed a repo would
+    // have an empty `machine_id` and every checkout would 500 with
+    // "machine_id not initialized" until some worker happened to boot.
+    //
+    // NON-FATAL on purpose: unlike `boot_engine` (which `?`-aborts), a failure to
+    // compute/persist the id here must NOT take down the router — that would kill
+    // the whole UI for an issue that only degrades one feature. The checkout path
+    // already degrades gracefully (it surfaces the same 500 the user would see
+    // anyway), so we log and keep serving rather than failing boot harder than
+    // the feature it gates.
+    if let Err(e) = ensure_machine_id(&home_dir, &mut settings) {
+        tracing::warn!(
+            error = %e,
+            "could not initialize machine_id at router boot; checkout/free-trial will report it \
+             uninitialized until it can be persisted, but the UI stays up"
+        );
+    }
 
     let data_dir = opts
         .data_dir
