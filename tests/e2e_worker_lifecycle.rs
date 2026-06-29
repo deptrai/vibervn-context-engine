@@ -74,7 +74,8 @@ async fn start_router(home: &TempDir) -> SocketAddr {
         worker_exe: Some(worker_exe()),
     })
     .await
-    .expect("router app");
+    .expect("router app")
+    .0;
     tokio::spawn(async move {
         axum::serve(listener, app).await.expect("serve");
     });

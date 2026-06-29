@@ -1,3 +1,4 @@
+use std::future::IntoFuture;
 use std::path::PathBuf;
 
 use clap::Parser;
@@ -254,7 +255,7 @@ async fn run_router(cli: &Cli, bind: &str) {
     // and the embedding/data dirs, but it does NOT start an IndexEngine or open
     // any repo DB — that is the whole point. `boot_router` loads settings and
     // resolves dirs only.
-    let app = match router::build_router_app(router::RouterBootOptions {
+    let (app, proxy) = match router::build_router_app(router::RouterBootOptions {
         data_dir: cli.data_dir.clone(),
         embeddings_dir: cli.embeddings_dir.clone(),
         bind: bind.to_owned(),
@@ -263,7 +264,7 @@ async fn run_router(cli: &Cli, bind: &str) {
     })
     .await
     {
-        Ok(app) => app,
+        Ok(pair) => pair,
         Err(e) => {
             eprintln!("error: {e:#}");
             std::process::exit(2);
@@ -278,8 +279,90 @@ async fn run_router(cli: &Cli, bind: &str) {
         });
 
     info!("Context Engine router listening on http://{addr}");
-    axum::serve(listener, app).await.unwrap_or_else(|e| {
-        eprintln!("router server error: {e}");
-        std::process::exit(1);
-    });
+
+    // Graceful stop: when a shutdown signal arrives, kill every live worker
+    // FIRST (releasing each worker's RocksDB LOCK + its hold on the binary image)
+    // and only then exit. Without this, the router would die but its
+    // idle-but-alive workers would keep running for up to `worker_idle_secs`
+    // (default 300s), pinning `context-engine-rs.exe` on Windows so a follow-up
+    // `npx ...@latest` cannot replace the cached binary (EPERM unlink).
+    //
+    // We RACE the server against the signal rather than using
+    // `with_graceful_shutdown` (which drains in-flight connections AFTER the
+    // signal): an idle SSE/keep-alive connection — e.g. a browser holding
+    // `/api/repos/:id/index-events` — would otherwise make Ctrl+C hang. The
+    // worker teardown is crash-safe (RocksDB LOCK releases on process exit;
+    // `file_meta` self-heals the next run), so a hard kill + immediate exit is
+    // the correct, responsive stop. `process::exit(0)` then drops the Job Object
+    // handle → kill-on-close catches any worker `kill_all` raced past (e.g. one
+    // mid-spawn). See `router::registry::Registry::kill_all` + `router::jobobject`.
+    //
+    // This deterministic teardown runs only on paths where the router actually
+    // receives the signal: `just rs-dev`, or launching the binary directly. On
+    // the npx path the Node wrapper hard-TERMINATES the router (Windows has no
+    // real SIGINT to forward), so this never runs there — that path is covered by
+    // the wrapper's `taskkill /T` over the whole tree plus the Job Object.
+    let server = axum::serve(listener, app).into_future();
+    tokio::select! {
+        res = server => {
+            res.unwrap_or_else(|e| {
+                eprintln!("router server error: {e}");
+                std::process::exit(1);
+            });
+        }
+        _ = shutdown_signal() => {
+            info!("shutdown signal received; killing live workers");
+            proxy.registry.kill_all().await;
+            info!("workers killed; router exiting");
+            std::process::exit(0);
+        }
+    }
+}
+
+/// Resolve once any OS stop signal arrives. On Windows we additionally wake on
+/// the console-close / logoff / shutdown control events (Ctrl+C alone does not
+/// cover a closed console window). On Unix we also wake on SIGTERM (the signal a
+/// supervisor/`kill` sends), not just Ctrl+C (SIGINT). First signal wins.
+async fn shutdown_signal() {
+    #[cfg(windows)]
+    {
+        use tokio::signal::windows;
+        // `ctrl_c` covers Ctrl+C; the others cover the console window being
+        // closed / the user logging off / the system shutting down. Any one of
+        // them should trigger the same orderly worker teardown.
+        let mut ctrl_close = match windows::ctrl_close() {
+            Ok(s) => s,
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+                return;
+            }
+        };
+        let mut ctrl_shutdown = windows::ctrl_shutdown().ok();
+        let mut ctrl_logoff = windows::ctrl_logoff().ok();
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = ctrl_close.recv() => {}
+            _ = async { match ctrl_shutdown.as_mut() { Some(s) => { s.recv().await; }, None => std::future::pending().await } } => {}
+            _ = async { match ctrl_logoff.as_mut() { Some(s) => { s.recv().await; }, None => std::future::pending().await } } => {}
+        }
+    }
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut term = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+                return;
+            }
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+        }
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }

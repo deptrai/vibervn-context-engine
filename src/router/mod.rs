@@ -79,7 +79,12 @@ pub struct RouterState {
 
 /// Build the router-mode axum app: load settings + resolve dirs (NO IndexEngine,
 /// NO repo DB opens), create the Job Object, and wire global + proxy routes.
-pub async fn build_router_app(opts: RouterBootOptions) -> Result<Router> {
+///
+/// Returns the wired `Router` plus a clone of the [`ProxyCtx`] so the caller's
+/// shutdown handler can reach the worker [`registry::Registry`] (to kill live
+/// workers on Ctrl+C). The router's own `RouterState` keeps the original; the
+/// returned clone shares the same `Arc`-backed registry + Job Object.
+pub async fn build_router_app(opts: RouterBootOptions) -> Result<(Router, ProxyCtx)> {
     // The router does not open RocksDB, but a worker it spawns will — and the
     // worker reads these same env-derived bounds at its own boot. Setting them
     // here is harmless and keeps parity if the router is ever extended.
@@ -230,6 +235,11 @@ pub async fn build_router_app(opts: RouterBootOptions) -> Result<Router> {
         });
     }
 
+    // Clone the proxy context BEFORE `state` is moved into `.with_state(state)`
+    // below — the caller's shutdown handler needs it to reach the worker registry.
+    // Shares the same Arc-backed registry + Job Object as the router's state.
+    let proxy = state.proxy.clone();
+
     let app = Router::new()
         // ── Global endpoints served NATIVELY (no worker, no DB) ──────────────
         .route("/", get(serve_index))
@@ -305,7 +315,7 @@ pub async fn build_router_app(opts: RouterBootOptions) -> Result<Router> {
         // Global multi-repo `/mcp`: proxying handler (repo per call).
         .merge(Router::new().nest_service("/mcp", mcp_service));
 
-    Ok(app)
+    Ok((app, proxy))
 }
 
 // ── Native global handlers ──────────────────────────────────────────────────

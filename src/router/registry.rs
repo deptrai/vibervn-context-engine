@@ -350,6 +350,38 @@ impl Registry {
         }
     }
 
+    /// Kill EVERY live worker and block until each is reaped. Used by the
+    /// router's shutdown handler (Ctrl+C / SIGTERM / console-close) so a clean
+    /// stop releases every worker's RocksDB LOCK *and* its hold on the binary
+    /// image before the router exits — otherwise an idle-but-alive worker keeps
+    /// running for up to `worker_idle_secs` (default 300s) after the router is
+    /// gone, which on Windows pins `context-engine-rs.exe` and makes a follow-up
+    /// `npx ...@latest` fail to replace the cached binary (EPERM unlink).
+    ///
+    /// This is the DETERMINISTIC teardown for paths where the router actually
+    /// receives the signal (`just rs-dev`, running the binary directly). On the
+    /// npx path the Node wrapper hard-terminates the router (Windows has no real
+    /// SIGINT), so this handler may never run there — that path is covered by the
+    /// wrapper's `taskkill /T` (whole tree) plus the Job Object kill-on-close
+    /// backstop. Belt-and-suspenders: drain the map first so a concurrent
+    /// `acquire`/`reap` can't resurrect or double-reap an entry mid-shutdown.
+    pub async fn kill_all(&self) {
+        let entries: Vec<WorkerState> = {
+            let mut map = self.inner.write().await;
+            map.drain().map(|(_repo, state)| state).collect()
+        };
+        for state in entries {
+            if let WorkerState::Ready(w) = state {
+                let mut child = w.child.lock().await;
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            // `Spawning` holds no child handle here (the driver owns it until it
+            // publishes), so there is nothing to kill — the Job Object backstop
+            // covers a worker that was mid-spawn when shutdown hit.
+        }
+    }
+
     /// Snapshot of repos that currently have a Ready worker (for diagnostics /
     /// the router's "which repos are warm" view).
     pub async fn ready_repos(&self) -> Vec<String> {
@@ -666,8 +698,44 @@ mod tests {
         w.kill_and_wait().await; // cleanup
     }
 
-    /// (f) ABA SAFETY: the watchdog reaps a slow spawn's `Spawning(ready_A)`, a
-    /// waiter re-elects a fresh `Spawning(ready_B)`, then the original slow driver
+    /// (g) SHUTDOWN: `kill_all` terminates every live `Ready` worker and empties
+    /// the registry, so a clean router stop releases each worker's RocksDB LOCK +
+    /// its hold on the binary image (the EPERM-on-update root cause) instead of
+    /// leaving idle-but-alive workers running until their 300s idle timer fires.
+    #[tokio::test]
+    async fn kill_all_kills_live_workers_and_empties_registry() {
+        let reg = Registry::new();
+        let w1 = live_ready_worker();
+        let w2 = live_ready_worker();
+        install_ready(&reg, "repoK1", w1.clone()).await;
+        install_ready(&reg, "repoK2", w2.clone()).await;
+
+        reg.kill_all().await;
+
+        // Registry is fully drained.
+        assert!(
+            reg.ready_repos().await.is_empty() && reg.spawning_repos().await.is_empty(),
+            "kill_all must drain every entry"
+        );
+        // Both children are actually dead: try_wait reports an exit status.
+        for w in [&w1, &w2] {
+            let mut child = w.child.lock().await;
+            assert!(
+                matches!(child.try_wait(), Ok(Some(_))),
+                "kill_all must have killed + reaped the worker child"
+            );
+        }
+    }
+
+    /// (g') `kill_all` on an empty registry is a no-op (idempotent / safe to call
+    /// even when no workers ever spawned).
+    #[tokio::test]
+    async fn kill_all_on_empty_registry_is_noop() {
+        let reg = Registry::new();
+        reg.kill_all().await;
+        assert!(reg.ready_repos().await.is_empty());
+    }
+
     /// finally completes. `publish_ready(ready_A)` must report SUPERSEDED (false)
     /// and must NOT clobber `ready_B` into `Ready` (that would leave two workers
     /// racing one LOCK). The re-elected `Spawning(ready_B)` stays intact.
