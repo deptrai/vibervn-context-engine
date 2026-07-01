@@ -1,0 +1,1762 @@
+[
+  {
+    "diff": "--- src/config.rs\n+++ replace migrate_v1_to_v2 -> Result<Value, ConfigError> with Ok(Default::default())\n@@ -20,20 +20,17 @@\n pub const MIGRATIONS: &[MigrationFn] = &[migrate_v1_to_v2, migrate_v2_to_v3, migrate_v3_to_v4, migrate_v4_to_v5, migrate_v5_to_v6, migrate_v6_to_v7, migrate_v7_to_v8, migrate_v8_to_v9];\n \n /// v1→v2: introduce `data_dir` (Option<PathBuf>). The body is a no-op stamp —\n /// `serde(default)` already handles missing fields on deserialize, but we\n /// persist an explicit `null` and bump the file's `version` so that an older\n /// v1 binary refuses to read this file (VersionTooNew) instead of silently\n /// dropping the new field on the next save.\n fn migrate_v1_to_v2(mut value: Value) -> Result<Value, ConfigError> {\n-    if let Value::Object(ref mut obj) = value {\n-        obj.entry(\"data_dir\".to_string()).or_insert(Value::Null);\n-    }\n-    Ok(value)\n+    Ok(Default::default()) /* ~ changed by cargo-mutants ~ */\n }\n \n /// v2→v3: introduce `embeddings_dir` (Option<PathBuf>). Same no-op stamp +\n /// forward-incompat tripwire rationale as v1→v2. `embeddings_dir` lets the\n /// content-addressed embedding cache live at its own location — typically a\n /// SHARED path across multiple instances, so identical code chunks are embedded\n /// once (the cache is concurrency-safe; only RocksDB needs per-instance\n /// isolation). `None` means the builtin default\n",
+    "file": "src/config.rs",
+    "function": {
+      "function_name": "migrate_v1_to_v2",
+      "return_type": "-> Result<Value, ConfigError>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 32
+        },
+        "start": {
+          "column": 1,
+          "line": 22
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "src/config.rs:28:5: replace migrate_v1_to_v2 -> Result<Value, ConfigError> with Ok(Default::default())",
+    "package": "context-engine-rs",
+    "replacement": "Ok(Default::default())",
+    "span": {
+      "end": {
+        "column": 14,
+        "line": 31
+      },
+      "start": {
+        "column": 5,
+        "line": 28
+      }
+    }
+  },
+  {
+    "diff": "--- src/config.rs\n+++ replace migrate_v2_to_v3 -> Result<Value, ConfigError> with Ok(Default::default())\n@@ -34,20 +34,17 @@\n /// v2→v3: introduce `embeddings_dir` (Option<PathBuf>). Same no-op stamp +\n /// forward-incompat tripwire rationale as v1→v2. `embeddings_dir` lets the\n /// content-addressed embedding cache live at its own location — typically a\n /// SHARED path across multiple instances, so identical code chunks are embedded\n /// once (the cache is concurrency-safe; only RocksDB needs per-instance\n /// isolation). `None` means the builtin default\n /// `~/.vibervn/context-engine/embeddings` (anchored to home, not `data_dir`).\n fn migrate_v2_to_v3(mut value: Value) -> Result<Value, ConfigError> {\n-    if let Value::Object(ref mut obj) = value {\n-        obj.entry(\"embeddings_dir\".to_string()).or_insert(Value::Null);\n-    }\n-    Ok(value)\n+    Ok(Default::default()) /* ~ changed by cargo-mutants ~ */\n }\n \n /// v3→v4: introduce `enabled_mcp_tools` (Vec<String>). Defaults to both tools\n /// enabled so existing installations gain file-retrieval without manual opt-in.\n fn migrate_v3_to_v4(mut value: Value) -> Result<Value, ConfigError> {\n     if let Value::Object(ref mut obj) = value {\n         obj.entry(\"enabled_mcp_tools\".to_string()).or_insert_with(|| {\n             Value::Array(vec![\n",
+    "file": "src/config.rs",
+    "function": {
+      "function_name": "migrate_v2_to_v3",
+      "return_type": "-> Result<Value, ConfigError>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 46
+        },
+        "start": {
+          "column": 1,
+          "line": 34
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "src/config.rs:42:5: replace migrate_v2_to_v3 -> Result<Value, ConfigError> with Ok(Default::default())",
+    "package": "context-engine-rs",
+    "replacement": "Ok(Default::default())",
+    "span": {
+      "end": {
+        "column": 14,
+        "line": 45
+      },
+      "start": {
+        "column": 5,
+        "line": 42
+      }
+    }
+  },
+  {
+    "diff": "--- src/config.rs\n+++ replace migrate_v3_to_v4 -> Result<Value, ConfigError> with Ok(Default::default())\n@@ -43,25 +43,17 @@\n         obj.entry(\"embeddings_dir\".to_string()).or_insert(Value::Null);\n     }\n     Ok(value)\n }\n \n /// v3→v4: introduce `enabled_mcp_tools` (Vec<String>). Defaults to both tools\n /// enabled so existing installations gain file-retrieval without manual opt-in.\n fn migrate_v3_to_v4(mut value: Value) -> Result<Value, ConfigError> {\n-    if let Value::Object(ref mut obj) = value {\n-        obj.entry(\"enabled_mcp_tools\".to_string()).or_insert_with(|| {\n-            Value::Array(vec![\n-                Value::String(\"codebase-retrieval\".to_string()),\n-                Value::String(\"file-retrieval\".to_string()),\n-            ])\n-        });\n-    }\n-    Ok(value)\n+    Ok(Default::default()) /* ~ changed by cargo-mutants ~ */\n }\n \n /// v4→v5: introduce `custom_extensions` (Vec<String>). Defaults to empty —\n /// users add their own extensions beyond the built-in CODE_EXTENSIONS list.\n fn migrate_v4_to_v5(mut value: Value) -> Result<Value, ConfigError> {\n     if let Value::Object(ref mut obj) = value {\n         obj.entry(\"custom_extensions\".to_string())\n             .or_insert_with(|| Value::Array(vec![]));\n",
+    "file": "src/config.rs",
+    "function": {
+      "function_name": "migrate_v3_to_v4",
+      "return_type": "-> Result<Value, ConfigError>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 60
+        },
+        "start": {
+          "column": 1,
+          "line": 48
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "src/config.rs:51:5: replace migrate_v3_to_v4 -> Result<Value, ConfigError> with Ok(Default::default())",
+    "package": "context-engine-rs",
+    "replacement": "Ok(Default::default())",
+    "span": {
+      "end": {
+        "column": 14,
+        "line": 59
+      },
+      "start": {
+        "column": 5,
+        "line": 51
+      }
+    }
+  },
+  {
+    "diff": "--- src/config.rs\n+++ replace migrate_v4_to_v5 -> Result<Value, ConfigError> with Ok(Default::default())\n@@ -57,21 +57,17 @@\n         });\n     }\n     Ok(value)\n }\n \n /// v4→v5: introduce `custom_extensions` (Vec<String>). Defaults to empty —\n /// users add their own extensions beyond the built-in CODE_EXTENSIONS list.\n fn migrate_v4_to_v5(mut value: Value) -> Result<Value, ConfigError> {\n-    if let Value::Object(ref mut obj) = value {\n-        obj.entry(\"custom_extensions\".to_string())\n-            .or_insert_with(|| Value::Array(vec![]));\n-    }\n-    Ok(value)\n+    Ok(Default::default()) /* ~ changed by cargo-mutants ~ */\n }\n \n /// v5→v6: introduce `index_ignore_filenames` (Vec<String>). Defaults to\n /// CLAUDE.md and AGENTS.md — files typically consumed by AI agents that add\n /// noise to code search results.\n fn migrate_v5_to_v6(mut value: Value) -> Result<Value, ConfigError> {\n     if let Value::Object(ref mut obj) = value {\n         obj.entry(\"index_ignore_filenames\".to_string())\n",
+    "file": "src/config.rs",
+    "function": {
+      "function_name": "migrate_v4_to_v5",
+      "return_type": "-> Result<Value, ConfigError>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 70
+        },
+        "start": {
+          "column": 1,
+          "line": 62
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "src/config.rs:65:5: replace migrate_v4_to_v5 -> Result<Value, ConfigError> with Ok(Default::default())",
+    "package": "context-engine-rs",
+    "replacement": "Ok(Default::default())",
+    "span": {
+      "end": {
+        "column": 14,
+        "line": 69
+      },
+      "start": {
+        "column": 5,
+        "line": 65
+      }
+    }
+  },
+  {
+    "diff": "--- src/config.rs\n+++ replace migrate_v5_to_v6 -> Result<Value, ConfigError> with Ok(Default::default())\n@@ -68,26 +68,17 @@\n     }\n     Ok(value)\n }\n \n /// v5→v6: introduce `index_ignore_filenames` (Vec<String>). Defaults to\n /// CLAUDE.md and AGENTS.md — files typically consumed by AI agents that add\n /// noise to code search results.\n fn migrate_v5_to_v6(mut value: Value) -> Result<Value, ConfigError> {\n-    if let Value::Object(ref mut obj) = value {\n-        obj.entry(\"index_ignore_filenames\".to_string())\n-            .or_insert_with(|| {\n-                Value::Array(vec![\n-                    Value::String(\"CLAUDE.md\".to_string()),\n-                    Value::String(\"AGENTS.md\".to_string()),\n-                ])\n-            });\n-    }\n-    Ok(value)\n+    Ok(Default::default()) /* ~ changed by cargo-mutants ~ */\n }\n \n /// v6→v7: introduce `embedding.voyage_base_url` (Option<String>). Allows\n /// overriding the Voyage AI endpoint (proxy, self-hosted compatible API).\n /// `None` / null means the default `https://api.voyageai.com/v1/embeddings`.\n fn migrate_v6_to_v7(mut value: Value) -> Result<Value, ConfigError> {\n     if let Value::Object(ref mut obj) = value\n         && let Some(Value::Object(emb)) = obj.get_mut(\"embedding\")\n",
+    "file": "src/config.rs",
+    "function": {
+      "function_name": "migrate_v5_to_v6",
+      "return_type": "-> Result<Value, ConfigError>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 86
+        },
+        "start": {
+          "column": 1,
+          "line": 72
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "src/config.rs:76:5: replace migrate_v5_to_v6 -> Result<Value, ConfigError> with Ok(Default::default())",
+    "package": "context-engine-rs",
+    "replacement": "Ok(Default::default())",
+    "span": {
+      "end": {
+        "column": 14,
+        "line": 85
+      },
+      "start": {
+        "column": 5,
+        "line": 76
+      }
+    }
+  },
+  {
+    "diff": "--- src/config.rs\n+++ replace migrate_v6_to_v7 -> Result<Value, ConfigError> with Ok(Default::default())\n@@ -84,23 +84,17 @@\n     }\n     Ok(value)\n }\n \n /// v6→v7: introduce `embedding.voyage_base_url` (Option<String>). Allows\n /// overriding the Voyage AI endpoint (proxy, self-hosted compatible API).\n /// `None` / null means the default `https://api.voyageai.com/v1/embeddings`.\n fn migrate_v6_to_v7(mut value: Value) -> Result<Value, ConfigError> {\n-    if let Value::Object(ref mut obj) = value\n-        && let Some(Value::Object(emb)) = obj.get_mut(\"embedding\")\n-    {\n-        emb.entry(\"voyage_base_url\".to_string())\n-            .or_insert(Value::Null);\n-    }\n-    Ok(value)\n+    Ok(Default::default()) /* ~ changed by cargo-mutants ~ */\n }\n \n /// v7→v8: introduce `repo_generations` (map of repo path → generation counter).\n /// Defaults to an empty object — every existing repo is implicitly generation 0,\n /// which `db_path` maps to exactly today's `<data_dir>/rocksdb/<name>` layout, so\n /// no on-disk index is orphaned by this migration. The counter is bumped on every\n /// repo/index delete so the next index for that repo lands on a FRESH directory\n /// (`<data_dir>/rocksdb/<gen>/<name>` for gen ≥ 1), side-stepping the async RocksDB\n",
+    "file": "src/config.rs",
+    "function": {
+      "function_name": "migrate_v6_to_v7",
+      "return_type": "-> Result<Value, ConfigError>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 99
+        },
+        "start": {
+          "column": 1,
+          "line": 88
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "src/config.rs:92:5: replace migrate_v6_to_v7 -> Result<Value, ConfigError> with Ok(Default::default())",
+    "package": "context-engine-rs",
+    "replacement": "Ok(Default::default())",
+    "span": {
+      "end": {
+        "column": 14,
+        "line": 98
+      },
+      "start": {
+        "column": 5,
+        "line": 92
+      }
+    }
+  },
+  {
+    "diff": "--- src/config.rs\n+++ replace && with || in migrate_v6_to_v7\n@@ -85,17 +85,17 @@\n     Ok(value)\n }\n \n /// v6→v7: introduce `embedding.voyage_base_url` (Option<String>). Allows\n /// overriding the Voyage AI endpoint (proxy, self-hosted compatible API).\n /// `None` / null means the default `https://api.voyageai.com/v1/embeddings`.\n fn migrate_v6_to_v7(mut value: Value) -> Result<Value, ConfigError> {\n     if let Value::Object(ref mut obj) = value\n-        && let Some(Value::Object(emb)) = obj.get_mut(\"embedding\")\n+        || /* ~ changed by cargo-mutants ~ */ let Some(Value::Object(emb)) = obj.get_mut(\"embedding\")\n     {\n         emb.entry(\"voyage_base_url\".to_string())\n             .or_insert(Value::Null);\n     }\n     Ok(value)\n }\n \n /// v7→v8: introduce `repo_generations` (map of repo path → generation counter).\n",
+    "file": "src/config.rs",
+    "function": {
+      "function_name": "migrate_v6_to_v7",
+      "return_type": "-> Result<Value, ConfigError>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 99
+        },
+        "start": {
+          "column": 1,
+          "line": 88
+        }
+      }
+    },
+    "genre": "BinaryOperator",
+    "name": "src/config.rs:93:9: replace && with || in migrate_v6_to_v7",
+    "package": "context-engine-rs",
+    "replacement": "||",
+    "span": {
+      "end": {
+        "column": 11,
+        "line": 93
+      },
+      "start": {
+        "column": 9,
+        "line": 93
+      }
+    }
+  },
+  {
+    "diff": "--- src/config.rs\n+++ replace migrate_v7_to_v8 -> Result<Value, ConfigError> with Ok(Default::default())\n@@ -101,21 +101,17 @@\n /// v7→v8: introduce `repo_generations` (map of repo path → generation counter).\n /// Defaults to an empty object — every existing repo is implicitly generation 0,\n /// which `db_path` maps to exactly today's `<data_dir>/rocksdb/<name>` layout, so\n /// no on-disk index is orphaned by this migration. The counter is bumped on every\n /// repo/index delete so the next index for that repo lands on a FRESH directory\n /// (`<data_dir>/rocksdb/<gen>/<name>` for gen ≥ 1), side-stepping the async RocksDB\n /// LOCK drain that otherwise makes an immediate re-index race the deleted handle.\n fn migrate_v7_to_v8(mut value: Value) -> Result<Value, ConfigError> {\n-    if let Value::Object(ref mut obj) = value {\n-        obj.entry(\"repo_generations\".to_string())\n-            .or_insert_with(|| Value::Object(serde_json::Map::new()));\n-    }\n-    Ok(value)\n+    Ok(Default::default()) /* ~ changed by cargo-mutants ~ */\n }\n \n /// v8→v9: introduce `purchased_plans` (Vec<PurchasedPlan>). Defaults to an empty\n /// array. Plans used to live in browser localStorage, which lost them whenever\n /// the UI was opened from a different browser/machine; persisting them in\n /// settings.json (next to the proxy keys they reference) makes them follow the\n /// install. The UI folds any pre-existing localStorage plans into this list on\n /// first load after the upgrade, so nothing already claimed is dropped.\n",
+    "file": "src/config.rs",
+    "function": {
+      "function_name": "migrate_v7_to_v8",
+      "return_type": "-> Result<Value, ConfigError>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 114
+        },
+        "start": {
+          "column": 1,
+          "line": 101
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "src/config.rs:109:5: replace migrate_v7_to_v8 -> Result<Value, ConfigError> with Ok(Default::default())",
+    "package": "context-engine-rs",
+    "replacement": "Ok(Default::default())",
+    "span": {
+      "end": {
+        "column": 14,
+        "line": 113
+      },
+      "start": {
+        "column": 5,
+        "line": 109
+      }
+    }
+  },
+  {
+    "diff": "--- src/config.rs\n+++ replace migrate_v8_to_v9 -> Result<Value, ConfigError> with Ok(Default::default())\n@@ -115,21 +115,17 @@\n \n /// v8→v9: introduce `purchased_plans` (Vec<PurchasedPlan>). Defaults to an empty\n /// array. Plans used to live in browser localStorage, which lost them whenever\n /// the UI was opened from a different browser/machine; persisting them in\n /// settings.json (next to the proxy keys they reference) makes them follow the\n /// install. The UI folds any pre-existing localStorage plans into this list on\n /// first load after the upgrade, so nothing already claimed is dropped.\n fn migrate_v8_to_v9(mut value: Value) -> Result<Value, ConfigError> {\n-    if let Value::Object(ref mut obj) = value {\n-        obj.entry(\"purchased_plans\".to_string())\n-            .or_insert_with(|| Value::Array(vec![]));\n-    }\n-    Ok(value)\n+    Ok(Default::default()) /* ~ changed by cargo-mutants ~ */\n }\n \n // ─── Settings ──────────────────────────────────────────────────────────────\n \n fn default_index_ignore_filenames() -> Vec<String> {\n     vec![\"CLAUDE.md\".to_string(), \"AGENTS.md\".to_string()]\n }\n \n",
+    "file": "src/config.rs",
+    "function": {
+      "function_name": "migrate_v8_to_v9",
+      "return_type": "-> Result<Value, ConfigError>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 128
+        },
+        "start": {
+          "column": 1,
+          "line": 116
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "src/config.rs:123:5: replace migrate_v8_to_v9 -> Result<Value, ConfigError> with Ok(Default::default())",
+    "package": "context-engine-rs",
+    "replacement": "Ok(Default::default())",
+    "span": {
+      "end": {
+        "column": 14,
+        "line": 127
+      },
+      "start": {
+        "column": 5,
+        "line": 123
+      }
+    }
+  },
+  {
+    "diff": "--- src/config.rs\n+++ replace default_index_ignore_filenames -> Vec<String> with vec![]\n@@ -125,17 +125,17 @@\n             .or_insert_with(|| Value::Array(vec![]));\n     }\n     Ok(value)\n }\n \n // ─── Settings ──────────────────────────────────────────────────────────────\n \n fn default_index_ignore_filenames() -> Vec<String> {\n-    vec![\"CLAUDE.md\".to_string(), \"AGENTS.md\".to_string()]\n+    vec![] /* ~ changed by cargo-mutants ~ */\n }\n \n fn default_embed_concurrency() -> usize {\n     // Per-key concurrency: each API key is allowed this many concurrent\n     // embedding batches in-flight. Runtime total = this value × number of\n     // keys. The embed stage is network-bound (the pipeline's pacing stage);\n     // 64 saturates typical gateways and keeps parse/store stages fed on\n     // multi-core machines. Gateway proven to handle 32+ parallel at sub-1.5s\n",
+    "file": "src/config.rs",
+    "function": {
+      "function_name": "default_index_ignore_filenames",
+      "return_type": "-> Vec<String>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 134
+        },
+        "start": {
+          "column": 1,
+          "line": 132
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "src/config.rs:133:5: replace default_index_ignore_filenames -> Vec<String> with vec![]",
+    "package": "context-engine-rs",
+    "replacement": "vec![]",
+    "span": {
+      "end": {
+        "column": 59,
+        "line": 133
+      },
+      "start": {
+        "column": 5,
+        "line": 133
+      }
+    }
+  },
+  {
+    "diff": "--- src/config.rs\n+++ replace default_index_ignore_filenames -> Vec<String> with vec![String::new()]\n@@ -125,17 +125,17 @@\n             .or_insert_with(|| Value::Array(vec![]));\n     }\n     Ok(value)\n }\n \n // ─── Settings ──────────────────────────────────────────────────────────────\n \n fn default_index_ignore_filenames() -> Vec<String> {\n-    vec![\"CLAUDE.md\".to_string(), \"AGENTS.md\".to_string()]\n+    vec![String::new()] /* ~ changed by cargo-mutants ~ */\n }\n \n fn default_embed_concurrency() -> usize {\n     // Per-key concurrency: each API key is allowed this many concurrent\n     // embedding batches in-flight. Runtime total = this value × number of\n     // keys. The embed stage is network-bound (the pipeline's pacing stage);\n     // 64 saturates typical gateways and keeps parse/store stages fed on\n     // multi-core machines. Gateway proven to handle 32+ parallel at sub-1.5s\n",
+    "file": "src/config.rs",
+    "function": {
+      "function_name": "default_index_ignore_filenames",
+      "return_type": "-> Vec<String>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 134
+        },
+        "start": {
+          "column": 1,
+          "line": 132
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "src/config.rs:133:5: replace default_index_ignore_filenames -> Vec<String> with vec![String::new()]",
+    "package": "context-engine-rs",
+    "replacement": "vec![String::new()]",
+    "span": {
+      "end": {
+        "column": 59,
+        "line": 133
+      },
+      "start": {
+        "column": 5,
+        "line": 133
+      }
+    }
+  },
+  {
+    "diff": "--- src/config.rs\n+++ replace default_index_ignore_filenames -> Vec<String> with vec![\"xyzzy\".into()]\n@@ -125,17 +125,17 @@\n             .or_insert_with(|| Value::Array(vec![]));\n     }\n     Ok(value)\n }\n \n // ─── Settings ──────────────────────────────────────────────────────────────\n \n fn default_index_ignore_filenames() -> Vec<String> {\n-    vec![\"CLAUDE.md\".to_string(), \"AGENTS.md\".to_string()]\n+    vec![\"xyzzy\".into()] /* ~ changed by cargo-mutants ~ */\n }\n \n fn default_embed_concurrency() -> usize {\n     // Per-key concurrency: each API key is allowed this many concurrent\n     // embedding batches in-flight. Runtime total = this value × number of\n     // keys. The embed stage is network-bound (the pipeline's pacing stage);\n     // 64 saturates typical gateways and keeps parse/store stages fed on\n     // multi-core machines. Gateway proven to handle 32+ parallel at sub-1.5s\n",
+    "file": "src/config.rs",
+    "function": {
+      "function_name": "default_index_ignore_filenames",
+      "return_type": "-> Vec<String>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 134
+        },
+        "start": {
+          "column": 1,
+          "line": 132
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "src/config.rs:133:5: replace default_index_ignore_filenames -> Vec<String> with vec![\"xyzzy\".into()]",
+    "package": "context-engine-rs",
+    "replacement": "vec![\"xyzzy\".into()]",
+    "span": {
+      "end": {
+        "column": 59,
+        "line": 133
+      },
+      "start": {
+        "column": 5,
+        "line": 133
+      }
+    }
+  },
+  {
+    "diff": "--- src/config.rs\n+++ replace default_embed_concurrency -> usize with 0\n@@ -135,17 +135,17 @@\n \n fn default_embed_concurrency() -> usize {\n     // Per-key concurrency: each API key is allowed this many concurrent\n     // embedding batches in-flight. Runtime total = this value × number of\n     // keys. The embed stage is network-bound (the pipeline's pacing stage);\n     // 64 saturates typical gateways and keeps parse/store stages fed on\n     // multi-core machines. Gateway proven to handle 32+ parallel at sub-1.5s\n     // with zero 429s; 64 gives headroom. Default 64.\n-    64\n+    0 /* ~ changed by cargo-mutants ~ */\n }\n \n fn default_vector_resident_cap_mb() -> usize {\n     // Resident-byte cap for the per-repo sharded vector index, in megabytes.\n     // Total resident embedding bytes across all repo shards are kept at or below\n     // this; least-recently-used non-active repos are evicted when an insert/warm\n     // would exceed it. Cold repos are warmed lazily on query. 0 disables the cap\n     // (unbounded — not recommended). Default 2048 MB (~2 GB).\n",
+    "file": "src/config.rs",
+    "function": {
+      "function_name": "default_embed_concurrency",
+      "return_type": "-> usize",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 144
+        },
+        "start": {
+          "column": 1,
+          "line": 136
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "src/config.rs:143:5: replace default_embed_concurrency -> usize with 0",
+    "package": "context-engine-rs",
+    "replacement": "0",
+    "span": {
+      "end": {
+        "column": 7,
+        "line": 143
+      },
+      "start": {
+        "column": 5,
+        "line": 143
+      }
+    }
+  },
+  {
+    "diff": "--- src/config.rs\n+++ replace default_embed_concurrency -> usize with 1\n@@ -135,17 +135,17 @@\n \n fn default_embed_concurrency() -> usize {\n     // Per-key concurrency: each API key is allowed this many concurrent\n     // embedding batches in-flight. Runtime total = this value × number of\n     // keys. The embed stage is network-bound (the pipeline's pacing stage);\n     // 64 saturates typical gateways and keeps parse/store stages fed on\n     // multi-core machines. Gateway proven to handle 32+ parallel at sub-1.5s\n     // with zero 429s; 64 gives headroom. Default 64.\n-    64\n+    1 /* ~ changed by cargo-mutants ~ */\n }\n \n fn default_vector_resident_cap_mb() -> usize {\n     // Resident-byte cap for the per-repo sharded vector index, in megabytes.\n     // Total resident embedding bytes across all repo shards are kept at or below\n     // this; least-recently-used non-active repos are evicted when an insert/warm\n     // would exceed it. Cold repos are warmed lazily on query. 0 disables the cap\n     // (unbounded — not recommended). Default 2048 MB (~2 GB).\n",
+    "file": "src/config.rs",
+    "function": {
+      "function_name": "default_embed_concurrency",
+      "return_type": "-> usize",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 144
+        },
+        "start": {
+          "column": 1,
+          "line": 136
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "src/config.rs:143:5: replace default_embed_concurrency -> usize with 1",
+    "package": "context-engine-rs",
+    "replacement": "1",
+    "span": {
+      "end": {
+        "column": 7,
+        "line": 143
+      },
+      "start": {
+        "column": 5,
+        "line": 143
+      }
+    }
+  },
+  {
+    "diff": "--- src/config.rs\n+++ replace default_vector_resident_cap_mb -> usize with 0\n@@ -144,17 +144,17 @@\n }\n \n fn default_vector_resident_cap_mb() -> usize {\n     // Resident-byte cap for the per-repo sharded vector index, in megabytes.\n     // Total resident embedding bytes across all repo shards are kept at or below\n     // this; least-recently-used non-active repos are evicted when an insert/warm\n     // would exceed it. Cold repos are warmed lazily on query. 0 disables the cap\n     // (unbounded — not recommended). Default 2048 MB (~2 GB).\n-    2048\n+    0 /* ~ changed by cargo-mutants ~ */\n }\n \n #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]\n pub struct EmbeddingConfig {\n     pub provider: String,\n     pub model: String,\n     pub api_keys: Vec<String>,\n     /// Per-key concurrency: number of embedding batches in-flight per API key.\n",
+    "file": "src/config.rs",
+    "function": {
+      "function_name": "default_vector_resident_cap_mb",
+      "return_type": "-> usize",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 153
+        },
+        "start": {
+          "column": 1,
+          "line": 146
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "src/config.rs:152:5: replace default_vector_resident_cap_mb -> usize with 0",
+    "package": "context-engine-rs",
+    "replacement": "0",
+    "span": {
+      "end": {
+        "column": 9,
+        "line": 152
+      },
+      "start": {
+        "column": 5,
+        "line": 152
+      }
+    }
+  },
+  {
+    "diff": "--- src/config.rs\n+++ replace default_vector_resident_cap_mb -> usize with 1\n@@ -144,17 +144,17 @@\n }\n \n fn default_vector_resident_cap_mb() -> usize {\n     // Resident-byte cap for the per-repo sharded vector index, in megabytes.\n     // Total resident embedding bytes across all repo shards are kept at or below\n     // this; least-recently-used non-active repos are evicted when an insert/warm\n     // would exceed it. Cold repos are warmed lazily on query. 0 disables the cap\n     // (unbounded — not recommended). Default 2048 MB (~2 GB).\n-    2048\n+    1 /* ~ changed by cargo-mutants ~ */\n }\n \n #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]\n pub struct EmbeddingConfig {\n     pub provider: String,\n     pub model: String,\n     pub api_keys: Vec<String>,\n     /// Per-key concurrency: number of embedding batches in-flight per API key.\n",
+    "file": "src/config.rs",
+    "function": {
+      "function_name": "default_vector_resident_cap_mb",
+      "return_type": "-> usize",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 153
+        },
+        "start": {
+          "column": 1,
+          "line": 146
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "src/config.rs:152:5: replace default_vector_resident_cap_mb -> usize with 1",
+    "package": "context-engine-rs",
+    "replacement": "1",
+    "span": {
+      "end": {
+        "column": 9,
+        "line": 152
+      },
+      "start": {
+        "column": 5,
+        "line": 152
+      }
+    }
+  },
+  {
+    "diff": "--- src/config.rs\n+++ replace default_min_prune_lines -> u32 with 0\n@@ -181,17 +181,17 @@\n             voyage_base_url: None,\n         }\n     }\n }\n \n fn default_min_prune_lines() -> u32 {\n     // Chunks whose line span is below this are never line-pruned by the reranker\n     // (kept whole). Pruning a small chunk saves little and risks losing context.\n-    16\n+    0 /* ~ changed by cargo-mutants ~ */\n }\n \n fn default_use_structured_output() -> bool {\n     // When true, the reranker requests the provider's native JSON output mode\n     // (Gemini responseMimeType / OpenAI response_format) instead of wrapping the\n     // ranking in <ranked_indices> XML tags. Providers without a JSON mode fall\n     // back to the XML path regardless of this flag.\n     true\n",
+    "file": "src/config.rs",
+    "function": {
+      "function_name": "default_min_prune_lines",
+      "return_type": "-> u32",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 190
+        },
+        "start": {
+          "column": 1,
+          "line": 186
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "src/config.rs:189:5: replace default_min_prune_lines -> u32 with 0",
+    "package": "context-engine-rs",
+    "replacement": "0",
+    "span": {
+      "end": {
+        "column": 7,
+        "line": 189
+      },
+      "start": {
+        "column": 5,
+        "line": 189
+      }
+    }
+  },
+  {
+    "diff": "--- src/config.rs\n+++ replace default_min_prune_lines -> u32 with 1\n@@ -181,17 +181,17 @@\n             voyage_base_url: None,\n         }\n     }\n }\n \n fn default_min_prune_lines() -> u32 {\n     // Chunks whose line span is below this are never line-pruned by the reranker\n     // (kept whole). Pruning a small chunk saves little and risks losing context.\n-    16\n+    1 /* ~ changed by cargo-mutants ~ */\n }\n \n fn default_use_structured_output() -> bool {\n     // When true, the reranker requests the provider's native JSON output mode\n     // (Gemini responseMimeType / OpenAI response_format) instead of wrapping the\n     // ranking in <ranked_indices> XML tags. Providers without a JSON mode fall\n     // back to the XML path regardless of this flag.\n     true\n",
+    "file": "src/config.rs",
+    "function": {
+      "function_name": "default_min_prune_lines",
+      "return_type": "-> u32",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 190
+        },
+        "start": {
+          "column": 1,
+          "line": 186
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "src/config.rs:189:5: replace default_min_prune_lines -> u32 with 1",
+    "package": "context-engine-rs",
+    "replacement": "1",
+    "span": {
+      "end": {
+        "column": 7,
+        "line": 189
+      },
+      "start": {
+        "column": 5,
+        "line": 189
+      }
+    }
+  },
+  {
+    "diff": "--- src/config.rs\n+++ replace default_use_structured_output -> bool with false\n@@ -189,17 +189,17 @@\n     16\n }\n \n fn default_use_structured_output() -> bool {\n     // When true, the reranker requests the provider's native JSON output mode\n     // (Gemini responseMimeType / OpenAI response_format) instead of wrapping the\n     // ranking in <ranked_indices> XML tags. Providers without a JSON mode fall\n     // back to the XML path regardless of this flag.\n-    true\n+    false /* ~ changed by cargo-mutants ~ */\n }\n \n fn default_agentic_rag_max_turns() -> u32 {\n     9\n }\n \n fn default_agentic_rag_max_chunk_chars() -> u32 {\n     50_000\n",
+    "file": "src/config.rs",
+    "function": {
+      "function_name": "default_use_structured_output",
+      "return_type": "-> bool",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 198
+        },
+        "start": {
+          "column": 1,
+          "line": 192
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "src/config.rs:197:5: replace default_use_structured_output -> bool with false",
+    "package": "context-engine-rs",
+    "replacement": "false",
+    "span": {
+      "end": {
+        "column": 9,
+        "line": 197
+      },
+      "start": {
+        "column": 5,
+        "line": 197
+      }
+    }
+  },
+  {
+    "diff": "--- src/config.rs\n+++ replace default_agentic_rag_max_turns -> u32 with 0\n@@ -193,17 +193,17 @@\n     // When true, the reranker requests the provider's native JSON output mode\n     // (Gemini responseMimeType / OpenAI response_format) instead of wrapping the\n     // ranking in <ranked_indices> XML tags. Providers without a JSON mode fall\n     // back to the XML path regardless of this flag.\n     true\n }\n \n fn default_agentic_rag_max_turns() -> u32 {\n-    9\n+    0 /* ~ changed by cargo-mutants ~ */\n }\n \n fn default_agentic_rag_max_chunk_chars() -> u32 {\n     50_000\n }\n \n #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]\n pub struct LlmConfig {\n",
+    "file": "src/config.rs",
+    "function": {
+      "function_name": "default_agentic_rag_max_turns",
+      "return_type": "-> u32",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 202
+        },
+        "start": {
+          "column": 1,
+          "line": 200
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "src/config.rs:201:5: replace default_agentic_rag_max_turns -> u32 with 0",
+    "package": "context-engine-rs",
+    "replacement": "0",
+    "span": {
+      "end": {
+        "column": 6,
+        "line": 201
+      },
+      "start": {
+        "column": 5,
+        "line": 201
+      }
+    }
+  },
+  {
+    "diff": "--- src/config.rs\n+++ replace default_agentic_rag_max_turns -> u32 with 1\n@@ -193,17 +193,17 @@\n     // When true, the reranker requests the provider's native JSON output mode\n     // (Gemini responseMimeType / OpenAI response_format) instead of wrapping the\n     // ranking in <ranked_indices> XML tags. Providers without a JSON mode fall\n     // back to the XML path regardless of this flag.\n     true\n }\n \n fn default_agentic_rag_max_turns() -> u32 {\n-    9\n+    1 /* ~ changed by cargo-mutants ~ */\n }\n \n fn default_agentic_rag_max_chunk_chars() -> u32 {\n     50_000\n }\n \n #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]\n pub struct LlmConfig {\n",
+    "file": "src/config.rs",
+    "function": {
+      "function_name": "default_agentic_rag_max_turns",
+      "return_type": "-> u32",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 202
+        },
+        "start": {
+          "column": 1,
+          "line": 200
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "src/config.rs:201:5: replace default_agentic_rag_max_turns -> u32 with 1",
+    "package": "context-engine-rs",
+    "replacement": "1",
+    "span": {
+      "end": {
+        "column": 6,
+        "line": 201
+      },
+      "start": {
+        "column": 5,
+        "line": 201
+      }
+    }
+  },
+  {
+    "diff": "--- src/config.rs\n+++ replace default_agentic_rag_max_chunk_chars -> u32 with 0\n@@ -197,17 +197,17 @@\n     true\n }\n \n fn default_agentic_rag_max_turns() -> u32 {\n     9\n }\n \n fn default_agentic_rag_max_chunk_chars() -> u32 {\n-    50_000\n+    0 /* ~ changed by cargo-mutants ~ */\n }\n \n #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]\n pub struct LlmConfig {\n     pub provider: String,\n     pub rerank_model: String,\n     pub api_keys: Vec<String>,\n     /// Minimum chunk line-span eligible for line-range pruning during rerank.\n",
+    "file": "src/config.rs",
+    "function": {
+      "function_name": "default_agentic_rag_max_chunk_chars",
+      "return_type": "-> u32",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 206
+        },
+        "start": {
+          "column": 1,
+          "line": 204
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "src/config.rs:205:5: replace default_agentic_rag_max_chunk_chars -> u32 with 0",
+    "package": "context-engine-rs",
+    "replacement": "0",
+    "span": {
+      "end": {
+        "column": 11,
+        "line": 205
+      },
+      "start": {
+        "column": 5,
+        "line": 205
+      }
+    }
+  },
+  {
+    "diff": "--- src/config.rs\n+++ replace default_agentic_rag_max_chunk_chars -> u32 with 1\n@@ -197,17 +197,17 @@\n     true\n }\n \n fn default_agentic_rag_max_turns() -> u32 {\n     9\n }\n \n fn default_agentic_rag_max_chunk_chars() -> u32 {\n-    50_000\n+    1 /* ~ changed by cargo-mutants ~ */\n }\n \n #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]\n pub struct LlmConfig {\n     pub provider: String,\n     pub rerank_model: String,\n     pub api_keys: Vec<String>,\n     /// Minimum chunk line-span eligible for line-range pruning during rerank.\n",
+    "file": "src/config.rs",
+    "function": {
+      "function_name": "default_agentic_rag_max_chunk_chars",
+      "return_type": "-> u32",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 206
+        },
+        "start": {
+          "column": 1,
+          "line": 204
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "src/config.rs:205:5: replace default_agentic_rag_max_chunk_chars -> u32 with 1",
+    "package": "context-engine-rs",
+    "replacement": "1",
+    "span": {
+      "end": {
+        "column": 11,
+        "line": 205
+      },
+      "start": {
+        "column": 5,
+        "line": 205
+      }
+    }
+  },
+  {
+    "diff": "--- src/config.rs\n+++ replace default_mcp_index_wait_secs -> u64 with 0\n@@ -262,17 +262,17 @@\n             agentic_rag_max_chunk_chars: default_agentic_rag_max_chunk_chars(),\n             openai_base_url: None,\n             openai_force_tool_use: false,\n         }\n     }\n }\n \n fn default_mcp_index_wait_secs() -> u64 {\n-    50\n+    0 /* ~ changed by cargo-mutants ~ */\n }\n \n fn default_mcp_stale_after_days() -> u64 {\n     7\n }\n \n fn default_enabled_mcp_tools() -> Vec<String> {\n     vec![\n",
+    "file": "src/config.rs",
+    "function": {
+      "function_name": "default_mcp_index_wait_secs",
+      "return_type": "-> u64",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 271
+        },
+        "start": {
+          "column": 1,
+          "line": 269
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "src/config.rs:270:5: replace default_mcp_index_wait_secs -> u64 with 0",
+    "package": "context-engine-rs",
+    "replacement": "0",
+    "span": {
+      "end": {
+        "column": 7,
+        "line": 270
+      },
+      "start": {
+        "column": 5,
+        "line": 270
+      }
+    }
+  },
+  {
+    "diff": "--- src/config.rs\n+++ replace default_mcp_index_wait_secs -> u64 with 1\n@@ -262,17 +262,17 @@\n             agentic_rag_max_chunk_chars: default_agentic_rag_max_chunk_chars(),\n             openai_base_url: None,\n             openai_force_tool_use: false,\n         }\n     }\n }\n \n fn default_mcp_index_wait_secs() -> u64 {\n-    50\n+    1 /* ~ changed by cargo-mutants ~ */\n }\n \n fn default_mcp_stale_after_days() -> u64 {\n     7\n }\n \n fn default_enabled_mcp_tools() -> Vec<String> {\n     vec![\n",
+    "file": "src/config.rs",
+    "function": {
+      "function_name": "default_mcp_index_wait_secs",
+      "return_type": "-> u64",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 271
+        },
+        "start": {
+          "column": 1,
+          "line": 269
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "src/config.rs:270:5: replace default_mcp_index_wait_secs -> u64 with 1",
+    "package": "context-engine-rs",
+    "replacement": "1",
+    "span": {
+      "end": {
+        "column": 7,
+        "line": 270
+      },
+      "start": {
+        "column": 5,
+        "line": 270
+      }
+    }
+  },
+  {
+    "diff": "--- src/config.rs\n+++ replace default_mcp_stale_after_days -> u64 with 0\n@@ -266,17 +266,17 @@\n     }\n }\n \n fn default_mcp_index_wait_secs() -> u64 {\n     50\n }\n \n fn default_mcp_stale_after_days() -> u64 {\n-    7\n+    0 /* ~ changed by cargo-mutants ~ */\n }\n \n fn default_enabled_mcp_tools() -> Vec<String> {\n     vec![\n         \"codebase-retrieval\".to_string(),\n         \"file-retrieval\".to_string(),\n     ]\n }\n",
+    "file": "src/config.rs",
+    "function": {
+      "function_name": "default_mcp_stale_after_days",
+      "return_type": "-> u64",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 275
+        },
+        "start": {
+          "column": 1,
+          "line": 273
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "src/config.rs:274:5: replace default_mcp_stale_after_days -> u64 with 0",
+    "package": "context-engine-rs",
+    "replacement": "0",
+    "span": {
+      "end": {
+        "column": 6,
+        "line": 274
+      },
+      "start": {
+        "column": 5,
+        "line": 274
+      }
+    }
+  },
+  {
+    "diff": "--- src/config.rs\n+++ replace default_mcp_stale_after_days -> u64 with 1\n@@ -266,17 +266,17 @@\n     }\n }\n \n fn default_mcp_index_wait_secs() -> u64 {\n     50\n }\n \n fn default_mcp_stale_after_days() -> u64 {\n-    7\n+    1 /* ~ changed by cargo-mutants ~ */\n }\n \n fn default_enabled_mcp_tools() -> Vec<String> {\n     vec![\n         \"codebase-retrieval\".to_string(),\n         \"file-retrieval\".to_string(),\n     ]\n }\n",
+    "file": "src/config.rs",
+    "function": {
+      "function_name": "default_mcp_stale_after_days",
+      "return_type": "-> u64",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 275
+        },
+        "start": {
+          "column": 1,
+          "line": 273
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "src/config.rs:274:5: replace default_mcp_stale_after_days -> u64 with 1",
+    "package": "context-engine-rs",
+    "replacement": "1",
+    "span": {
+      "end": {
+        "column": 6,
+        "line": 274
+      },
+      "start": {
+        "column": 5,
+        "line": 274
+      }
+    }
+  },
+  {
+    "diff": "--- src/config.rs\n+++ replace default_enabled_mcp_tools -> Vec<String> with vec![]\n@@ -270,20 +270,17 @@\n     50\n }\n \n fn default_mcp_stale_after_days() -> u64 {\n     7\n }\n \n fn default_enabled_mcp_tools() -> Vec<String> {\n-    vec![\n-        \"codebase-retrieval\".to_string(),\n-        \"file-retrieval\".to_string(),\n-    ]\n+    vec![] /* ~ changed by cargo-mutants ~ */\n }\n \n /// A plan/key the user has bought (or claimed as a free trial) through the buy\n /// flow. Persisted in settings.json (was browser localStorage) so the list\n /// follows the install across browsers/machines instead of being lost on a new\n /// device. Identity for dedup is `proxy_key` (the same key can be re-claimed\n /// under multiple invoices, e.g. renewals, but is one plan sharing one budget\n /// pool); `invoice` is the display/lookup fallback when no key is present.\n",
+    "file": "src/config.rs",
+    "function": {
+      "function_name": "default_enabled_mcp_tools",
+      "return_type": "-> Vec<String>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 282
+        },
+        "start": {
+          "column": 1,
+          "line": 277
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "src/config.rs:278:5: replace default_enabled_mcp_tools -> Vec<String> with vec![]",
+    "package": "context-engine-rs",
+    "replacement": "vec![]",
+    "span": {
+      "end": {
+        "column": 6,
+        "line": 281
+      },
+      "start": {
+        "column": 5,
+        "line": 278
+      }
+    }
+  },
+  {
+    "diff": "--- src/config.rs\n+++ replace default_enabled_mcp_tools -> Vec<String> with vec![String::new()]\n@@ -270,20 +270,17 @@\n     50\n }\n \n fn default_mcp_stale_after_days() -> u64 {\n     7\n }\n \n fn default_enabled_mcp_tools() -> Vec<String> {\n-    vec![\n-        \"codebase-retrieval\".to_string(),\n-        \"file-retrieval\".to_string(),\n-    ]\n+    vec![String::new()] /* ~ changed by cargo-mutants ~ */\n }\n \n /// A plan/key the user has bought (or claimed as a free trial) through the buy\n /// flow. Persisted in settings.json (was browser localStorage) so the list\n /// follows the install across browsers/machines instead of being lost on a new\n /// device. Identity for dedup is `proxy_key` (the same key can be re-claimed\n /// under multiple invoices, e.g. renewals, but is one plan sharing one budget\n /// pool); `invoice` is the display/lookup fallback when no key is present.\n",
+    "file": "src/config.rs",
+    "function": {
+      "function_name": "default_enabled_mcp_tools",
+      "return_type": "-> Vec<String>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 282
+        },
+        "start": {
+          "column": 1,
+          "line": 277
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "src/config.rs:278:5: replace default_enabled_mcp_tools -> Vec<String> with vec![String::new()]",
+    "package": "context-engine-rs",
+    "replacement": "vec![String::new()]",
+    "span": {
+      "end": {
+        "column": 6,
+        "line": 281
+      },
+      "start": {
+        "column": 5,
+        "line": 278
+      }
+    }
+  },
+  {
+    "diff": "--- src/config.rs\n+++ replace default_enabled_mcp_tools -> Vec<String> with vec![\"xyzzy\".into()]\n@@ -270,20 +270,17 @@\n     50\n }\n \n fn default_mcp_stale_after_days() -> u64 {\n     7\n }\n \n fn default_enabled_mcp_tools() -> Vec<String> {\n-    vec![\n-        \"codebase-retrieval\".to_string(),\n-        \"file-retrieval\".to_string(),\n-    ]\n+    vec![\"xyzzy\".into()] /* ~ changed by cargo-mutants ~ */\n }\n \n /// A plan/key the user has bought (or claimed as a free trial) through the buy\n /// flow. Persisted in settings.json (was browser localStorage) so the list\n /// follows the install across browsers/machines instead of being lost on a new\n /// device. Identity for dedup is `proxy_key` (the same key can be re-claimed\n /// under multiple invoices, e.g. renewals, but is one plan sharing one budget\n /// pool); `invoice` is the display/lookup fallback when no key is present.\n",
+    "file": "src/config.rs",
+    "function": {
+      "function_name": "default_enabled_mcp_tools",
+      "return_type": "-> Vec<String>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 282
+        },
+        "start": {
+          "column": 1,
+          "line": 277
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "src/config.rs:278:5: replace default_enabled_mcp_tools -> Vec<String> with vec![\"xyzzy\".into()]",
+    "package": "context-engine-rs",
+    "replacement": "vec![\"xyzzy\".into()]",
+    "span": {
+      "end": {
+        "column": 6,
+        "line": 281
+      },
+      "start": {
+        "column": 5,
+        "line": 278
+      }
+    }
+  },
+  {
+    "diff": "--- src/config.rs\n+++ replace Settings::repo_generation -> u32 with 0\n@@ -454,20 +454,17 @@\n }\n \n impl Settings {\n     /// Generation counter for `repo` (0 if never deleted). The lookup key is the\n     /// normalized repo path so it matches how `repo_dbs`, statuses, and the delete\n     /// handler key the same repo. Generation 0 → legacy `<data_dir>/rocksdb/<name>`\n     /// path; ≥ 1 → `<data_dir>/rocksdb/<gen>/<name>`.\n     pub fn repo_generation(&self, repo: &str) -> u32 {\n-        self.repo_generations\n-            .get(&crate::store::normalize_repo_path(repo))\n-            .copied()\n-            .unwrap_or(0)\n+        0 /* ~ changed by cargo-mutants ~ */\n     }\n }\n \n // ─── ConfigError ───────────────────────────────────────────────────────────\n \n #[derive(Debug)]\n pub enum ConfigError {\n     /// I/O failure (read / write / create_dir). `op` carries human-readable context.\n",
+    "file": "src/config.rs",
+    "function": {
+      "function_name": "Settings::repo_generation",
+      "return_type": "-> u32",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 466
+        },
+        "start": {
+          "column": 5,
+          "line": 457
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "src/config.rs:462:9: replace Settings::repo_generation -> u32 with 0",
+    "package": "context-engine-rs",
+    "replacement": "0",
+    "span": {
+      "end": {
+        "column": 26,
+        "line": 465
+      },
+      "start": {
+        "column": 9,
+        "line": 462
+      }
+    }
+  },
+  {
+    "diff": "--- src/config.rs\n+++ replace Settings::repo_generation -> u32 with 1\n@@ -454,20 +454,17 @@\n }\n \n impl Settings {\n     /// Generation counter for `repo` (0 if never deleted). The lookup key is the\n     /// normalized repo path so it matches how `repo_dbs`, statuses, and the delete\n     /// handler key the same repo. Generation 0 → legacy `<data_dir>/rocksdb/<name>`\n     /// path; ≥ 1 → `<data_dir>/rocksdb/<gen>/<name>`.\n     pub fn repo_generation(&self, repo: &str) -> u32 {\n-        self.repo_generations\n-            .get(&crate::store::normalize_repo_path(repo))\n-            .copied()\n-            .unwrap_or(0)\n+        1 /* ~ changed by cargo-mutants ~ */\n     }\n }\n \n // ─── ConfigError ───────────────────────────────────────────────────────────\n \n #[derive(Debug)]\n pub enum ConfigError {\n     /// I/O failure (read / write / create_dir). `op` carries human-readable context.\n",
+    "file": "src/config.rs",
+    "function": {
+      "function_name": "Settings::repo_generation",
+      "return_type": "-> u32",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 466
+        },
+        "start": {
+          "column": 5,
+          "line": 457
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "src/config.rs:462:9: replace Settings::repo_generation -> u32 with 1",
+    "package": "context-engine-rs",
+    "replacement": "1",
+    "span": {
+      "end": {
+        "column": 26,
+        "line": 465
+      },
+      "start": {
+        "column": 9,
+        "line": 462
+      }
+    }
+  },
+  {
+    "diff": "--- src/config.rs\n+++ replace <impl std::fmt::Display for ConfigError>::fmt -> std::fmt::Result with Ok(Default::default())\n@@ -477,30 +477,17 @@\n     /// The file was written by a newer binary — this binary cannot read it safely.\n     VersionTooNew { found: u32 },\n     /// A migration step failed.\n     MigrationFailed { from: u32, to: u32, detail: String },\n }\n \n impl std::fmt::Display for ConfigError {\n     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n-        match self {\n-            ConfigError::Io { op, source } => write!(f, \"failed to {op} settings: {source}\"),\n-            ConfigError::Parse(e) => {\n-                write!(f, \"settings.json is corrupt: {e}; fix or delete the file\")\n-            }\n-            ConfigError::VersionTooNew { found } => write!(\n-                f,\n-                \"settings.json was written by a newer version of context-engine (version {found}); \\\n-                 upgrade the binary or restore an older settings.json\"\n-            ),\n-            ConfigError::MigrationFailed { from, to, detail } => {\n-                write!(f, \"migration from v{from} to v{to} failed: {detail}\")\n-            }\n-        }\n+        Ok(Default::default()) /* ~ changed by cargo-mutants ~ */\n     }\n }\n \n impl std::error::Error for ConfigError {}\n \n // ─── Path helpers ──────────────────────────────────────────────────────────\n \n /// Return the path of `settings.json` under `home_dir`.\n",
+    "file": "src/config.rs",
+    "function": {
+      "function_name": "<impl std::fmt::Display for ConfigError>::fmt",
+      "return_type": "-> std::fmt::Result",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 499
+        },
+        "start": {
+          "column": 5,
+          "line": 484
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "src/config.rs:485:9: replace <impl std::fmt::Display for ConfigError>::fmt -> std::fmt::Result with Ok(Default::default())",
+    "package": "context-engine-rs",
+    "replacement": "Ok(Default::default())",
+    "span": {
+      "end": {
+        "column": 10,
+        "line": 498
+      },
+      "start": {
+        "column": 9,
+        "line": 485
+      }
+    }
+  },
+  {
+    "diff": "--- src/config.rs\n+++ replace config_path -> PathBuf with Default::default()\n@@ -505,20 +505,17 @@\n \n /// Return the path of `settings.json` under `home_dir`.\n ///\n /// settings.json's location is intentionally fixed (NOT controlled by\n /// `Settings.data_dir`): the data_dir field itself lives inside settings.json,\n /// so deriving its location from the field would be circular. See the bootstrap\n /// notes on `Settings.data_dir`.\n pub fn config_path(home_dir: &Path) -> PathBuf {\n-    home_dir\n-        .join(\".vibervn\")\n-        .join(\"context-engine\")\n-        .join(\"settings.json\")\n+    Default::default() /* ~ changed by cargo-mutants ~ */\n }\n \n /// Return the builtin-default data directory under `home_dir`\n /// (`~/.vibervn/context-engine`).\n ///\n /// Used as the lowest-precedence fallback in boot resolution when no CLI flag,\n /// env var, or persisted `Settings.data_dir` is set.\n pub fn default_data_dir(home_dir: &Path) -> PathBuf {\n",
+    "file": "src/config.rs",
+    "function": {
+      "function_name": "config_path",
+      "return_type": "-> PathBuf",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 517
+        },
+        "start": {
+          "column": 1,
+          "line": 506
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "src/config.rs:513:5: replace config_path -> PathBuf with Default::default()",
+    "package": "context-engine-rs",
+    "replacement": "Default::default()",
+    "span": {
+      "end": {
+        "column": 31,
+        "line": 516
+      },
+      "start": {
+        "column": 5,
+        "line": 513
+      }
+    }
+  },
+  {
+    "diff": "--- src/config.rs\n+++ replace default_data_dir -> PathBuf with Default::default()\n@@ -517,17 +517,17 @@\n }\n \n /// Return the builtin-default data directory under `home_dir`\n /// (`~/.vibervn/context-engine`).\n ///\n /// Used as the lowest-precedence fallback in boot resolution when no CLI flag,\n /// env var, or persisted `Settings.data_dir` is set.\n pub fn default_data_dir(home_dir: &Path) -> PathBuf {\n-    home_dir.join(\".vibervn\").join(\"context-engine\")\n+    Default::default() /* ~ changed by cargo-mutants ~ */\n }\n \n /// Return the default embedding-cache root under `home_dir`\n /// (`~/.vibervn/context-engine/embeddings`).\n ///\n /// Used as the lowest-precedence fallback in boot resolution when no CLI flag,\n /// env var, or persisted `Settings.embeddings_dir` is set. Anchored to\n /// `home_dir` (NOT the resolved `data_dir`) on purpose: the content-addressed\n",
+    "file": "src/config.rs",
+    "function": {
+      "function_name": "default_data_dir",
+      "return_type": "-> PathBuf",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 526
+        },
+        "start": {
+          "column": 1,
+          "line": 519
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "src/config.rs:525:5: replace default_data_dir -> PathBuf with Default::default()",
+    "package": "context-engine-rs",
+    "replacement": "Default::default()",
+    "span": {
+      "end": {
+        "column": 53,
+        "line": 525
+      },
+      "start": {
+        "column": 5,
+        "line": 525
+      }
+    }
+  },
+  {
+    "diff": "--- src/config.rs\n+++ replace default_embeddings_dir -> PathBuf with Default::default()\n@@ -532,17 +532,17 @@\n /// env var, or persisted `Settings.embeddings_dir` is set. Anchored to\n /// `home_dir` (NOT the resolved `data_dir`) on purpose: the content-addressed\n /// cache is concurrency-safe and meant to be shared, so multiple instances\n /// running with different `--data-dir` values share ONE cache by default —\n /// identical chunks are embedded once. A pure default install (no flags) still\n /// lands at `~/.vibervn/context-engine/embeddings`, byte-identical to the\n /// historical layout, because `default_data_dir(home)` is the same base.\n pub fn default_embeddings_dir(home_dir: &Path) -> PathBuf {\n-    default_data_dir(home_dir).join(\"embeddings\")\n+    Default::default() /* ~ changed by cargo-mutants ~ */\n }\n \n // ─── Atomic write ──────────────────────────────────────────────────────────\n \n /// Write `settings` atomically to `target`.\n ///\n /// Sequence:\n /// 1. `create_dir_all(parent)` — idempotent, race-safe.\n",
+    "file": "src/config.rs",
+    "function": {
+      "function_name": "default_embeddings_dir",
+      "return_type": "-> PathBuf",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 541
+        },
+        "start": {
+          "column": 1,
+          "line": 528
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "src/config.rs:540:5: replace default_embeddings_dir -> PathBuf with Default::default()",
+    "package": "context-engine-rs",
+    "replacement": "Default::default()",
+    "span": {
+      "end": {
+        "column": 50,
+        "line": 540
+      },
+      "start": {
+        "column": 5,
+        "line": 540
+      }
+    }
+  },
+  {
+    "diff": "--- src/config.rs\n+++ replace write_settings_atomic -> Result<(), ConfigError> with Ok(())\n@@ -552,71 +552,17 @@\n /// 5. `temp.persist(target)` — atomic rename.\n /// 6. (Unix) Reassert 0o600 **after** persist — closes the rename-onto-existing edge case\n ///    where the previous target's permissions might have been preserved by the kernel.\n ///\n /// Windows: no permission manipulation. Files inherit the `%USERPROFILE%` NTFS ACLs\n /// (owner + SYSTEM + Administrators by default), which is threat-model-equivalent to\n /// Unix 0o600. This is intentional, not an oversight.\n pub fn write_settings_atomic(target: &Path, settings: &Settings) -> Result<(), ConfigError> {\n-    let parent = target.parent().expect(\"settings path must have a parent\");\n-\n-    // 1. Ensure directory exists.\n-    fs::create_dir_all(parent).map_err(|e| ConfigError::Io {\n-        op: \"create directory for\",\n-        source: e,\n-    })?;\n-\n-    // 2. Tempfile in same directory (same filesystem → atomic rename).\n-    let temp = NamedTempFile::new_in(parent).map_err(|e| ConfigError::Io {\n-        op: \"create tempfile for\",\n-        source: e,\n-    })?;\n-\n-    // 3. Serialize and write.\n-    let json = serde_json::to_string_pretty(settings)\n-        .map_err(ConfigError::Parse)?;\n-\n-    fs::write(temp.path(), json.as_bytes()).map_err(|e| ConfigError::Io {\n-        op: \"write tempfile for\",\n-        source: e,\n-    })?;\n-\n-    // 4. (Unix only) Set 0o600 before persist.\n-    #[cfg(unix)]\n-    {\n-        use std::os::unix::fs::PermissionsExt;\n-        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o600)).map_err(|e| {\n-            ConfigError::Io {\n-                op: \"set permissions on tempfile for\",\n-                source: e,\n-            }\n-        })?;\n-    }\n-\n-    // 5. Atomic rename.\n-    let target_path = target.to_path_buf();\n-    temp.persist(&target_path).map_err(|e| ConfigError::Io {\n-        op: \"persist (rename) tempfile to\",\n-        source: e.error,\n-    })?;\n-\n-    // 6. (Unix only) Reassert 0o600 after persist.\n-    #[cfg(unix)]\n-    {\n-        use std::os::unix::fs::PermissionsExt;\n-        fs::set_permissions(&target_path, fs::Permissions::from_mode(0o600)).map_err(|e| {\n-            ConfigError::Io {\n-                op: \"set permissions after persist for\",\n-                source: e,\n-            }\n-        })?;\n-    }\n-\n-    Ok(())\n+    Ok(()) /* ~ changed by cargo-mutants ~ */\n }\n \n // ─── Load with migration ────────────────────────────────────────────────────\n \n /// Ensure the config directory exists, bootstrap a default `settings.json` if absent,\n /// run migrations if necessary, and return the current `Settings`.\n pub fn ensure_dir_and_load(home_dir: &Path) -> Result<Settings, ConfigError> {\n     let path = config_path(home_dir);\n",
+    "file": "src/config.rs",
+    "function": {
+      "function_name": "write_settings_atomic",
+      "return_type": "-> Result<(), ConfigError>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 615
+        },
+        "start": {
+          "column": 1,
+          "line": 545
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "src/config.rs:560:5: replace write_settings_atomic -> Result<(), ConfigError> with Ok(())",
+    "package": "context-engine-rs",
+    "replacement": "Ok(())",
+    "span": {
+      "end": {
+        "column": 11,
+        "line": 614
+      },
+      "start": {
+        "column": 5,
+        "line": 560
+      }
+    }
+  },
+  {
+    "diff": "--- src/config.rs\n+++ replace ensure_dir_and_load -> Result<Settings, ConfigError> with Ok(Default::default())\n@@ -614,108 +614,17 @@\n     Ok(())\n }\n \n // ─── Load with migration ────────────────────────────────────────────────────\n \n /// Ensure the config directory exists, bootstrap a default `settings.json` if absent,\n /// run migrations if necessary, and return the current `Settings`.\n pub fn ensure_dir_and_load(home_dir: &Path) -> Result<Settings, ConfigError> {\n-    let path = config_path(home_dir);\n-    let parent = path.parent().expect(\"settings path must have a parent\");\n-\n-    // 1. Ensure directory.\n-    fs::create_dir_all(parent).map_err(|e| ConfigError::Io {\n-        op: \"create directory for\",\n-        source: e,\n-    })?;\n-\n-    // 2. Bootstrap default file if absent.\n-    if !path.exists() {\n-        write_settings_atomic(&path, &Settings::default())?;\n-    }\n-\n-    // 3. Read file.\n-    let raw = fs::read_to_string(&path).map_err(|e| ConfigError::Io {\n-        op: \"read\",\n-        source: e,\n-    })?;\n-\n-    // 4. Parse as generic Value first (needed for migration).\n-    let mut value: Value = serde_json::from_str(&raw).map_err(ConfigError::Parse)?;\n-\n-    // 5. Migration logic.\n-    let file_version = value\n-        .get(\"version\")\n-        .and_then(|v| v.as_u64())\n-        .map(|v| v as u32)\n-        .unwrap_or(1); // missing → treat as v1 (forward-compat for hand-written files)\n-\n-    let settings = if file_version == 0 {\n-        return Err(ConfigError::MigrationFailed {\n-            from: 0,\n-            to: 1,\n-            detail: \"version 0 is not a valid schema version\".to_string(),\n-        });\n-    } else if file_version == CURRENT_VERSION {\n-        serde_json::from_value::<Settings>(value).map_err(ConfigError::Parse)?\n-    } else if file_version > CURRENT_VERSION {\n-        return Err(ConfigError::VersionTooNew { found: file_version });\n-    } else {\n-        // Run migrations from file_version to CURRENT_VERSION.\n-        for step in file_version..CURRENT_VERSION {\n-            let idx = (step - 1) as usize; // migration index 0 = v1→v2\n-            let migrate = MIGRATIONS.get(idx).ok_or_else(|| ConfigError::MigrationFailed {\n-                from: step,\n-                to: step + 1,\n-                detail: format!(\"no migration registered for v{step}→v{}\", step + 1),\n-            })?;\n-            value = migrate(value).map_err(|e| match e {\n-                ConfigError::MigrationFailed { .. } => e,\n-                other => ConfigError::MigrationFailed {\n-                    from: step,\n-                    to: step + 1,\n-                    detail: other.to_string(),\n-                },\n-            })?;\n-        }\n-\n-        let mut s = serde_json::from_value::<Settings>(value).map_err(ConfigError::Parse)?;\n-        // Stamp the migrated content with CURRENT_VERSION before persisting —\n-        // otherwise the file's `version` field still reads as the OLD version\n-        // and the next load would re-run the migration. Each migration\n-        // function focuses on field-shape changes only; the version bump is\n-        // applied here so it stays in lockstep with CURRENT_VERSION even when\n-        // a migration is a no-op stamp like v1→v2.\n-        s.version = CURRENT_VERSION;\n-        // Re-save with the migrated content.\n-        write_settings_atomic(&path, &s)?;\n-        s\n-    };\n-\n-    // Normalize repo paths (OS-native separators + case-fold on Windows) and\n-    // deduplicate. Handles pre-existing mixed-case entries from before the\n-    // normalization fix — e.g. both \"D:\\Projects\\Foo\" and \"d:\\projects\\foo\" collapse\n-    // to a single entry. Persist the cleaned list so duplicates don't reappear.\n-    let mut settings = settings;\n-    let original_repos = settings.repos.clone();\n-    {\n-        let mut seen = std::collections::HashSet::new();\n-        settings.repos = settings\n-            .repos\n-            .iter()\n-            .map(|r| crate::store::normalize_repo_path(r))\n-            .filter(|r| seen.insert(r.clone()))\n-            .collect();\n-    }\n-    if settings.repos != original_repos {\n-        let _ = write_settings_atomic(&path, &settings);\n-    }\n-\n-    Ok(settings)\n+    Ok(Default::default()) /* ~ changed by cargo-mutants ~ */\n }\n \n /// Ensure `settings.machine_id` is `Some(...)` and persisted on disk. Called\n /// once at boot, after `ensure_dir_and_load`. Mutates `settings` in place.\n ///\n /// First boot (or upgrades from a settings file written before this field\n /// existed): compute `sha256(MACHINE_ID_SALT ‖ \\0 ‖ hardware_uid)` as hex,\n /// matching the legacy free-trial claim formula so machines that already\n",
+    "file": "src/config.rs",
+    "function": {
+      "function_name": "ensure_dir_and_load",
+      "return_type": "-> Result<Settings, ConfigError>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 714
+        },
+        "start": {
+          "column": 1,
+          "line": 619
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "src/config.rs:622:5: replace ensure_dir_and_load -> Result<Settings, ConfigError> with Ok(Default::default())",
+    "package": "context-engine-rs",
+    "replacement": "Ok(Default::default())",
+    "span": {
+      "end": {
+        "column": 17,
+        "line": 713
+      },
+      "start": {
+        "column": 5,
+        "line": 622
+      }
+    }
+  },
+  {
+    "diff": "--- src/config.rs\n+++ delete ! in ensure_dir_and_load\n@@ -624,17 +624,17 @@\n \n     // 1. Ensure directory.\n     fs::create_dir_all(parent).map_err(|e| ConfigError::Io {\n         op: \"create directory for\",\n         source: e,\n     })?;\n \n     // 2. Bootstrap default file if absent.\n-    if !path.exists() {\n+    if  /* ~ changed by cargo-mutants ~ */path.exists() {\n         write_settings_atomic(&path, &Settings::default())?;\n     }\n \n     // 3. Read file.\n     let raw = fs::read_to_string(&path).map_err(|e| ConfigError::Io {\n         op: \"read\",\n         source: e,\n     })?;\n",
+    "file": "src/config.rs",
+    "function": {
+      "function_name": "ensure_dir_and_load",
+      "return_type": "-> Result<Settings, ConfigError>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 714
+        },
+        "start": {
+          "column": 1,
+          "line": 619
+        }
+      }
+    },
+    "genre": "UnaryOperator",
+    "name": "src/config.rs:632:8: delete ! in ensure_dir_and_load",
+    "package": "context-engine-rs",
+    "replacement": "",
+    "span": {
+      "end": {
+        "column": 9,
+        "line": 632
+      },
+      "start": {
+        "column": 8,
+        "line": 632
+      }
+    }
+  },
+  {
+    "diff": "--- src/config.rs\n+++ replace == with != in ensure_dir_and_load\n@@ -644,17 +644,17 @@\n \n     // 5. Migration logic.\n     let file_version = value\n         .get(\"version\")\n         .and_then(|v| v.as_u64())\n         .map(|v| v as u32)\n         .unwrap_or(1); // missing → treat as v1 (forward-compat for hand-written files)\n \n-    let settings = if file_version == 0 {\n+    let settings = if file_version != /* ~ changed by cargo-mutants ~ */ 0 {\n         return Err(ConfigError::MigrationFailed {\n             from: 0,\n             to: 1,\n             detail: \"version 0 is not a valid schema version\".to_string(),\n         });\n     } else if file_version == CURRENT_VERSION {\n         serde_json::from_value::<Settings>(value).map_err(ConfigError::Parse)?\n     } else if file_version > CURRENT_VERSION {\n",
+    "file": "src/config.rs",
+    "function": {
+      "function_name": "ensure_dir_and_load",
+      "return_type": "-> Result<Settings, ConfigError>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 714
+        },
+        "start": {
+          "column": 1,
+          "line": 619
+        }
+      }
+    },
+    "genre": "BinaryOperator",
+    "name": "src/config.rs:652:36: replace == with != in ensure_dir_and_load",
+    "package": "context-engine-rs",
+    "replacement": "!=",
+    "span": {
+      "end": {
+        "column": 38,
+        "line": 652
+      },
+      "start": {
+        "column": 36,
+        "line": 652
+      }
+    }
+  },
+  {
+    "diff": "--- src/config.rs\n+++ replace == with != in ensure_dir_and_load\n@@ -650,17 +650,17 @@\n         .unwrap_or(1); // missing → treat as v1 (forward-compat for hand-written files)\n \n     let settings = if file_version == 0 {\n         return Err(ConfigError::MigrationFailed {\n             from: 0,\n             to: 1,\n             detail: \"version 0 is not a valid schema version\".to_string(),\n         });\n-    } else if file_version == CURRENT_VERSION {\n+    } else if file_version != /* ~ changed by cargo-mutants ~ */ CURRENT_VERSION {\n         serde_json::from_value::<Settings>(value).map_err(ConfigError::Parse)?\n     } else if file_version > CURRENT_VERSION {\n         return Err(ConfigError::VersionTooNew { found: file_version });\n     } else {\n         // Run migrations from file_version to CURRENT_VERSION.\n         for step in file_version..CURRENT_VERSION {\n             let idx = (step - 1) as usize; // migration index 0 = v1→v2\n             let migrate = MIGRATIONS.get(idx).ok_or_else(|| ConfigError::MigrationFailed {\n",
+    "file": "src/config.rs",
+    "function": {
+      "function_name": "ensure_dir_and_load",
+      "return_type": "-> Result<Settings, ConfigError>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 714
+        },
+        "start": {
+          "column": 1,
+          "line": 619
+        }
+      }
+    },
+    "genre": "BinaryOperator",
+    "name": "src/config.rs:658:28: replace == with != in ensure_dir_and_load",
+    "package": "context-engine-rs",
+    "replacement": "!=",
+    "span": {
+      "end": {
+        "column": 30,
+        "line": 658
+      },
+      "start": {
+        "column": 28,
+        "line": 658
+      }
+    }
+  },
+  {
+    "diff": "--- src/config.rs\n+++ replace > with == in ensure_dir_and_load\n@@ -652,17 +652,17 @@\n     let settings = if file_version == 0 {\n         return Err(ConfigError::MigrationFailed {\n             from: 0,\n             to: 1,\n             detail: \"version 0 is not a valid schema version\".to_string(),\n         });\n     } else if file_version == CURRENT_VERSION {\n         serde_json::from_value::<Settings>(value).map_err(ConfigError::Parse)?\n-    } else if file_version > CURRENT_VERSION {\n+    } else if file_version == /* ~ changed by cargo-mutants ~ */ CURRENT_VERSION {\n         return Err(ConfigError::VersionTooNew { found: file_version });\n     } else {\n         // Run migrations from file_version to CURRENT_VERSION.\n         for step in file_version..CURRENT_VERSION {\n             let idx = (step - 1) as usize; // migration index 0 = v1→v2\n             let migrate = MIGRATIONS.get(idx).ok_or_else(|| ConfigError::MigrationFailed {\n                 from: step,\n                 to: step + 1,\n",
+    "file": "src/config.rs",
+    "function": {
+      "function_name": "ensure_dir_and_load",
+      "return_type": "-> Result<Settings, ConfigError>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 714
+        },
+        "start": {
+          "column": 1,
+          "line": 619
+        }
+      }
+    },
+    "genre": "BinaryOperator",
+    "name": "src/config.rs:660:28: replace > with == in ensure_dir_and_load",
+    "package": "context-engine-rs",
+    "replacement": "==",
+    "span": {
+      "end": {
+        "column": 29,
+        "line": 660
+      },
+      "start": {
+        "column": 28,
+        "line": 660
+      }
+    }
+  },
+  {
+    "diff": "--- src/config.rs\n+++ replace > with < in ensure_dir_and_load\n@@ -652,17 +652,17 @@\n     let settings = if file_version == 0 {\n         return Err(ConfigError::MigrationFailed {\n             from: 0,\n             to: 1,\n             detail: \"version 0 is not a valid schema version\".to_string(),\n         });\n     } else if file_version == CURRENT_VERSION {\n         serde_json::from_value::<Settings>(value).map_err(ConfigError::Parse)?\n-    } else if file_version > CURRENT_VERSION {\n+    } else if file_version < /* ~ changed by cargo-mutants ~ */ CURRENT_VERSION {\n         return Err(ConfigError::VersionTooNew { found: file_version });\n     } else {\n         // Run migrations from file_version to CURRENT_VERSION.\n         for step in file_version..CURRENT_VERSION {\n             let idx = (step - 1) as usize; // migration index 0 = v1→v2\n             let migrate = MIGRATIONS.get(idx).ok_or_else(|| ConfigError::MigrationFailed {\n                 from: step,\n                 to: step + 1,\n",
+    "file": "src/config.rs",
+    "function": {
+      "function_name": "ensure_dir_and_load",
+      "return_type": "-> Result<Settings, ConfigError>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 714
+        },
+        "start": {
+          "column": 1,
+          "line": 619
+        }
+      }
+    },
+    "genre": "BinaryOperator",
+    "name": "src/config.rs:660:28: replace > with < in ensure_dir_and_load",
+    "package": "context-engine-rs",
+    "replacement": "<",
+    "span": {
+      "end": {
+        "column": 29,
+        "line": 660
+      },
+      "start": {
+        "column": 28,
+        "line": 660
+      }
+    }
+  },
+  {
+    "diff": "--- src/config.rs\n+++ replace > with >= in ensure_dir_and_load\n@@ -652,17 +652,17 @@\n     let settings = if file_version == 0 {\n         return Err(ConfigError::MigrationFailed {\n             from: 0,\n             to: 1,\n             detail: \"version 0 is not a valid schema version\".to_string(),\n         });\n     } else if file_version == CURRENT_VERSION {\n         serde_json::from_value::<Settings>(value).map_err(ConfigError::Parse)?\n-    } else if file_version > CURRENT_VERSION {\n+    } else if file_version >= /* ~ changed by cargo-mutants ~ */ CURRENT_VERSION {\n         return Err(ConfigError::VersionTooNew { found: file_version });\n     } else {\n         // Run migrations from file_version to CURRENT_VERSION.\n         for step in file_version..CURRENT_VERSION {\n             let idx = (step - 1) as usize; // migration index 0 = v1→v2\n             let migrate = MIGRATIONS.get(idx).ok_or_else(|| ConfigError::MigrationFailed {\n                 from: step,\n                 to: step + 1,\n",
+    "file": "src/config.rs",
+    "function": {
+      "function_name": "ensure_dir_and_load",
+      "return_type": "-> Result<Settings, ConfigError>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 714
+        },
+        "start": {
+          "column": 1,
+          "line": 619
+        }
+      }
+    },
+    "genre": "BinaryOperator",
+    "name": "src/config.rs:660:28: replace > with >= in ensure_dir_and_load",
+    "package": "context-engine-rs",
+    "replacement": ">=",
+    "span": {
+      "end": {
+        "column": 29,
+        "line": 660
+      },
+      "start": {
+        "column": 28,
+        "line": 660
+      }
+    }
+  },
+  {
+    "diff": "--- src/config.rs\n+++ replace - with + in ensure_dir_and_load\n@@ -657,17 +657,17 @@\n         });\n     } else if file_version == CURRENT_VERSION {\n         serde_json::from_value::<Settings>(value).map_err(ConfigError::Parse)?\n     } else if file_version > CURRENT_VERSION {\n         return Err(ConfigError::VersionTooNew { found: file_version });\n     } else {\n         // Run migrations from file_version to CURRENT_VERSION.\n         for step in file_version..CURRENT_VERSION {\n-            let idx = (step - 1) as usize; // migration index 0 = v1→v2\n+            let idx = (step + /* ~ changed by cargo-mutants ~ */ 1) as usize; // migration index 0 = v1→v2\n             let migrate = MIGRATIONS.get(idx).ok_or_else(|| ConfigError::MigrationFailed {\n                 from: step,\n                 to: step + 1,\n                 detail: format!(\"no migration registered for v{step}→v{}\", step + 1),\n             })?;\n             value = migrate(value).map_err(|e| match e {\n                 ConfigError::MigrationFailed { .. } => e,\n                 other => ConfigError::MigrationFailed {\n",
+    "file": "src/config.rs",
+    "function": {
+      "function_name": "ensure_dir_and_load",
+      "return_type": "-> Result<Settings, ConfigError>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 714
+        },
+        "start": {
+          "column": 1,
+          "line": 619
+        }
+      }
+    },
+    "genre": "BinaryOperator",
+    "name": "src/config.rs:665:29: replace - with + in ensure_dir_and_load",
+    "package": "context-engine-rs",
+    "replacement": "+",
+    "span": {
+      "end": {
+        "column": 30,
+        "line": 665
+      },
+      "start": {
+        "column": 29,
+        "line": 665
+      }
+    }
+  },
+  {
+    "diff": "--- src/config.rs\n+++ replace - with / in ensure_dir_and_load\n@@ -657,17 +657,17 @@\n         });\n     } else if file_version == CURRENT_VERSION {\n         serde_json::from_value::<Settings>(value).map_err(ConfigError::Parse)?\n     } else if file_version > CURRENT_VERSION {\n         return Err(ConfigError::VersionTooNew { found: file_version });\n     } else {\n         // Run migrations from file_version to CURRENT_VERSION.\n         for step in file_version..CURRENT_VERSION {\n-            let idx = (step - 1) as usize; // migration index 0 = v1→v2\n+            let idx = (step / /* ~ changed by cargo-mutants ~ */ 1) as usize; // migration index 0 = v1→v2\n             let migrate = MIGRATIONS.get(idx).ok_or_else(|| ConfigError::MigrationFailed {\n                 from: step,\n                 to: step + 1,\n                 detail: format!(\"no migration registered for v{step}→v{}\", step + 1),\n             })?;\n             value = migrate(value).map_err(|e| match e {\n                 ConfigError::MigrationFailed { .. } => e,\n                 other => ConfigError::MigrationFailed {\n",
+    "file": "src/config.rs",
+    "function": {
+      "function_name": "ensure_dir_and_load",
+      "return_type": "-> Result<Settings, ConfigError>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 714
+        },
+        "start": {
+          "column": 1,
+          "line": 619
+        }
+      }
+    },
+    "genre": "BinaryOperator",
+    "name": "src/config.rs:665:29: replace - with / in ensure_dir_and_load",
+    "package": "context-engine-rs",
+    "replacement": "/",
+    "span": {
+      "end": {
+        "column": 30,
+        "line": 665
+      },
+      "start": {
+        "column": 29,
+        "line": 665
+      }
+    }
+  },
+  {
+    "diff": "--- src/config.rs\n+++ replace + with - in ensure_dir_and_load\n@@ -660,17 +660,17 @@\n     } else if file_version > CURRENT_VERSION {\n         return Err(ConfigError::VersionTooNew { found: file_version });\n     } else {\n         // Run migrations from file_version to CURRENT_VERSION.\n         for step in file_version..CURRENT_VERSION {\n             let idx = (step - 1) as usize; // migration index 0 = v1→v2\n             let migrate = MIGRATIONS.get(idx).ok_or_else(|| ConfigError::MigrationFailed {\n                 from: step,\n-                to: step + 1,\n+                to: step - /* ~ changed by cargo-mutants ~ */ 1,\n                 detail: format!(\"no migration registered for v{step}→v{}\", step + 1),\n             })?;\n             value = migrate(value).map_err(|e| match e {\n                 ConfigError::MigrationFailed { .. } => e,\n                 other => ConfigError::MigrationFailed {\n                     from: step,\n                     to: step + 1,\n                     detail: other.to_string(),\n",
+    "file": "src/config.rs",
+    "function": {
+      "function_name": "ensure_dir_and_load",
+      "return_type": "-> Result<Settings, ConfigError>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 714
+        },
+        "start": {
+          "column": 1,
+          "line": 619
+        }
+      }
+    },
+    "genre": "BinaryOperator",
+    "name": "src/config.rs:668:26: replace + with - in ensure_dir_and_load",
+    "package": "context-engine-rs",
+    "replacement": "-",
+    "span": {
+      "end": {
+        "column": 27,
+        "line": 668
+      },
+      "start": {
+        "column": 26,
+        "line": 668
+      }
+    }
+  },
+  {
+    "diff": "--- src/config.rs\n+++ replace + with * in ensure_dir_and_load\n@@ -660,17 +660,17 @@\n     } else if file_version > CURRENT_VERSION {\n         return Err(ConfigError::VersionTooNew { found: file_version });\n     } else {\n         // Run migrations from file_version to CURRENT_VERSION.\n         for step in file_version..CURRENT_VERSION {\n             let idx = (step - 1) as usize; // migration index 0 = v1→v2\n             let migrate = MIGRATIONS.get(idx).ok_or_else(|| ConfigError::MigrationFailed {\n                 from: step,\n-                to: step + 1,\n+                to: step * /* ~ changed by cargo-mutants ~ */ 1,\n                 detail: format!(\"no migration registered for v{step}→v{}\", step + 1),\n             })?;\n             value = migrate(value).map_err(|e| match e {\n                 ConfigError::MigrationFailed { .. } => e,\n                 other => ConfigError::MigrationFailed {\n                     from: step,\n                     to: step + 1,\n                     detail: other.to_string(),\n",
+    "file": "src/config.rs",
+    "function": {
+      "function_name": "ensure_dir_and_load",
+      "return_type": "-> Result<Settings, ConfigError>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 714
+        },
+        "start": {
+          "column": 1,
+          "line": 619
+        }
+      }
+    },
+    "genre": "BinaryOperator",
+    "name": "src/config.rs:668:26: replace + with * in ensure_dir_and_load",
+    "package": "context-engine-rs",
+    "replacement": "*",
+    "span": {
+      "end": {
+        "column": 27,
+        "line": 668
+      },
+      "start": {
+        "column": 26,
+        "line": 668
+      }
+    }
+  },
+  {
+    "diff": "--- src/config.rs\n+++ replace + with - in ensure_dir_and_load\n@@ -667,17 +667,17 @@\n                 from: step,\n                 to: step + 1,\n                 detail: format!(\"no migration registered for v{step}→v{}\", step + 1),\n             })?;\n             value = migrate(value).map_err(|e| match e {\n                 ConfigError::MigrationFailed { .. } => e,\n                 other => ConfigError::MigrationFailed {\n                     from: step,\n-                    to: step + 1,\n+                    to: step - /* ~ changed by cargo-mutants ~ */ 1,\n                     detail: other.to_string(),\n                 },\n             })?;\n         }\n \n         let mut s = serde_json::from_value::<Settings>(value).map_err(ConfigError::Parse)?;\n         // Stamp the migrated content with CURRENT_VERSION before persisting —\n         // otherwise the file's `version` field still reads as the OLD version\n",
+    "file": "src/config.rs",
+    "function": {
+      "function_name": "ensure_dir_and_load",
+      "return_type": "-> Result<Settings, ConfigError>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 714
+        },
+        "start": {
+          "column": 1,
+          "line": 619
+        }
+      }
+    },
+    "genre": "BinaryOperator",
+    "name": "src/config.rs:675:30: replace + with - in ensure_dir_and_load",
+    "package": "context-engine-rs",
+    "replacement": "-",
+    "span": {
+      "end": {
+        "column": 31,
+        "line": 675
+      },
+      "start": {
+        "column": 30,
+        "line": 675
+      }
+    }
+  },
+  {
+    "diff": "--- src/config.rs\n+++ replace + with * in ensure_dir_and_load\n@@ -667,17 +667,17 @@\n                 from: step,\n                 to: step + 1,\n                 detail: format!(\"no migration registered for v{step}→v{}\", step + 1),\n             })?;\n             value = migrate(value).map_err(|e| match e {\n                 ConfigError::MigrationFailed { .. } => e,\n                 other => ConfigError::MigrationFailed {\n                     from: step,\n-                    to: step + 1,\n+                    to: step * /* ~ changed by cargo-mutants ~ */ 1,\n                     detail: other.to_string(),\n                 },\n             })?;\n         }\n \n         let mut s = serde_json::from_value::<Settings>(value).map_err(ConfigError::Parse)?;\n         // Stamp the migrated content with CURRENT_VERSION before persisting —\n         // otherwise the file's `version` field still reads as the OLD version\n",
+    "file": "src/config.rs",
+    "function": {
+      "function_name": "ensure_dir_and_load",
+      "return_type": "-> Result<Settings, ConfigError>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 714
+        },
+        "start": {
+          "column": 1,
+          "line": 619
+        }
+      }
+    },
+    "genre": "BinaryOperator",
+    "name": "src/config.rs:675:30: replace + with * in ensure_dir_and_load",
+    "package": "context-engine-rs",
+    "replacement": "*",
+    "span": {
+      "end": {
+        "column": 31,
+        "line": 675
+      },
+      "start": {
+        "column": 30,
+        "line": 675
+      }
+    }
+  },
+  {
+    "diff": "--- src/config.rs\n+++ replace != with == in ensure_dir_and_load\n@@ -701,17 +701,17 @@\n         let mut seen = std::collections::HashSet::new();\n         settings.repos = settings\n             .repos\n             .iter()\n             .map(|r| crate::store::normalize_repo_path(r))\n             .filter(|r| seen.insert(r.clone()))\n             .collect();\n     }\n-    if settings.repos != original_repos {\n+    if settings.repos == /* ~ changed by cargo-mutants ~ */ original_repos {\n         let _ = write_settings_atomic(&path, &settings);\n     }\n \n     Ok(settings)\n }\n \n /// Ensure `settings.machine_id` is `Some(...)` and persisted on disk. Called\n /// once at boot, after `ensure_dir_and_load`. Mutates `settings` in place.\n",
+    "file": "src/config.rs",
+    "function": {
+      "function_name": "ensure_dir_and_load",
+      "return_type": "-> Result<Settings, ConfigError>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 714
+        },
+        "start": {
+          "column": 1,
+          "line": 619
+        }
+      }
+    },
+    "genre": "BinaryOperator",
+    "name": "src/config.rs:709:23: replace != with == in ensure_dir_and_load",
+    "package": "context-engine-rs",
+    "replacement": "==",
+    "span": {
+      "end": {
+        "column": 25,
+        "line": 709
+      },
+      "start": {
+        "column": 23,
+        "line": 709
+      }
+    }
+  },
+  {
+    "diff": "--- src/config.rs\n+++ replace ensure_machine_id -> Result<(), ConfigError> with Ok(())\n@@ -723,29 +723,17 @@\n /// If `machine_uid::get()` fails (rare hosts where no hardware uid is\n /// reachable), fall back to a random UUIDv4. The fallback is only sound\n /// BECAUSE we persist it immediately — the next boot reads the same value, so\n /// \"one machine = one user\" still holds across restarts.\n ///\n /// Subsequent boots: field already populated → no-op (don't recompute, don't\n /// rewrite).\n pub fn ensure_machine_id(home_dir: &Path, settings: &mut Settings) -> Result<(), ConfigError> {\n-    if settings\n-        .machine_id\n-        .as_deref()\n-        .map(|s| !s.is_empty())\n-        .unwrap_or(false)\n-    {\n-        return Ok(());\n-    }\n-\n-    let id = compute_seed_machine_id();\n-    settings.machine_id = Some(id);\n-    let path = config_path(home_dir);\n-    write_settings_atomic(&path, settings)\n+    Ok(()) /* ~ changed by cargo-mutants ~ */\n }\n \n /// Compute the machine-id seed used by `ensure_machine_id`. Public-in-crate so\n /// tests can assert the legacy formula is preserved.\n fn compute_seed_machine_id() -> String {\n     use sha2::{Digest, Sha256};\n     let mut hasher = Sha256::new();\n     hasher.update(MACHINE_ID_SALT.as_bytes());\n",
+    "file": "src/config.rs",
+    "function": {
+      "function_name": "ensure_machine_id",
+      "return_type": "-> Result<(), ConfigError>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 744
+        },
+        "start": {
+          "column": 1,
+          "line": 716
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "src/config.rs:731:5: replace ensure_machine_id -> Result<(), ConfigError> with Ok(())",
+    "package": "context-engine-rs",
+    "replacement": "Ok(())",
+    "span": {
+      "end": {
+        "column": 43,
+        "line": 743
+      },
+      "start": {
+        "column": 5,
+        "line": 731
+      }
+    }
+  },
+  {
+    "diff": "--- src/config.rs\n+++ delete ! in ensure_machine_id\n@@ -726,17 +726,17 @@\n /// \"one machine = one user\" still holds across restarts.\n ///\n /// Subsequent boots: field already populated → no-op (don't recompute, don't\n /// rewrite).\n pub fn ensure_machine_id(home_dir: &Path, settings: &mut Settings) -> Result<(), ConfigError> {\n     if settings\n         .machine_id\n         .as_deref()\n-        .map(|s| !s.is_empty())\n+        .map(|s|  /* ~ changed by cargo-mutants ~ */s.is_empty())\n         .unwrap_or(false)\n     {\n         return Ok(());\n     }\n \n     let id = compute_seed_machine_id();\n     settings.machine_id = Some(id);\n     let path = config_path(home_dir);\n",
+    "file": "src/config.rs",
+    "function": {
+      "function_name": "ensure_machine_id",
+      "return_type": "-> Result<(), ConfigError>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 744
+        },
+        "start": {
+          "column": 1,
+          "line": 716
+        }
+      }
+    },
+    "genre": "UnaryOperator",
+    "name": "src/config.rs:734:18: delete ! in ensure_machine_id",
+    "package": "context-engine-rs",
+    "replacement": "",
+    "span": {
+      "end": {
+        "column": 19,
+        "line": 734
+      },
+      "start": {
+        "column": 18,
+        "line": 734
+      }
+    }
+  },
+  {
+    "diff": "--- src/config.rs\n+++ replace compute_seed_machine_id -> String with String::new()\n@@ -741,48 +741,17 @@\n     settings.machine_id = Some(id);\n     let path = config_path(home_dir);\n     write_settings_atomic(&path, settings)\n }\n \n /// Compute the machine-id seed used by `ensure_machine_id`. Public-in-crate so\n /// tests can assert the legacy formula is preserved.\n fn compute_seed_machine_id() -> String {\n-    use sha2::{Digest, Sha256};\n-    let mut hasher = Sha256::new();\n-    hasher.update(MACHINE_ID_SALT.as_bytes());\n-    hasher.update(b\"\\x00\");\n-    match machine_uid::get() {\n-        Ok(uid) => {\n-            hasher.update(uid.as_bytes());\n-        }\n-        Err(_) => {\n-            // Fallback only — not the common path. Mix high-entropy host signals\n-            // (system time + process id + a fresh allocation address) into the\n-            // hash so the result is unique per first-boot. Acceptable here\n-            // because we persist it on the same call: the next boot reads the\n-            // same value, preserving idempotency.\n-            let nanos = std::time::SystemTime::now()\n-                .duration_since(std::time::UNIX_EPOCH)\n-                .map(|d| d.as_nanos())\n-                .unwrap_or(0);\n-            hasher.update(b\"fallback-v1\\x00\");\n-            hasher.update(nanos.to_le_bytes());\n-            hasher.update(std::process::id().to_le_bytes());\n-            let probe: Box<u8> = Box::new(0);\n-            hasher.update((Box::as_ref(&probe) as *const u8 as usize).to_le_bytes());\n-        }\n-    }\n-    let bytes = hasher.finalize();\n-    let mut s = String::with_capacity(bytes.len() * 2);\n-    use std::fmt::Write as _;\n-    for b in bytes {\n-        let _ = write!(s, \"{b:02x}\");\n-    }\n-    s\n+    String::new() /* ~ changed by cargo-mutants ~ */\n }\n \n // ─── Tests ─────────────────────────────────────────────────────────────────\n \n #[cfg(test)]\n mod tests {\n     use super::*;\n     use tempfile::TempDir;\n",
+    "file": "src/config.rs",
+    "function": {
+      "function_name": "compute_seed_machine_id",
+      "return_type": "-> String",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 781
+        },
+        "start": {
+          "column": 1,
+          "line": 746
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "src/config.rs:749:5: replace compute_seed_machine_id -> String with String::new()",
+    "package": "context-engine-rs",
+    "replacement": "String::new()",
+    "span": {
+      "end": {
+        "column": 6,
+        "line": 780
+      },
+      "start": {
+        "column": 5,
+        "line": 749
+      }
+    }
+  },
+  {
+    "diff": "--- src/config.rs\n+++ replace compute_seed_machine_id -> String with \"xyzzy\".into()\n@@ -741,48 +741,17 @@\n     settings.machine_id = Some(id);\n     let path = config_path(home_dir);\n     write_settings_atomic(&path, settings)\n }\n \n /// Compute the machine-id seed used by `ensure_machine_id`. Public-in-crate so\n /// tests can assert the legacy formula is preserved.\n fn compute_seed_machine_id() -> String {\n-    use sha2::{Digest, Sha256};\n-    let mut hasher = Sha256::new();\n-    hasher.update(MACHINE_ID_SALT.as_bytes());\n-    hasher.update(b\"\\x00\");\n-    match machine_uid::get() {\n-        Ok(uid) => {\n-            hasher.update(uid.as_bytes());\n-        }\n-        Err(_) => {\n-            // Fallback only — not the common path. Mix high-entropy host signals\n-            // (system time + process id + a fresh allocation address) into the\n-            // hash so the result is unique per first-boot. Acceptable here\n-            // because we persist it on the same call: the next boot reads the\n-            // same value, preserving idempotency.\n-            let nanos = std::time::SystemTime::now()\n-                .duration_since(std::time::UNIX_EPOCH)\n-                .map(|d| d.as_nanos())\n-                .unwrap_or(0);\n-            hasher.update(b\"fallback-v1\\x00\");\n-            hasher.update(nanos.to_le_bytes());\n-            hasher.update(std::process::id().to_le_bytes());\n-            let probe: Box<u8> = Box::new(0);\n-            hasher.update((Box::as_ref(&probe) as *const u8 as usize).to_le_bytes());\n-        }\n-    }\n-    let bytes = hasher.finalize();\n-    let mut s = String::with_capacity(bytes.len() * 2);\n-    use std::fmt::Write as _;\n-    for b in bytes {\n-        let _ = write!(s, \"{b:02x}\");\n-    }\n-    s\n+    \"xyzzy\".into() /* ~ changed by cargo-mutants ~ */\n }\n \n // ─── Tests ─────────────────────────────────────────────────────────────────\n \n #[cfg(test)]\n mod tests {\n     use super::*;\n     use tempfile::TempDir;\n",
+    "file": "src/config.rs",
+    "function": {
+      "function_name": "compute_seed_machine_id",
+      "return_type": "-> String",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 781
+        },
+        "start": {
+          "column": 1,
+          "line": 746
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "src/config.rs:749:5: replace compute_seed_machine_id -> String with \"xyzzy\".into()",
+    "package": "context-engine-rs",
+    "replacement": "\"xyzzy\".into()",
+    "span": {
+      "end": {
+        "column": 6,
+        "line": 780
+      },
+      "start": {
+        "column": 5,
+        "line": 749
+      }
+    }
+  }
+]

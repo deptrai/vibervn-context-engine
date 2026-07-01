@@ -1,0 +1,25 @@
+--- src/config.rs
++++ replace migrate_v4_to_v5 -> Result<Value, ConfigError> with Ok(Default::default())
+@@ -57,21 +57,17 @@
+         });
+     }
+     Ok(value)
+ }
+ 
+ /// v4→v5: introduce `custom_extensions` (Vec<String>). Defaults to empty —
+ /// users add their own extensions beyond the built-in CODE_EXTENSIONS list.
+ fn migrate_v4_to_v5(mut value: Value) -> Result<Value, ConfigError> {
+-    if let Value::Object(ref mut obj) = value {
+-        obj.entry("custom_extensions".to_string())
+-            .or_insert_with(|| Value::Array(vec![]));
+-    }
+-    Ok(value)
++    Ok(Default::default()) /* ~ changed by cargo-mutants ~ */
+ }
+ 
+ /// v5→v6: introduce `index_ignore_filenames` (Vec<String>). Defaults to
+ /// CLAUDE.md and AGENTS.md — files typically consumed by AI agents that add
+ /// noise to code search results.
+ fn migrate_v5_to_v6(mut value: Value) -> Result<Value, ConfigError> {
+     if let Value::Object(ref mut obj) = value {
+         obj.entry("index_ignore_filenames".to_string())

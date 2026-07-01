@@ -1,0 +1,29 @@
+--- src/config.rs
++++ replace migrate_v3_to_v4 -> Result<Value, ConfigError> with Ok(Default::default())
+@@ -43,25 +43,17 @@
+         obj.entry("embeddings_dir".to_string()).or_insert(Value::Null);
+     }
+     Ok(value)
+ }
+ 
+ /// v3→v4: introduce `enabled_mcp_tools` (Vec<String>). Defaults to both tools
+ /// enabled so existing installations gain file-retrieval without manual opt-in.
+ fn migrate_v3_to_v4(mut value: Value) -> Result<Value, ConfigError> {
+-    if let Value::Object(ref mut obj) = value {
+-        obj.entry("enabled_mcp_tools".to_string()).or_insert_with(|| {
+-            Value::Array(vec![
+-                Value::String("codebase-retrieval".to_string()),
+-                Value::String("file-retrieval".to_string()),
+-            ])
+-        });
+-    }
+-    Ok(value)
++    Ok(Default::default()) /* ~ changed by cargo-mutants ~ */
+ }
+ 
+ /// v4→v5: introduce `custom_extensions` (Vec<String>). Defaults to empty —
+ /// users add their own extensions beyond the built-in CODE_EXTENSIONS list.
+ fn migrate_v4_to_v5(mut value: Value) -> Result<Value, ConfigError> {
+     if let Value::Object(ref mut obj) = value {
+         obj.entry("custom_extensions".to_string())
+             .or_insert_with(|| Value::Array(vec![]));

@@ -1653,14 +1653,15 @@ async fn do_query(
 fn build_db_key(workspace: &str, file_path: &str) -> String {
     let workspace = workspace.trim_end_matches(['/', '\\']);
     let file_path = file_path.trim_start_matches(['/', '\\']);
-    let file_path_native = if cfg!(windows) {
-        file_path.replace('/', "\\")
+    // Detect Windows-style path by content (backslash separators or drive
+    // letter "X:") rather than cfg!(windows), so DB keys are stable across
+    // host OSes — a Windows repo indexed on macOS must still use backslashes.
+    let is_windows_style = workspace.contains('\\') || workspace.contains(':');
+    if is_windows_style {
+        format!("{}\\{}", workspace, file_path.replace('/', "\\"))
     } else {
-        file_path.replace('\\', "/")
-    };
-    let repo_path = std::path::Path::new(workspace);
-    let abs_file = repo_path.join(&file_path_native);
-    abs_file.to_string_lossy().to_string()
+        format!("{}/{}", workspace, file_path.replace('\\', "/"))
+    }
 }
 
 /// Single-file semantic retrieval: embed query → fetch file chunks from DB →

@@ -1,0 +1,24 @@
+--- src/config.rs
++++ replace migrate_v2_to_v3 -> Result<Value, ConfigError> with Ok(Default::default())
+@@ -34,20 +34,17 @@
+ /// v2→v3: introduce `embeddings_dir` (Option<PathBuf>). Same no-op stamp +
+ /// forward-incompat tripwire rationale as v1→v2. `embeddings_dir` lets the
+ /// content-addressed embedding cache live at its own location — typically a
+ /// SHARED path across multiple instances, so identical code chunks are embedded
+ /// once (the cache is concurrency-safe; only RocksDB needs per-instance
+ /// isolation). `None` means the builtin default
+ /// `~/.vibervn/context-engine/embeddings` (anchored to home, not `data_dir`).
+ fn migrate_v2_to_v3(mut value: Value) -> Result<Value, ConfigError> {
+-    if let Value::Object(ref mut obj) = value {
+-        obj.entry("embeddings_dir".to_string()).or_insert(Value::Null);
+-    }
+-    Ok(value)
++    Ok(Default::default()) /* ~ changed by cargo-mutants ~ */
+ }
+ 
+ /// v3→v4: introduce `enabled_mcp_tools` (Vec<String>). Defaults to both tools
+ /// enabled so existing installations gain file-retrieval without manual opt-in.
+ fn migrate_v3_to_v4(mut value: Value) -> Result<Value, ConfigError> {
+     if let Value::Object(ref mut obj) = value {
+         obj.entry("enabled_mcp_tools".to_string()).or_insert_with(|| {
+             Value::Array(vec![
