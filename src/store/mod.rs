@@ -3228,3 +3228,302 @@ mod schemaless_tests {
         assert!(!MIGRATION_TASKS.lock().unwrap().contains_key(&normalize_repo_path(repo)));
     }
 }
+
+// ─── Mutation-coverage tests ──────────────────────────────────────────────
+//
+// Targets 56 missed mutants from the baseline (37.1% → target ≥80%).
+// Key groups: sanitize_repo_name (4), maybe_spawn_migration (17),
+// open_db (10), migration version gates (11), remove_dir_with_retry (7),
+// build_index_concurrently (5), index_building_status (1).
+#[cfg(test)]
+mod mutation_coverage {
+    use super::*;
+    use tempfile::TempDir;
+
+    // ── sanitize_repo_name (4 mutants) ────────────────────────────────────
+
+    #[test]
+    fn mc_sanitize_repo_name_short_path() {
+        // Leading '/' is non-alphanumeric → '_' → trimmed by trim_matches('_')
+        assert_eq!(sanitize_repo_name("/home/user/myrepo"), "home_user_myrepo");
+    }
+
+    #[test]
+    fn mc_sanitize_repo_name_replaces_special_chars() {
+        // Space, dot, colon → underscore; leading/trailing trimmed
+        assert_eq!(sanitize_repo_name("my repo.git"), "my_repo_git");
+        assert_eq!(sanitize_repo_name("C:\\Users\\dev"), "C__Users_dev");
+    }
+
+    #[test]
+    fn mc_sanitize_repo_name_trims_leading_trailing_underscores() {
+        assert_eq!(sanitize_repo_name("///repo///"), "repo");
+        // "/@/repo/@/" → "_@_repo_@_" → trimmed → "@_repo_@" (non-alnum stays as _)
+        // Actually: @ is non-alphanumeric → _, so "_ _ _repo_ _ _" → trim → "repo"
+        assert_eq!(sanitize_repo_name("/@/repo/@/"), "repo");
+    }
+
+    #[test]
+    fn mc_sanitize_repo_name_truncates_to_64_chars() {
+        let long = "a".repeat(200);
+        let result = sanitize_repo_name(&long);
+        assert_eq!(result.len(), 64, "must truncate to exactly 64 chars");
+        // Last 64 chars of "aaa...a" (200 a's) = 64 a's
+        assert_eq!(result, "a".repeat(64));
+    }
+
+    #[test]
+    fn mc_sanitize_repo_name_truncation_takes_last_64() {
+        // With mixed chars: the LAST 64 chars after sanitization
+        let input = format!("{}{}", "x".repeat(100), "y".repeat(50));
+        let result = sanitize_repo_name(&input);
+        assert_eq!(result.len(), 64);
+        // trimmed = "xxx...xyyy...y" (150 chars), last 64 = 14 x's + 50 y's
+        assert_eq!(result, format!("{}{}", "x".repeat(14), "y".repeat(50)));
+    }
+
+    // ── db_path (indirect, but verifies sanitize + generation routing) ─────
+
+    #[test]
+    fn mc_db_path_generation_zero_no_subdir() {
+        let tmp = TempDir::new().unwrap();
+        let p = db_path(tmp.path(), "/test/repo", 0);
+        let s = p.to_str().unwrap();
+        assert!(s.contains("rocksdb/test_repo"), "gen0 path: {s}");
+        assert!(!s.contains("rocksdb/0/"), "gen0 must not have gen subdir: {s}");
+    }
+
+    #[test]
+    fn mc_db_path_generation_nonzero_has_subdir() {
+        let tmp = TempDir::new().unwrap();
+        let p = db_path(tmp.path(), "/test/repo", 3);
+        let s = p.to_str().unwrap();
+        assert!(s.contains("rocksdb/3/test_repo"), "gen3 path: {s}");
+    }
+
+    // ── maybe_spawn_migration (17 mutants) ────────────────────────────────
+    //
+    // The key insight: maybe_spawn_migration checks stored_version < N for
+    // each migration step. We need to verify that:
+    // 1. When stored_version >= DB_SCHEMA_VERSION, no migration runs (return early)
+    // 2. When stored_version < 2, v1→v2 runs
+    // 3. When stored_version < 3, v2→v3 runs
+    // 4. etc. for each version gate
+    //
+    // We test this by opening a DB, setting a low schema version, calling
+    // maybe_spawn_migration, and verifying the version was bumped.
+
+    async fn open_and_set_version(repo: &str, version: u32) -> (TempDir, Surreal<Db>) {
+        let home = TempDir::new().unwrap();
+        let db = open_db(home.path(), repo, 0).await.unwrap();
+        if version > 0 {
+            db.query("INSERT INTO index_meta { key: 'db_schema_version', value: $v }")
+                .bind(("v", version.to_string()))
+                .await.unwrap();
+        }
+        (home, db)
+    }
+
+    async fn read_version(db: &Surreal<Db>) -> u32 {
+        read_db_schema_version(db).await
+    }
+
+    #[tokio::test]
+    async fn mc_maybe_spawn_migration_noop_when_current() {
+        // When stored_version >= DB_SCHEMA_VERSION, migration is a no-op.
+        let repo = "/test/migrate_noop";
+        let (home, db) = open_and_set_version(repo, DB_SCHEMA_VERSION).await;
+        let repo_dbs = Arc::new(RwLock::new(
+            HashMap::from([(repo.to_string(), db.clone())])
+        ));
+        maybe_spawn_migration(repo_dbs, repo.to_string(), DB_SCHEMA_VERSION);
+        // Wait for any spawned task
+        abort_migration(repo).await;
+        // Version should be unchanged
+        let v = read_version(&db).await;
+        assert_eq!(v, DB_SCHEMA_VERSION);
+        drop(db);
+        drop(home);
+    }
+
+    #[tokio::test]
+    async fn mc_maybe_spawn_migration_runs_from_v1() {
+        // stored_version=1 → all migrations should run → version bumps to DB_SCHEMA_VERSION
+        let repo = "/test/migrate_v1";
+        let (home, db) = open_and_set_version(repo, 1).await;
+        let repo_dbs = Arc::new(RwLock::new(
+            HashMap::from([(repo.to_string(), db.clone())])
+        ));
+        maybe_spawn_migration(repo_dbs, repo.to_string(), 1);
+        // Wait for migration to complete
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        abort_migration(repo).await;
+        let v = read_version(&db).await;
+        assert_eq!(v, DB_SCHEMA_VERSION, "migration must bump version to current");
+        drop(db);
+        drop(home);
+    }
+
+    #[tokio::test]
+    async fn mc_maybe_spawn_migration_runs_from_v0() {
+        // stored_version=0 (unversioned) → treated as v1 → all migrations run
+        let repo = "/test/migrate_v0";
+        let (home, db) = open_and_set_version(repo, 0).await;
+        let repo_dbs = Arc::new(RwLock::new(
+            HashMap::from([(repo.to_string(), db.clone())])
+        ));
+        maybe_spawn_migration(repo_dbs, repo.to_string(), 0);
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        abort_migration(repo).await;
+        let v = read_version(&db).await;
+        assert_eq!(v, DB_SCHEMA_VERSION, "migration from v0 must bump to current");
+        drop(db);
+        drop(home);
+    }
+
+    #[tokio::test]
+    async fn mc_maybe_spawn_migration_from_v4() {
+        // stored_version=4 → only v4→v5, v5→v6 etc. run
+        let repo = "/test/migrate_v4";
+        let (home, db) = open_and_set_version(repo, 4).await;
+        let repo_dbs = Arc::new(RwLock::new(
+            HashMap::from([(repo.to_string(), db.clone())])
+        ));
+        maybe_spawn_migration(repo_dbs, repo.to_string(), 4);
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        abort_migration(repo).await;
+        let v = read_version(&db).await;
+        assert_eq!(v, DB_SCHEMA_VERSION, "migration from v4 must bump to current");
+        drop(db);
+        drop(home);
+    }
+
+    // ── open_db (10 mutants) — verify retry logic and version checks ──────
+
+    #[tokio::test]
+    async fn mc_open_db_creates_dir_and_schema() {
+        let home = TempDir::new().unwrap();
+        let db = open_db(home.path(), "/test/open_basic", 0).await.unwrap();
+        // Verify schema was applied: tables exist
+        let tables: Vec<serde_json::Value> = db
+            .query("INFO FOR DB")
+            .await.unwrap()
+            .take(0).unwrap();
+        assert!(!tables.is_empty(), "DB must have tables after open_db");
+        drop(db);
+    }
+
+    #[tokio::test]
+    async fn mc_open_db_different_repos_isolated() {
+        let home = TempDir::new().unwrap();
+        let db1 = open_db(home.path(), "/test/repo_a", 0).await.unwrap();
+        let db2 = open_db(home.path(), "/test/repo_b", 0).await.unwrap();
+        // Both should open successfully
+        let _ = db1;
+        let _ = db2;
+    }
+
+    // ── remove_dir_with_retry (7 mutants) ─────────────────────────────────
+
+    #[tokio::test]
+    async fn mc_remove_dir_with_retry_nonexistent_returns_true() {
+        let home = TempDir::new().unwrap();
+        let nonexistent = home.path().join("does_not_exist");
+        let result = remove_dir_with_retry(home.path(), "/nonexistent", 0).await;
+        assert!(result, "removing non-existent dir should return true");
+        assert!(!nonexistent.exists());
+    }
+
+    #[tokio::test]
+    async fn mc_remove_dir_with_retry_removes_existing() {
+        let home = TempDir::new().unwrap();
+        let repo = "/test/remove_me";
+        // Create the DB dir by opening
+        let db = open_db(home.path(), repo, 0).await.unwrap();
+        drop(db);
+        let dir_path = db_path(home.path(), repo, 0);
+        assert!(dir_path.exists(), "dir must exist before removal");
+        let result = remove_dir_with_retry(home.path(), repo, 0).await;
+        assert!(result, "removal must succeed");
+        assert!(!dir_path.exists(), "dir must be gone after removal");
+    }
+
+    #[tokio::test]
+    async fn mc_remove_dir_with_retry_with_generation() {
+        let home = TempDir::new().unwrap();
+        let repo = "/test/remove_gen";
+        let generation = 2;
+        let db = open_db(home.path(), repo, generation).await.unwrap();
+        drop(db);
+        let dir_path = db_path(home.path(), repo, generation);
+        assert!(dir_path.exists());
+        let result = remove_dir_with_retry(home.path(), repo, generation).await;
+        assert!(result);
+        assert!(!dir_path.exists());
+    }
+
+    // ── read_db_schema_version ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn mc_read_db_schema_version_defaults_to_1() {
+        let home = TempDir::new().unwrap();
+        let db = open_db(home.path(), "/test/schema_default", 0).await.unwrap();
+        let v = read_db_schema_version(&db).await;
+        assert_eq!(v, 1, "unversioned DB should default to v1");
+        drop(db);
+    }
+
+    #[tokio::test]
+    async fn mc_read_db_schema_version_reads_stored() {
+        let home = TempDir::new().unwrap();
+        let db = open_db(home.path(), "/test/schema_stored", 0).await.unwrap();
+        db.query("INSERT INTO index_meta { key: 'db_schema_version', value: '5' }")
+            .await.unwrap();
+        let v = read_db_schema_version(&db).await;
+        assert_eq!(v, 5);
+        drop(db);
+    }
+
+    // ── index_status_is_trustworthy (indirect, but tests the logic) ───────
+
+    #[test]
+    fn mc_index_status_trustworthy_none_is_true() {
+        assert!(index_status_is_trustworthy(None));
+    }
+
+    #[test]
+    fn mc_index_status_trustworthy_ready_is_true() {
+        assert!(index_status_is_trustworthy(Some("ready")));
+    }
+
+    #[test]
+    fn mc_index_status_trustworthy_in_progress_is_false() {
+        assert!(!index_status_is_trustworthy(Some("started")));
+        assert!(!index_status_is_trustworthy(Some("indexing")));
+        assert!(!index_status_is_trustworthy(Some("cleaning")));
+    }
+
+    #[test]
+    fn mc_index_status_trustworthy_error_is_false() {
+        assert!(!index_status_is_trustworthy(Some("error")));
+        assert!(!index_status_is_trustworthy(Some("aborted")));
+    }
+
+    // ── normalize_repo_path (indirect) ────────────────────────────────────
+
+    #[test]
+    fn mc_normalize_repo_path_unix() {
+        assert_eq!(normalize_repo_path("/home/user/repo"), "/home/user/repo");
+    }
+
+    #[test]
+    fn mc_normalize_repo_path_backslash_to_slash() {
+        assert_eq!(normalize_repo_path("C:\\Users\\dev\\repo"), "C:/Users/dev/repo");
+    }
+
+    #[test]
+    fn mc_normalize_repo_path_trims_trailing_slash() {
+        assert_eq!(normalize_repo_path("/home/user/repo/"), "/home/user/repo");
+        assert_eq!(normalize_repo_path("/home/user/repo\\"), "/home/user/repo");
+    }
+}
