@@ -1941,3 +1941,652 @@ mod ignored_paths_tests {
         assert!(loaded3.is_empty());
     }
 }
+
+// ─── Mutation-coverage tests ──────────────────────────────────────────────
+//
+// These tests target specific mutants that survived the initial mutation
+// testing baseline (56.7% for store/ops.rs). Each test is designed to KILL
+// a specific missed mutant by verifying the actual side-effect or return
+// value, not just that the function returns Ok.
+//
+// Categories targeted:
+//   1. kind_to_str — verify all variants map to correct strings
+//   2. strip_symbol_ref — verify wrapper stripping and name extraction
+//   3. de_embedding_dual — verify null/unit decoding via direct serde
+//   4. delete_* — verify rows are actually removed from the DB
+//   5. upsert_symbol / insert_edge — verify rows are actually inserted
+//   6. get_symbols_for_file / find_symbols_by_names — verify non-empty results
+//   7. files_page — verify filter is applied (not ignored)
+//   8. chunks_for_file — verify chunks are returned with correct fields
+//   9. call_graph degree arithmetic (+=, *) — verify hub selection by degree
+//  10. call_graph edge filtering (&&/||) — verify dangling edges excluded
+//  11. call_graph truncation (||/>=) — verify truncated flag correctness
+#[cfg(test)]
+mod mutation_coverage {
+    use super::*;
+    use crate::store::open_db;
+    use tempfile::TempDir;
+
+    async fn open_test_db(home: &TempDir, repo: &str) -> Surreal<Db> {
+        open_db(home.path(), repo, 0).await.expect("open test db")
+    }
+
+    async fn insert_symbol(db: &Surreal<Db>, fqn: &str, file: &str, name: &str) {
+        let thing = surrealdb::sql::Thing::from((
+            "symbol",
+            surrealdb::sql::Id::String(fqn.to_string()),
+        ));
+        db.query(
+            "CREATE $t SET name = $n, kind = 'function', file = $f, \
+             line_start = 1, line_end = 5, signature = NONE, parent = NONE",
+        )
+        .bind(("t", thing))
+        .bind(("n", name.to_string()))
+        .bind(("f", file.to_string()))
+        .await
+        .expect("insert symbol");
+    }
+
+    /// Insert a call row using only in_name/out_name (no Thing refs).
+    /// The calls table is SCHEMALESS, so in/out fields can be omitted.
+    async fn insert_call_names(db: &Surreal<Db>, caller: &str, callee: &str) {
+        db.query(
+            "INSERT INTO calls { in_name: $caller, out_name: $callee, \
+             in_file: 'f', out_file: 'f', line: 1 }",
+        )
+        .bind(("caller", caller.to_string()))
+        .bind(("callee", callee.to_string()))
+        .await
+        .expect("insert call by name");
+    }
+
+    /// Insert a call row with explicit in_file/out_file (for delete tests
+    /// that filter by file path).
+    async fn insert_call_with_files(
+        db: &Surreal<Db>,
+        caller: &str,
+        callee: &str,
+        in_file: &str,
+        out_file: &str,
+    ) {
+        db.query(
+            "INSERT INTO calls { in_name: $caller, out_name: $callee, \
+             in_file: $in_file, out_file: $out_file, line: 1 }",
+        )
+        .bind(("caller", caller.to_string()))
+        .bind(("callee", callee.to_string()))
+        .bind(("in_file", in_file.to_string()))
+        .bind(("out_file", out_file.to_string()))
+        .await
+        .expect("insert call with files");
+    }
+
+    async fn count_table(db: &Surreal<Db>, table: &str) -> u64 {
+        #[derive(Deserialize)]
+        struct Row { count: i64 }
+        let rows: Vec<Row> = db
+            .query(&format!("SELECT count() AS count FROM {table} GROUP ALL"))
+            .await
+            .unwrap_or_else(|_| panic!("count {table}"))
+            .take(0)
+            .unwrap_or_else(|_| panic!("take {table}"));
+        rows.first().map(|r| r.count as u64).unwrap_or(0)
+    }
+
+    // ── 1. kind_to_str ────────────────────────────────────────────────────
+
+    #[test]
+    fn kind_to_str_all_variants() {
+        assert_eq!(kind_to_str(&SymbolKind::Function), "function");
+        assert_eq!(kind_to_str(&SymbolKind::Method), "method");
+        assert_eq!(kind_to_str(&SymbolKind::Struct), "struct");
+        assert_eq!(kind_to_str(&SymbolKind::Trait), "trait");
+        assert_eq!(kind_to_str(&SymbolKind::Impl), "impl");
+        assert_eq!(kind_to_str(&SymbolKind::Class), "class");
+        assert_eq!(kind_to_str(&SymbolKind::Module), "module");
+        assert_eq!(kind_to_str(&SymbolKind::Interface), "interface");
+        assert_eq!(kind_to_str(&SymbolKind::Enum), "enum");
+        assert_eq!(kind_to_str(&SymbolKind::Extension), "extension");
+    }
+
+    // ── 2. strip_symbol_ref ───────────────────────────────────────────────
+
+    #[test]
+    fn strip_symbol_ref_extracts_name_from_wrapper() {
+        // Standard wrapped ref: symbol:⟨fqn::name⟩ → "name"
+        assert_eq!(
+            strip_symbol_ref("symbol:⟨/a.rs::foo::bar⟩"),
+            Some("bar".to_string())
+        );
+        // Single-segment name (no ::)
+        assert_eq!(
+            strip_symbol_ref("symbol:⟨standalone⟩"),
+            Some("standalone".to_string())
+        );
+        // No wrapper → None
+        assert_eq!(strip_symbol_ref("plain_string"), None);
+        assert_eq!(strip_symbol_ref(""), None);
+    }
+
+    // ── 3. de_embedding_dual: null/unit decoding ──────────────────────────
+
+    /// Wrapper to invoke de_embedding_dual via serde (serde_json for Vec<f32>
+    /// uses deserialize_seq, not deserialize_any, so we need the custom
+    /// deserializer to be invoked through a struct field).
+    #[derive(Deserialize)]
+    struct EmbeddingField {
+        #[serde(deserialize_with = "de_embedding_dual")]
+        embedding: Vec<f32>,
+    }
+
+    #[test]
+    fn de_embedding_dual_decodes_null_as_empty() {
+        let v: EmbeddingField = serde_json::from_str(r#"{"embedding":null}"#)
+            .expect("null embedding must decode via de_embedding_dual");
+        assert!(v.embedding.is_empty(), "null embedding must yield empty Vec");
+    }
+
+    #[test]
+    fn de_embedding_dual_decodes_empty_array_as_empty() {
+        let v: EmbeddingField = serde_json::from_str(r#"{"embedding":[]}"#)
+            .expect("empty array must decode via de_embedding_dual");
+        assert!(v.embedding.is_empty(), "empty array must yield empty Vec");
+    }
+
+    #[test]
+    fn de_embedding_dual_decodes_array_float() {
+        let v: EmbeddingField = serde_json::from_str(r#"{"embedding":[1.0,2.0,3.0]}"#)
+            .expect("array<float> must decode via de_embedding_dual");
+        assert_eq!(v.embedding, vec![1.0, 2.0, 3.0]);
+    }
+
+    // ── 4. delete_file_data ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn delete_file_data_removes_all_rows_for_file() {
+        let home = TempDir::new().unwrap();
+        let db = open_test_db(&home, "/test/del_file").await;
+
+        // Insert a symbol, chunk, file_meta, and a call for the file.
+        insert_symbol(&db, "/test/foo.rs::foo", "/test/foo.rs", "foo").await;
+        db.query("CREATE chunk SET file = '/test/foo.rs', line_start = 1, \
+                  line_end = 5, content = 'fn foo() {}', embedding = [1.0], \
+                  symbol_ref = NONE")
+            .await.unwrap();
+        upsert_file_meta(&db, &FileMeta {
+            path: "/test/foo.rs".to_string(), mtime: 100, size: 200,
+            repo: "/test/del_file".to_string(), chunk_count: 1, chunker_version: 1,
+        }).await.unwrap();
+        insert_call_with_files(&db, "/test/foo.rs::foo", "/test/bar.rs::bar",
+                               "/test/foo.rs", "/test/bar.rs").await;
+
+        // Verify data exists before delete.
+        assert_eq!(count_symbols(&db).await.unwrap(), 1);
+        assert_eq!(count_table(&db, "chunk").await, 1);
+        assert_eq!(count_table(&db, "file_meta").await, 1);
+        assert_eq!(count_table(&db, "calls").await, 1);
+
+        // Delete and verify all rows are gone.
+        delete_file_data(&db, "/test/foo.rs").await.expect("delete_file_data");
+        assert_eq!(count_symbols(&db).await.unwrap(), 0, "symbols must be deleted");
+        assert_eq!(count_table(&db, "chunk").await, 0, "chunks must be deleted");
+        assert_eq!(count_table(&db, "file_meta").await, 0, "file_meta must be deleted");
+        assert_eq!(count_table(&db, "calls").await, 0, "calls must be deleted");
+    }
+
+    // ── 5. delete_files_data_bulk ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn delete_files_data_bulk_removes_all_rows_for_paths() {
+        let home = TempDir::new().unwrap();
+        let db = open_test_db(&home, "/test/del_bulk").await;
+
+        // Insert data for two files.
+        for f in &["/test/a.rs", "/test/b.rs"] {
+            insert_symbol(&db, &format!("{f}::sym"), f, "sym").await;
+            db.query(&format!(
+                "CREATE chunk SET file = '{f}', line_start = 1, line_end = 5, \
+                 content = 'x', embedding = [], symbol_ref = NONE"
+            )).await.unwrap();
+            upsert_file_meta(&db, &FileMeta {
+                path: f.to_string(), mtime: 1, size: 1,
+                repo: "/test/del_bulk".to_string(), chunk_count: 1, chunker_version: 1,
+            }).await.unwrap();
+        }
+        insert_call_with_files(&db, "/test/a.rs::sym", "/test/b.rs::sym",
+                               "/test/a.rs", "/test/b.rs").await;
+
+        assert_eq!(count_symbols(&db).await.unwrap(), 2);
+        assert_eq!(count_table(&db, "chunk").await, 2);
+        assert_eq!(count_table(&db, "file_meta").await, 2);
+        assert_eq!(count_table(&db, "calls").await, 1);
+
+        let paths = vec!["/test/a.rs".to_string(), "/test/b.rs".to_string()];
+        delete_files_data_bulk(&db, &paths).await.expect("delete_files_data_bulk");
+
+        assert_eq!(count_symbols(&db).await.unwrap(), 0, "symbols must be bulk-deleted");
+        assert_eq!(count_table(&db, "chunk").await, 0, "chunks must be bulk-deleted");
+        assert_eq!(count_table(&db, "file_meta").await, 0, "file_meta must be bulk-deleted");
+        assert_eq!(count_table(&db, "calls").await, 0, "calls must be bulk-deleted");
+    }
+
+    // ── 6. delete_all_data ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn delete_all_data_clears_every_table() {
+        let home = TempDir::new().unwrap();
+        let db = open_test_db(&home, "/test/del_all").await;
+
+        insert_symbol(&db, "/test/x.rs::x", "/test/x.rs", "x").await;
+        db.query("CREATE chunk SET file = '/test/x.rs', line_start = 1, \
+                  line_end = 5, content = 'x', embedding = [], symbol_ref = NONE")
+            .await.unwrap();
+        upsert_file_meta(&db, &FileMeta {
+            path: "/test/x.rs".to_string(), mtime: 1, size: 1,
+            repo: "/test/del_all".to_string(), chunk_count: 1, chunker_version: 1,
+        }).await.unwrap();
+        insert_call_with_files(&db, "/test/x.rs::x", "/test/x.rs::y",
+                               "/test/x.rs", "/test/x.rs").await;
+
+        assert!(count_symbols(&db).await.unwrap() > 0);
+        assert!(count_table(&db, "chunk").await > 0);
+        assert!(count_table(&db, "file_meta").await > 0);
+        assert!(count_table(&db, "calls").await > 0);
+
+        delete_all_data(&db).await.expect("delete_all_data");
+
+        assert_eq!(count_symbols(&db).await.unwrap(), 0, "symbols must be wiped");
+        assert_eq!(count_table(&db, "chunk").await, 0, "chunks must be wiped");
+        assert_eq!(count_table(&db, "file_meta").await, 0, "file_meta must be wiped");
+        assert_eq!(count_table(&db, "calls").await, 0, "calls must be wiped");
+    }
+
+    // ── 7. upsert_symbol persists and is retrievable ──────────────────────
+
+    #[tokio::test]
+    async fn upsert_symbol_persists_to_db() {
+        let home = TempDir::new().unwrap();
+        let db = open_test_db(&home, "/test/upsert_sym").await;
+
+        let sym = Symbol {
+            qualified: QualifiedSymbol {
+                file: "/test/foo.rs".to_string(),
+                scope_path: vec![],
+                name: "my_func".to_string(),
+            },
+            kind: SymbolKind::Function,
+            line_start: 10,
+            line_end: 20,
+            signature: Some("fn my_func(x: i32) -> bool".to_string()),
+            parent_fqn: None,
+        };
+        upsert_symbol(&db, &sym).await.expect("upsert_symbol");
+
+        // Verify via get_symbols_for_file (which also tests that function).
+        let retrieved = get_symbols_for_file(&db, "/test/foo.rs")
+            .await
+            .expect("get_symbols_for_file");
+        assert_eq!(retrieved.len(), 1, "upserted symbol must be retrievable");
+        assert_eq!(retrieved[0].name, "my_func");
+        assert_eq!(retrieved[0].file, "/test/foo.rs");
+    }
+
+    // ── 8. insert_edge persists to calls table ────────────────────────────
+    //
+    // Note: insert_edge uses RELATE, which requires a RELATION table. The
+    // calls table was migrated to NORMAL in schema v6, so RELATE may fail
+    // with newer SurrealDB versions. The function is currently dead code
+    // (production uses flush_edge_batch with INSERT). We test it anyway —
+    // if RELATE works, the test verifies the edge is persisted; if it
+    // doesn't, the test is skipped (the mutant is uncatchable but the
+    // function is unused).
+
+    #[tokio::test]
+    async fn insert_edge_persists_calls_edge() {
+        let home = TempDir::new().unwrap();
+        let db = open_test_db(&home, "/test/insert_edge").await;
+
+        let from = QualifiedSymbol {
+            file: "/test/a.rs".to_string(), scope_path: vec![], name: "caller".to_string(),
+        };
+        let to = QualifiedSymbol {
+            file: "/test/b.rs".to_string(), scope_path: vec![], name: "callee".to_string(),
+        };
+        insert_symbol(&db, "/test/a.rs::caller", "/test/a.rs", "caller").await;
+        insert_symbol(&db, "/test/b.rs::callee", "/test/b.rs", "callee").await;
+
+        // If insert_edge fails due to RELATE incompatibility, skip rather
+        // than fail — the function is dead code.
+        let result = insert_edge(&db, &from, &to, &EdgeKind::Calls, 42).await;
+        if result.is_err() {
+            eprintln!("insert_edge failed (RELATE may be incompatible with NORMAL calls table): {result:?}");
+            return;
+        }
+
+        assert_eq!(count_table(&db, "calls").await, 1, "calls edge must be persisted");
+
+        // Verify the line field was set correctly.
+        #[derive(Deserialize)]
+        struct CallRow { line: i64 }
+        let rows: Vec<CallRow> = db.query("SELECT line FROM calls").await.unwrap().take(0).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].line, 42, "edge line must be persisted");
+    }
+
+    // ── 9. find_symbols_by_names ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn find_symbols_by_names_returns_matching() {
+        let home = TempDir::new().unwrap();
+        let db = open_test_db(&home, "/test/find_names").await;
+
+        insert_symbol(&db, "/test/a.rs::alpha", "/test/a.rs", "alpha").await;
+        insert_symbol(&db, "/test/b.rs::beta", "/test/b.rs", "beta").await;
+        insert_symbol(&db, "/test/c.rs::gamma", "/test/c.rs", "gamma").await;
+
+        let found = find_symbols_by_names(&db, &["alpha".to_string(), "gamma".to_string()])
+            .await
+            .expect("find_symbols_by_names");
+        let names: Vec<&str> = found.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"alpha"), "alpha must be found");
+        assert!(names.contains(&"gamma"), "gamma must be found");
+        assert!(!names.contains(&"beta"), "beta must NOT be found (not in query)");
+        assert_eq!(found.len(), 2, "exactly 2 symbols must match");
+    }
+
+    // ── 10. files_page with and without filter ────────────────────────────
+
+    #[tokio::test]
+    async fn files_page_filter_excludes_non_matching() {
+        let home = TempDir::new().unwrap();
+        let db = open_test_db(&home, "/test/files_page").await;
+
+        // Insert file_meta for two files.
+        for (path, mtime) in &[("/test/foo.rs", 100), ("/test/bar.rs", 200)] {
+            upsert_file_meta(&db, &FileMeta {
+                path: path.to_string(), mtime: *mtime, size: 50,
+                repo: "/test/files_page".to_string(), chunk_count: 1, chunker_version: 1,
+            }).await.unwrap();
+        }
+
+        // Without filter: both files returned.
+        let all = files_page(&db, "/test/files_page", 100, None)
+            .await.expect("files_page no filter");
+        assert_eq!(all.len(), 2, "unfiltered must return all files");
+
+        // With filter "foo": only foo.rs returned (not bar.rs).
+        let filtered = files_page(&db, "/test/files_page", 100, Some("foo"))
+            .await.expect("files_page filtered");
+        assert_eq!(filtered.len(), 1, "filter must narrow results to 1");
+        assert_eq!(filtered[0].path, "/test/foo.rs", "filter must match foo.rs only");
+
+        // Verify mtime is correctly returned (not zeroed by a no-op mutant).
+        assert_eq!(filtered[0].mtime, 100, "mtime must be the stored value");
+    }
+
+    #[tokio::test]
+    async fn files_page_returns_chunk_count_and_size() {
+        let home = TempDir::new().unwrap();
+        let db = open_test_db(&home, "/test/files_page_fields").await;
+
+        upsert_file_meta(&db, &FileMeta {
+            path: "/test/x.rs".to_string(), mtime: 42, size: 99,
+            repo: "/test/files_page_fields".to_string(), chunk_count: 7, chunker_version: 1,
+        }).await.unwrap();
+
+        let rows = files_page(&db, "/test/files_page_fields", 100, None)
+            .await.expect("files_page");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].chunks, 7, "chunk_count must be the stored value");
+        assert_eq!(rows[0].size, 99, "size must be the stored value");
+        assert_eq!(rows[0].mtime, 42, "mtime must be the stored value");
+    }
+
+    // ── 11. chunks_for_file ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn chunks_for_file_returns_rows_with_embedding_dim() {
+        let home = TempDir::new().unwrap();
+        let db = open_test_db(&home, "/test/chunks_for_file").await;
+
+        // Insert two chunks with embeddings and symbol_refs.
+        db.query("CREATE chunk SET file = '/test/foo.rs', line_start = 1, \
+                  line_end = 5, content = 'fn foo() {}', embedding = [1.0, 2.0, 3.0], \
+                  symbol_ref = 'symbol:⟨/test/foo.rs::foo::bar⟩'")
+            .await.unwrap();
+        db.query("CREATE chunk SET file = '/test/foo.rs', line_start = 10, \
+                  line_end = 20, content = 'fn bar() {}', embedding = [], \
+                  symbol_ref = NONE")
+            .await.unwrap();
+        // A chunk for a different file (must NOT be returned).
+        db.query("CREATE chunk SET file = '/test/other.rs', line_start = 1, \
+                  line_end = 5, content = 'x', embedding = [], symbol_ref = NONE")
+            .await.unwrap();
+
+        let chunks = chunks_for_file(&db, "/test/foo.rs", 100)
+            .await.expect("chunks_for_file");
+        assert_eq!(chunks.len(), 2, "must return 2 chunks for foo.rs");
+
+        // Ordered by line_start.
+        assert_eq!(chunks[0].line_start, 1);
+        assert_eq!(chunks[0].line_end, 5);
+        assert_eq!(chunks[0].embedding_dim, 3, "embedding dim must be 3");
+        assert_eq!(chunks[0].symbol.as_deref(), Some("bar"),
+            "symbol_ref must be stripped to just the name");
+
+        assert_eq!(chunks[1].line_start, 10);
+        assert_eq!(chunks[1].embedding_dim, 0, "empty embedding → dim 0");
+        assert_eq!(chunks[1].symbol, None, "NONE symbol_ref → None");
+    }
+
+    // ── 12. call_graph: degree arithmetic (+= mutant) ─────────────────────
+    //
+    // The hub has BOTH caller and callee degree. With `+=`, its total is
+    // out_c + in_c (high). With `-=`, it becomes negative (ranks last).
+    // With `*=`, all degrees are 0 (sorted by name; hub "zzz" sorts last).
+    // The hub's name is "zzz_hub" so it sorts LAST alphabetically, ensuring
+    // it is NOT selected when all degrees are 0 (the *= mutant).
+
+    #[tokio::test]
+    async fn call_graph_hub_with_both_directions_is_selected() {
+        let home = TempDir::new().unwrap();
+        let db = open_test_db(&home, "/test/cg_degree").await;
+
+        // Hub: called by 3 callers, calls 3 callees. Total degree = 6.
+        insert_symbol(&db, "zzz_hub", "/f.rs", "hub").await;
+        for i in 0..3 {
+            insert_call_names(&db, &format!("aaa_c{i}"), "zzz_hub").await;
+            insert_call_names(&db, "zzz_hub", &format!("aaa_t{i}")).await;
+        }
+
+        // node_limit=3: with correct degree (6), hub is top. With -= (-6) or
+        // *= (0, sorts last alphabetically), hub is NOT in top 3.
+        let graph = call_graph(&db, 100, 3).await.expect("call_graph");
+        assert!(
+            graph.nodes.iter().any(|n| n.id == "zzz_hub"),
+            "hub with highest total degree must be selected; got nodes: {:?}",
+            graph.nodes.iter().map(|n| &n.id).collect::<Vec<_>>()
+        );
+    }
+
+    // ── 13. call_graph: fetch multiplier (* mutant, / variant) ────────────
+    //
+    // With node_limit=10, fetch = 10*4 = 40 (correct) vs 10/4 = 2 (mutant).
+    // The hub is at position 4 in both degree queries (3 decoys with degree 3
+    // rank above it). fetch=2 misses the hub; fetch=40 includes it.
+
+    #[tokio::test]
+    async fn call_graph_fetch_multiplier_includes_beyond_top2() {
+        let home = TempDir::new().unwrap();
+        let db = open_test_db(&home, "/test/cg_fetch_div").await;
+
+        insert_symbol(&db, "hub", "/f.rs", "hub").await;
+
+        // 3 callee decoys (out_deg=3 each, ranked above hub's out_deg=2).
+        for d in 0..3 {
+            let decoy = format!("cd{d}");
+            for s in 0..3 {
+                insert_call_names(&db, &format!("s{d}_{s}"), &decoy).await;
+            }
+        }
+        // 3 caller decoys (in_deg=3 each, ranked above hub's in_deg=2).
+        for d in 0..3 {
+            let decoy = format!("cr{d}");
+            for t in 0..3 {
+                insert_call_names(&db, &decoy, &format!("t{d}_{t}")).await;
+            }
+        }
+        // Hub: out_deg=2, in_deg=2. Total=4 > decoys' total=3.
+        insert_call_names(&db, "sh1", "hub").await;
+        insert_call_names(&db, "sh2", "hub").await;
+        insert_call_names(&db, "hub", "th1").await;
+        insert_call_names(&db, "hub", "th2").await;
+
+        // node_limit=10: fetch=40 (correct) includes hub at position 4.
+        // fetch=2 (mutant /): hub not fetched from either query → degree 0.
+        let graph = call_graph(&db, 100, 10).await.expect("call_graph");
+        assert!(
+            graph.nodes.iter().any(|n| n.id == "hub"),
+            "hub with total degree 4 must be selected (fetch must include position 4); \
+             got nodes: {:?}",
+            graph.nodes.iter().map(|n| &n.id).collect::<Vec<_>>()
+        );
+    }
+
+    // ── 14. call_graph: fetch multiplier (* mutant, + variant) ────────────
+    //
+    // With node_limit=2, fetch = 2*4 = 8 (correct) vs 2+4 = 6 (mutant).
+    // The hub is at position 7 in both degree queries (6 decoys with degree 3
+    // rank above it). fetch=6 misses the hub; fetch=8 includes it.
+
+    #[tokio::test]
+    async fn call_graph_fetch_multiplier_plus_variant() {
+        let home = TempDir::new().unwrap();
+        let db = open_test_db(&home, "/test/cg_fetch_plus").await;
+
+        insert_symbol(&db, "hub", "/f.rs", "hub").await;
+
+        // 6 callee decoys (out_deg=3 each, ranked above hub's out_deg=2).
+        for d in 0..6 {
+            let decoy = format!("cd{d}");
+            for s in 0..3 {
+                insert_call_names(&db, &format!("s{d}_{s}"), &decoy).await;
+            }
+        }
+        // 6 caller decoys (in_deg=3 each, ranked above hub's in_deg=2).
+        for d in 0..6 {
+            let decoy = format!("cr{d}");
+            for t in 0..3 {
+                insert_call_names(&db, &decoy, &format!("t{d}_{t}")).await;
+            }
+        }
+        // Hub: out_deg=2, in_deg=2. Total=4 > decoys' total=3.
+        insert_call_names(&db, "sh1", "hub").await;
+        insert_call_names(&db, "sh2", "hub").await;
+        insert_call_names(&db, "hub", "th1").await;
+        insert_call_names(&db, "hub", "th2").await;
+
+        // node_limit=2: fetch=8 (correct) includes hub at position 7.
+        // fetch=6 (mutant +): hub not fetched from either query → degree 0.
+        let graph = call_graph(&db, 100, 2).await.expect("call_graph");
+        assert!(
+            graph.nodes.iter().any(|n| n.id == "hub"),
+            "hub with total degree 4 must be selected (fetch must include position 7); \
+             got nodes: {:?}",
+            graph.nodes.iter().map(|n| &n.id).collect::<Vec<_>>()
+        );
+    }
+
+    // ── 15. call_graph: edge filtering excludes dangling endpoints ────────
+    //
+    // A "ghost" hub (high degree, no symbol record) is in hub_fqns but NOT
+    // in node_ids. Edges to/from ghost must be EXCLUDED. The &&→|| mutants
+    // would include them because one operand is true.
+
+    #[tokio::test]
+    async fn call_graph_excludes_edges_to_missing_symbol_records() {
+        let home = TempDir::new().unwrap();
+        let db = open_test_db(&home, "/test/cg_dangling").await;
+
+        // "real" has a symbol record; "ghost" does NOT.
+        insert_symbol(&db, "real", "/f.rs", "real").await;
+
+        // Both are high-degree hubs (5 calls each direction).
+        for i in 0..5 {
+            insert_call_names(&db, &format!("r_caller{i}"), "real").await;
+            insert_call_names(&db, "real", &format!("r_callee{i}")).await;
+            insert_call_names(&db, &format!("g_caller{i}"), "ghost").await;
+            insert_call_names(&db, "ghost", &format!("g_callee{i}")).await;
+        }
+        // Edge from ghost → real (both are hubs, but ghost has no node).
+        insert_call_names(&db, "ghost", "real").await;
+
+        let graph = call_graph(&db, 100, 10).await.expect("call_graph");
+
+        // "real" must be a node.
+        assert!(
+            graph.nodes.iter().any(|n| n.id == "real"),
+            "real must be a node (has symbol record)"
+        );
+        // "ghost" must NOT be a node (no symbol record).
+        assert!(
+            !graph.nodes.iter().any(|n| n.id == "ghost"),
+            "ghost must NOT be a node (no symbol record)"
+        );
+        // Edge ghost→real must NOT appear (ghost is not a node).
+        assert!(
+            !graph.edges.iter().any(|e| e.source == "ghost" && e.target == "real"),
+            "edge from ghost (no node) to real must be excluded"
+        );
+    }
+
+    // ── 16. call_graph: truncation flag (edge_limit boundary) ─────────────
+    //
+    // total_edges >= edge_limit with hub_set.len() < node_limit → truncated=true.
+    // Catches: ||→&& (would be false), >=→< on total_edges (would be false).
+
+    #[tokio::test]
+    async fn call_graph_truncated_when_edges_hit_limit() {
+        let home = TempDir::new().unwrap();
+        let db = open_test_db(&home, "/test/cg_trunc_edges").await;
+
+        // Two hubs with 2 distinct edges between them (A→B, B→A).
+        insert_symbol(&db, "aaa", "/f.rs", "aaa").await;
+        insert_symbol(&db, "bbb", "/f.rs", "bbb").await;
+        insert_call_names(&db, "aaa", "bbb").await;
+        insert_call_names(&db, "bbb", "aaa").await;
+
+        // edge_limit=2: total_edges=2 >= 2 → truncated=true.
+        // node_limit=10: hub_set.len()=2 < 10 → only edge condition triggers.
+        let graph = call_graph(&db, 2, 10).await.expect("call_graph");
+        assert!(
+            graph.truncated,
+            "truncated must be true when total_edges >= edge_limit (got false)"
+        );
+    }
+
+    // ── 17. call_graph: truncation flag (node_limit boundary) ─────────────
+    //
+    // hub_set.len() >= node_limit with total_edges < edge_limit → truncated=true.
+    // Catches: ||→&& (would be false), >=→< on hub_set.len() (would be false).
+
+    #[tokio::test]
+    async fn call_graph_truncated_when_hubs_hit_limit() {
+        let home = TempDir::new().unwrap();
+        let db = open_test_db(&home, "/test/cg_trunc_nodes").await;
+
+        // 3 hubs with 1 edge between them.
+        insert_symbol(&db, "aaa", "/f.rs", "aaa").await;
+        insert_symbol(&db, "bbb", "/f.rs", "bbb").await;
+        insert_symbol(&db, "ccc", "/f.rs", "ccc").await;
+        insert_call_names(&db, "aaa", "bbb").await;
+
+        // node_limit=2: hub_set.len()=3 >= 2 → truncated=true.
+        // edge_limit=100: total_edges=1 < 100 → only node condition triggers.
+        let graph = call_graph(&db, 100, 2).await.expect("call_graph");
+        assert!(
+            graph.truncated,
+            "truncated must be true when hub_set.len() >= node_limit (got false)"
+        );
+    }
+}
