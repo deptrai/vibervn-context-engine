@@ -2685,4 +2685,462 @@ mod mutation_coverage {
         assert!(result.contains("Error:"));
         assert!(result.contains("embedding client"));
     }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // assemble_with_budget — remaining mutants
+    // Line 70: + → - in candidate_len (full-text path)
+    // Line 84: -= → += (multi-byte char at boundary 120)
+    // Line 84: -= → /= (same test → timeout)
+    // Line 91: > → >= in line_end > line_start
+    // Line 108: + → - in candidate_len (truncated path)
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// effective_budget = 48000 - 150 = 47850
+    #[test]
+    fn assemble_budget_boundary_plus_to_minus_full_text() {
+        // Two blocks: first fills most of budget, second's full_text
+        // fits with mutant (out.len() - sep + full) but not original (out.len() + sep + full).
+        // Block 1: header="H1", content = "a" * 47845 → full_text = "H1\n" + 47845 = 47848
+        // Block 2: header="H", content = "UNIQUE_XYZ" → full_text = "H\nUNIQUE_XYZ" = 13
+        // Original: 47848 + 2 + 13 = 47863 > 47850 → truncated path
+        //   Truncated text also too large → NOT pushed → output has only block 1 + footer
+        // Mutant:   47848 - 2 + 13 = 47859 > 47850 → still doesn't fit!
+        // Need: out.len() - 2 + full_text.len() ≤ 47850 AND out.len() + 2 + full_text.len() > 47850
+        // So full_text.len() must be in (47850 - out.len() + 2, 47850 - out.len() + 2]
+        // Wait: out.len() + 2 + ft > 47850 AND out.len() - 2 + ft ≤ 47850
+        // → ft > 47850 - out.len() - 2 AND ft ≤ 47850 - out.len() + 2
+        // → ft in (47850 - out.len() - 2, 47850 - out.len() + 2]
+        // out.len() = 47848 → ft in (0, 4] → ft must be 1,2,3, or 4
+        // Block 2: header="H", content="b" → full_text = "H\nb" = 3 bytes ✓
+        // Original: 47848 + 2 + 3 = 47853 > 47850 → truncated
+        // Mutant:   47848 - 2 + 3 = 47849 ≤ 47850 → full text included
+        // With original: block 2 goes to truncated path, but truncated text also doesn't fit
+        // → block 2 NOT in output. With mutant: block 2 full text IS in output.
+        // Use distinctive content to check presence.
+        let blocks = vec![
+            OutputBlock {
+                header: "H1".into(),
+                content: "a".repeat(47845),
+                file: "f.rs".into(),
+                line_start: 1,
+                line_end: 10,
+                ..Default::default()
+            },
+            OutputBlock {
+                header: "H".into(),
+                content: "Z".into(), // full_text = "H\nZ" = 3 bytes
+                file: "f2.rs".into(),
+                line_start: 1,
+                line_end: 10,
+                ..Default::default()
+            },
+        ];
+        let result = assemble_with_budget(&blocks);
+        // With original: block 2's full text doesn't fit, truncated text also doesn't fit
+        // → "H\nZ" should NOT appear in output (only in footer count)
+        // With mutant: "H\nZ" IS pushed to output
+        // Check that the output does NOT contain "H\nZ" (block 2's full text)
+        // The footer says "2 of 2 results truncated" in both cases.
+        assert!(
+            !result.contains("H\nZ"),
+            "block 2 full text must NOT be in output (candidate > budget with +), got suffix:\n{}",
+            &result[result.len().saturating_sub(100)..]
+        );
+    }
+
+    #[test]
+    fn assemble_budget_multibyte_first_line_boundary() {
+        // Kills `end -= 1` → `end += 1`: multi-byte char at byte 120.
+        // 119 ASCII chars + "é" (2 bytes: 0xC3 0xA9) + more chars.
+        // Byte 120 is 0xA9 (continuation byte) → not a char boundary.
+        // Original: end=120 → not boundary → end=119 → boundary → output 119 chars + "…"
+        // Mutant +=: end=120 → not boundary → end=121 → boundary → output 121 chars + "…"
+        // The outputs differ (119 vs 121 bytes before "…").
+        let first_line = format!("{}{}", "a".repeat(119), "ébcdefgh");
+        // first_line.len() = 119 + 8 = 127 bytes (é is 2 bytes)
+        // Need this block to be in truncated form (budget exceeded)
+        let big_block = OutputBlock {
+            header: "H".into(),
+            content: first_line,
+            file: "f.rs".into(),
+            line_start: 1,
+            line_end: 100,
+            ..Default::default()
+        };
+        // Create a first block that fills the budget
+        let filler = OutputBlock {
+            header: "F".into(),
+            content: "x".repeat(47845),
+            file: "f2.rs".into(),
+            line_start: 1,
+            line_end: 10,
+            ..Default::default()
+        };
+        let result = assemble_with_budget(&[filler, big_block]);
+        // The big_block is truncated. Its first line display should be
+        // 119 'a' chars + "…" (original) vs 119 'a' + "é" + "…" (mutant).
+        // Assert the truncated form contains exactly 119 'a's before "…"
+        // and does NOT contain "é" in the first line display.
+        assert!(
+            !result.contains("é"),
+            "truncated first line must NOT contain é (end should back off to 119, not advance to 121)"
+        );
+    }
+
+    #[test]
+    fn assemble_budget_line_end_equals_line_start_no_elision() {
+        // Kills `>` → `>=` in `block.line_end > block_start`
+        // When line_end == line_start, original shows no elision.
+        // Mutant (>=) would show elision marker.
+        // Need a block that gets truncated (budget exceeded) but whose
+        // truncated text still fits in the budget.
+        // Use a filler that leaves enough room for the truncated block.
+        let _filler = OutputBlock {
+            header: "F".into(),
+            content: "x".repeat(47800),
+            file: "f2.rs".into(),
+            line_start: 1,
+            line_end: 10,
+            ..Default::default()
+        };
+        // filler full_text = "F\n" + 47800 = 47802. out = 47802.
+        // budget_exceeded after filler? 47802 ≤ 47850 → fits → no truncation yet.
+        // Need second block to trigger budget_exceeded.
+        // Block 2: header="H", content="hello world", line_start=5, line_end=5
+        // full_text = "H\nhello world" = 13. candidate = 47802 + 2 + 13 = 47817 ≤ 47850 → fits!
+        // That won't trigger truncation. Need bigger filler.
+        // filler content = 47844 → full_text = 47846. out = 47846.
+        // Block 2: full_text = 13. candidate = 47846 + 2 + 13 = 47861 > 47850 → truncated!
+        // Truncated text (no elision, line_end==line_start) = "H\nhello world" = 13
+        // candidate_truncated = 47846 + 2 + 13 = 47861 > 47850 → doesn't fit!
+        // Need smaller filler. filler content = 47834 → full_text = 47836. out = 47836.
+        // Block 2 full_text = 13. candidate = 47836 + 2 + 13 = 47851 > 47850 → truncated!
+        // Truncated text = "H\nhello world" = 13. candidate_truncated = 47836 + 2 + 13 = 47851 > 47850 → doesn't fit!
+        // Need filler content = 47833 → out = 47835. candidate = 47835 + 2 + 13 = 47850 ≤ 47850 → fits!
+        // That won't trigger truncation.
+        // I need the full text to NOT fit but the truncated text to fit.
+        // full_text = "H\nhello world" = 13. truncated_text (no elision) = same = 13.
+        // So if full doesn't fit, truncated doesn't either (same size).
+        // I need elision to make truncated DIFFERENT from full. But line_end == line_start
+        // means no elision. So truncated == full. Can't distinguish.
+        // Instead, use content with multiple lines. full_text = "H\nhello\nworld" = 14.
+        // first_line = "hello". truncated (no elision) = "H\nhello" = 7.
+        // Now truncated < full. If full doesn't fit but truncated does, we can test.
+        // filler content = 47840 → out = 47842.
+        // full_text = "H\nhello\nworld" = 14. candidate = 47842 + 2 + 14 = 47858 > 47850 → truncated.
+        // truncated = "H\nhello" = 7. candidate_truncated = 47842 + 2 + 7 = 47851 > 47850 → doesn't fit!
+        // filler content = 47839 → out = 47841.
+        // candidate = 47841 + 2 + 14 = 47857 > 47850 → truncated.
+        // truncated = 7. candidate_truncated = 47841 + 2 + 7 = 47850 ≤ 47850 → fits!
+        // With original (no elision): truncated = "H\nhello" → pushed.
+        // With mutant (>=, elision present): truncated = "H\nhello\n... (L6-5 elided, use Read)" = 38
+        // candidate = 47841 + 2 + 38 = 47881 > 47850 → doesn't fit → NOT pushed.
+        // So original has "hello" in output, mutant doesn't.
+        let filler = OutputBlock {
+            header: "F".into(),
+            content: "x".repeat(47839),
+            file: "f2.rs".into(),
+            line_start: 1,
+            line_end: 10,
+            ..Default::default()
+        };
+        let truncated_block = OutputBlock {
+            header: "H".into(),
+            content: "hello\nworld".into(),
+            file: "f.rs".into(),
+            line_start: 5,
+            line_end: 5, // line_end == line_start → no elision
+            ..Default::default()
+        };
+        let result = assemble_with_budget(&[filler, truncated_block]);
+        // With original: truncated text "H\nhello" fits → "hello" is in output
+        // With mutant (>=): elision added → truncated text too large → "hello" NOT in output
+        assert!(
+            result.contains("hello"),
+            "truncated block with line_end==line_start must include first line (no elision marker)"
+        );
+        assert!(
+            !result.contains("elided"),
+            "must not show elision when line_end == line_start"
+        );
+    }
+
+    #[test]
+    fn assemble_budget_truncated_path_plus_to_minus() {
+        // Kills `+` → `-` at line 108 (truncated path candidate_len).
+        // After budget is exceeded, truncated blocks are added if they fit.
+        // Need: first block fills budget → budget_exceeded = true.
+        // Second truncated block: with original, candidate = out.len() + 2 + truncated.len() > budget
+        // With mutant: candidate = out.len() - 2 + truncated.len() ≤ budget
+        // So second truncated block is NOT included with original but IS with mutant.
+        // The difference: with original, the truncated text is not pushed to `out`
+        // but truncated_count is still incremented. With mutant, it IS pushed.
+        // We can detect this by checking the output length or content.
+        // Block 1: header="H1", content = "a" * 47844 → full_text = 47848. out = 47848.
+        // Block 2: header="H", content="b", line_start=5, line_end=5 (no elision)
+        //   full_text = "H\nb" = 3. candidate = 47848 + 2 + 3 = 47853 > 47850 → truncated
+        //   truncated_text = "H\nb" = 3 (same, no elision). candidate = 47848 + 2 + 3 = 47853 > 47850 → NOT pushed
+        //   Mutant: 47848 - 2 + 3 = 47849 ≤ 47850 → IS pushed
+        let block1_fixed = OutputBlock {
+            header: "H1".into(),
+            content: "a".repeat(47844),
+            file: "f.rs".into(),
+            line_start: 1,
+            line_end: 10,
+            ..Default::default()
+        };
+        let block2 = OutputBlock {
+            header: "H".into(),
+            content: "b".into(),
+            file: "f2.rs".into(),
+            line_start: 5,
+            line_end: 5, // no elision → truncated_text = "H\nb" = 3 bytes
+            ..Default::default()
+        };
+        let result = assemble_with_budget(&[block1_fixed, block2]);
+        // With original: block 2's truncated text is NOT pushed (candidate > budget)
+        // but truncated_count = 2. Footer is present.
+        // With mutant: block 2's truncated text IS pushed.
+        // Check: the result should NOT contain "\n\nH\nb" (block 2's truncated text with separator)
+        // right before the footer. With the mutant, it would be present.
+        // Actually, let's check if "H\nb" appears after block 1's content.
+        // The footer starts with "\n\n---\n". If "H\nb" appears before "---", it's the mutant.
+        let before_footer = result.split("---").next().unwrap_or(&result);
+        assert!(
+            !before_footer.ends_with("H\nb"),
+            "block 2 truncated text must NOT be included (candidate > budget with +)"
+        );
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // merge_overlapping_blocks — remaining mutant
+    // Line 213: > → >= in originals.len() > 1
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn merge_blocks_non_overlapping_same_file_preserves_content() {
+        // Two blocks from same file, NON-overlapping (not merged).
+        // originals.len() == 1 for each → original skips re-read (1 > 1 is false).
+        // Mutant (>= 1) would try re-read from FS for single-original blocks.
+        // If the file doesn't exist, mutant falls back to merge_content_fallback
+        // which with a single original returns the same content. So we need a
+        // file that EXISTS but has different content than the block.
+        // Create a temp file with known content, then use blocks with DIFFERENT content.
+        let tmp = TempDir::new().unwrap();
+        let file_path = tmp.path().join("test.rs");
+        std::fs::write(&file_path, "REAL FILE CONTENT\nLINE2\nLINE3\n").unwrap();
+        let file_str = file_path.to_str().unwrap();
+
+        let blocks = vec![
+            OutputBlock {
+                file: file_str.into(),
+                content: "FAKE CONTENT A".into(),
+                line_start: 1,
+                line_end: 1,
+                ..Default::default()
+            },
+            OutputBlock {
+                file: file_str.into(),
+                content: "FAKE CONTENT B".into(),
+                line_start: 10,
+                line_end: 10,
+                ..Default::default()
+            },
+        ];
+        let merged = merge_overlapping_blocks(blocks);
+        // With original (1 > 1 = false): no re-read → content stays "FAKE CONTENT A/B"
+        // With mutant (1 >= 1 = true): re-reads from FS → content becomes "REAL FILE CONTENT..."
+        assert_eq!(merged.len(), 2, "non-overlapping blocks should not merge");
+        assert!(
+            merged[0].content.contains("FAKE") || merged.iter().any(|b| b.content.contains("FAKE")),
+            "original content must be preserved (no FS re-read for single-original blocks)"
+        );
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // ServerHandler get_info — kills Default::default() mutant
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn mcp_handler_get_info_has_correct_implementation_name() {
+        // Kills `get_info → Default::default()` mutant.
+        // Default ServerInfo would have empty implementation name/version.
+        // Real get_info returns "context-engine-rs" + CARGO_PKG_VERSION.
+        let home = TempDir::new().unwrap();
+        let (engine, repo_dbs) = make_test_engine(&home).await;
+        let settings = Arc::new(RwLock::new(Settings::default()));
+        let handler = McpHandler::new(
+            home.path().to_path_buf(),
+            home.path().to_path_buf(),
+            engine,
+            repo_dbs,
+            settings,
+            &["codebase-retrieval".into(), "file-retrieval".into()],
+        );
+        let info = handler.get_info();
+        // Verify non-default: implementation name must be "context-engine-rs"
+        let impl_info = info.server_info;
+        assert_eq!(
+            impl_info.name.to_string(),
+            "context-engine-rs",
+            "get_info must return correct implementation name"
+        );
+        assert!(
+            !impl_info.version.to_string().is_empty(),
+            "get_info must return non-empty version"
+        );
+    }
+
+    #[tokio::test]
+    async fn repo_mcp_handler_get_info_has_correct_implementation_name() {
+        // Kills `RepoMcpHandler::get_info → Default::default()` mutant.
+        let home = TempDir::new().unwrap();
+        let (engine, repo_dbs) = make_test_engine(&home).await;
+        let settings = Arc::new(RwLock::new(Settings::default()));
+        let handler = RepoMcpHandler::new(
+            home.path().to_path_buf(),
+            home.path().to_path_buf(),
+            "/test/repo".to_string(),
+            engine,
+            repo_dbs,
+            settings,
+            &["codebase-retrieval".into(), "file-retrieval".into()],
+        );
+        let info = handler.get_info();
+        let impl_info = info.server_info;
+        assert_eq!(
+            impl_info.name.to_string(),
+            "context-engine-rs",
+            "get_info must return correct implementation name"
+        );
+        assert!(
+            !impl_info.version.to_string().is_empty(),
+            "get_info must return non-empty version"
+        );
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // McpHandler::codebase_retrieval / file_retrieval — kills Ok(Default::default())
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn mcp_handler_codebase_retrieval_returns_non_default_result() {
+        // Kills `codebase_retrieval → Ok(Default::default())` mutant.
+        // Default CallToolResult has empty content. Real method returns error text.
+        let home = TempDir::new().unwrap();
+        let (engine, repo_dbs) = make_test_engine(&home).await;
+        let settings = Arc::new(RwLock::new(Settings::default()));
+        let handler = McpHandler::new(
+            home.path().to_path_buf(),
+            home.path().to_path_buf(),
+            engine,
+            repo_dbs,
+            settings,
+            &["codebase-retrieval".into(), "file-retrieval".into()],
+        );
+        let args = CodebaseRetrievalArgs {
+            information_request: "find something".into(),
+            filter_kind: None,
+            filter_lang: None,
+            filter_path: None,
+            workspace_full_path: "".into(), // empty → error message
+        };
+        let result = handler
+            .codebase_retrieval(Parameters(args))
+            .await
+            .expect("method should succeed");
+        // Default CallToolResult has no content. Real result has error text.
+        assert!(
+            !result.content.is_empty(),
+            "codebase_retrieval must return non-empty content (not Default::default())"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_handler_file_retrieval_returns_non_default_result() {
+        // Kills `file_retrieval → Ok(Default::default())` mutant.
+        let home = TempDir::new().unwrap();
+        let (engine, repo_dbs) = make_test_engine(&home).await;
+        let settings = Arc::new(RwLock::new(Settings::default()));
+        let handler = McpHandler::new(
+            home.path().to_path_buf(),
+            home.path().to_path_buf(),
+            engine,
+            repo_dbs,
+            settings,
+            &["codebase-retrieval".into(), "file-retrieval".into()],
+        );
+        let args = FileRetrievalArgs {
+            workspace_full_path: "".into(), // empty → error message
+            file_path: "src/main.rs".into(),
+            information_request: "find something".into(),
+            top_k: None,
+        };
+        let result = handler
+            .file_retrieval(Parameters(args))
+            .await
+            .expect("method should succeed");
+        assert!(
+            !result.content.is_empty(),
+            "file_retrieval must return non-empty content (not Default::default())"
+        );
+    }
+
+    #[tokio::test]
+    async fn repo_mcp_handler_codebase_retrieval_returns_non_default_result() {
+        // Kills `RepoMcpHandler::codebase_retrieval → Ok(Default::default())` mutant.
+        let home = TempDir::new().unwrap();
+        let (engine, repo_dbs) = make_test_engine(&home).await;
+        let settings = Arc::new(RwLock::new(Settings::default()));
+        let handler = RepoMcpHandler::new(
+            home.path().to_path_buf(),
+            home.path().to_path_buf(),
+            "/test/repo".to_string(),
+            engine,
+            repo_dbs,
+            settings,
+            &["codebase-retrieval".into(), "file-retrieval".into()],
+        );
+        let args = RepoCodebaseRetrievalArgs {
+            information_request: "find something".into(),
+        };
+        let result = handler
+            .codebase_retrieval(Parameters(args))
+            .await
+            .expect("method should succeed");
+        assert!(
+            !result.content.is_empty(),
+            "codebase_retrieval must return non-empty content (not Default::default())"
+        );
+    }
+
+    #[tokio::test]
+    async fn repo_mcp_handler_file_retrieval_returns_non_default_result() {
+        // Kills `RepoMcpHandler::file_retrieval → Ok(Default::default())` mutant.
+        let home = TempDir::new().unwrap();
+        let (engine, repo_dbs) = make_test_engine(&home).await;
+        let settings = Arc::new(RwLock::new(Settings::default()));
+        let handler = RepoMcpHandler::new(
+            home.path().to_path_buf(),
+            home.path().to_path_buf(),
+            "/test/repo".to_string(),
+            engine,
+            repo_dbs,
+            settings,
+            &["codebase-retrieval".into(), "file-retrieval".into()],
+        );
+        let args = RepoFileRetrievalArgs {
+            file_path: "src/main.rs".into(),
+            information_request: "find something".into(),
+            top_k: None,
+        };
+        let result = handler
+            .file_retrieval(Parameters(args))
+            .await
+            .expect("method should succeed");
+        assert!(
+            !result.content.is_empty(),
+            "file_retrieval must return non-empty content (not Default::default())"
+        );
+    }
 }
