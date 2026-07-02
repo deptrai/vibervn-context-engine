@@ -21,6 +21,12 @@ copy_target = true
 # Only run `cargo test --lib` per mutant, not the bench binaries
 # (bench-query / bench-incremental / chunk_bench are measurement harnesses,
 # not unit-test targets — running them per-mutant would waste hours).
+#
+# NOTE: run-module.sh overrides this with a module-specific filter (e.g.
+# `["--lib", "store::ops"]`) to run only the tests for the module being
+# mutated, cutting test time from ~68s to ~2-5s per mutant (~15-30x faster).
+# The global fallback below runs ALL lib tests (~68s) for manual `cargo
+# mutants` invocations that don't pass a module filter.
 additional_cargo_test_args = ["--lib"]
 
 # Cap lints so denied warnings in mutated code don't block viable mutants.
