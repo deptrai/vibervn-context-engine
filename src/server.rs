@@ -173,18 +173,29 @@ pub fn build_router(
     let mcp_config = {
         // DNS-rebinding protection: if bind is non-loopback, add it to allowed_hosts.
         let is_loopback = matches!(bind_host, "127.0.0.1" | "localhost" | "::1");
+        // Stateless + JSON-response mode: bypass SSE framing entirely.
+        // Claude Code's interactive MCP client opens an SSE GET stream after the
+        // handshake, then aborts it immediately (subscribe=false). In stateful
+        // mode rmcp treats that abort as a session drop and clears the session
+        // cache, so subsequent tools/list calls 404 and the client sees no tools
+        // even though `claude mcp list` reports "Connected". Stateless mode has
+        // no session to drop, and json_response returns each response as a plain
+        // `application/json` body (allowed by MCP Streamable HTTP spec 2025-06-18)
+        // so there is no SSE stream for the client to abort. The context-engine
+        // tools are stateless by design (every call carries workspace_full_path),
+        // so no session state is lost.
+        let base = StreamableHttpServerConfig::default()
+            .with_stateful_mode(false)
+            .with_json_response(true);
         let base = if is_loopback {
-            StreamableHttpServerConfig::default()
-                .with_sse_keep_alive(Some(std::time::Duration::from_secs(5)))
+            base
         } else {
-            StreamableHttpServerConfig::default()
-                .with_sse_keep_alive(Some(std::time::Duration::from_secs(5)))
-                .with_allowed_hosts(vec![
-                    bind_host.to_string(),
-                    "localhost".to_string(),
-                    "127.0.0.1".to_string(),
-                    "::1".to_string(),
-                ])
+            base.with_allowed_hosts(vec![
+                bind_host.to_string(),
+                "localhost".to_string(),
+                "127.0.0.1".to_string(),
+                "::1".to_string(),
+            ])
         };
         // Attach the shared session store so idle-dropped sessions self-heal
         // via rmcp's restore path instead of 404-ing "Session not found".
