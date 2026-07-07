@@ -175,13 +175,16 @@ pub fn build_router(
         let is_loopback = matches!(bind_host, "127.0.0.1" | "localhost" | "::1");
         let base = if is_loopback {
             StreamableHttpServerConfig::default()
+                .with_sse_keep_alive(Some(std::time::Duration::from_secs(5)))
         } else {
-            StreamableHttpServerConfig::default().with_allowed_hosts(vec![
-                bind_host.to_string(),
-                "localhost".to_string(),
-                "127.0.0.1".to_string(),
-                "::1".to_string(),
-            ])
+            StreamableHttpServerConfig::default()
+                .with_sse_keep_alive(Some(std::time::Duration::from_secs(5)))
+                .with_allowed_hosts(vec![
+                    bind_host.to_string(),
+                    "localhost".to_string(),
+                    "127.0.0.1".to_string(),
+                    "::1".to_string(),
+                ])
         };
         // Attach the shared session store so idle-dropped sessions self-heal
         // via rmcp's restore path instead of 404-ing "Session not found".
