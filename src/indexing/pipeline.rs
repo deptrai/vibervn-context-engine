@@ -648,9 +648,64 @@ impl IndexPipeline {
             self.ignore_paths.clone(),
         );
 
+        // Crash-recovery gate: if the edges_resolved marker is absent, Phase 2
+        // never completed (or its marker was lost). This must be checked BEFORE
+        // the empty/non-empty change split — a crash can leave file_meta missing
+        // for some files (detected as Added) AND edges_resolved absent. Without
+        // this gate, the incremental path would re-process only the changed files
+        // and never re-stamp the global marker, leaving the repo in a permanently
+        // "unresolved" state. Forcing a full rebuild here regenerates all edges
+        // and re-stamps the marker, regardless of the change set.
+        let resolved = get_meta(db, EDGES_RESOLVED_KEY).await?.is_some();
+        if !resolved {
+            use serde::Deserialize;
+            #[derive(Deserialize)]
+            struct CountRow { count: i64 }
+            let raw_edge_count: Vec<CountRow> = db
+                .query("SELECT count() AS count FROM raw_edge GROUP ALL")
+                .await
+                .context("crash-recovery: count raw_edge")?
+                .take(0)?;
+            let raw_edge_total = raw_edge_count.first().map(|r| r.count).unwrap_or(0);
+
+            if raw_edge_total == 0 && !stored_meta.is_empty() {
+                // RAM-path crash: Stage 3 completed, Phase 2 never ran, no DB raw_edges.
+                // Force a full rebuild to regenerate calls edges.
+                warn!(
+                    repo = %self.repo,
+                    "RAM-path crash detected (edges_resolved absent, raw_edge empty, file_meta present) \
+                     — forcing full rebuild to recover calls edges"
+                );
+                let (new_vectors, stage_stats) = self.full_rebuild(db, None, event_bus, key_hints, cancel_token.as_ref()).await?;
+                if let Some(vi) = vector_index {
+                    let mut guard = vi.write().await;
+                    guard.replace_repo(&self.repo, &new_vectors, &[]);
+                }
+                self.invalidate_persisted_shard();
+                let indexed = get_all_file_meta(db, &self.repo).await?.len() as u64;
+                let total_files = stored_meta.len() as u64;
+                return Ok(IndexPipelineStats {
+                    indexed_files: indexed,
+                    total_files,
+                    phase2_ms: stage_stats.phase2_ms,
+                    ..Default::default()
+                });
+            } else if raw_edge_total > 0 {
+                // DB-path crash: raw_edges are in DB (overflow path or incremental).
+                // Replay full Phase 2 to resolve all edges, then stamp the marker.
+                info!(repo = %self.repo, raw_edge_total, "edges_resolved marker absent — replaying Phase 2 from DB");
+                self.resolve_edges_phase2(db, progress.as_ref(), cancel_token.as_ref()).await
+                    .context("edges Phase 2 replay (pre-incremental crash recovery)")?;
+            }
+            // If raw_edge_total == 0 AND stored_meta is empty, this is a fresh
+            // repo with no prior index — fall through to normal incremental/full
+            // rebuild logic below.
+        }
+
         if file_changes.is_empty() {
             debug!(repo = %self.repo, "no changes detected");
-            // Check if edges_resolved marker is missing.
+            // edges_resolved was already checked and recovered above; re-check
+            // is unnecessary but kept as a no-op guard for safety.
             let resolved = get_meta(db, EDGES_RESOLVED_KEY).await?.is_some();
             if !resolved {
                 // Check how many raw_edges are in the DB.

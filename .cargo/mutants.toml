@@ -1,0 +1,62 @@
+# cargo-mutants configuration — https://mutants.rs/
+#
+# Run:   cargo mutants                          # full run
+#        cargo mutants --list                   # just list generated mutants
+#        cargo mutants -f 'src/mcp.rs'          # mutate one file
+#        cargo mutants --shard 1/4              # parallel shard
+#        cargo mutants --iterate                # skip previously-caught mutants
+#
+# Results are written to mutants.out/ (gitignored).
+
+# ── Performance: avoid rebuilding 600+ deps per mutant ───────────────────
+# This repo has 600+ dependencies including RocksDB (200+ C++ files).
+# Default scratch-dir mode rebuilds ALL deps per mutant (~20 min/mutant).
+# `copy_target = true` copies target/ but build scripts (RocksDB) still rerun.
+# Best option: run with `--in-place` — shares target/ 100%, only rebuilds
+# the mutated crate (~5s build + ~70s test = ~75s/mutant).
+# CAVEAT: `--in-place` is sequential (no -j) and uses `git checkout` to
+# rollback mutations, so commit/stash uncommitted src/ changes before running.
+copy_target = true
+
+# Only run `cargo test --lib` per mutant, not the bench binaries
+# (bench-query / bench-incremental / chunk_bench are measurement harnesses,
+# not unit-test targets — running them per-mutant would waste hours).
+#
+# NOTE: run-module.sh overrides this with a module-specific filter (e.g.
+# `["--lib", "store::ops"]`) to run only the tests for the module being
+# mutated, cutting test time from ~68s to ~2-5s per mutant (~15-30x faster).
+# The global fallback below runs ALL lib tests (~68s) for manual `cargo
+# mutants` invocations that don't pass a module filter.
+additional_cargo_test_args = ["--lib"]
+
+# Cap lints so denied warnings in mutated code don't block viable mutants.
+cap_lints = true
+
+# Skip calls that are pure capacity hints / debug logging — mutating them is
+# almost never caught by tests and produces noise.
+skip_calls_defaults = true
+skip_calls = [
+    "debug",
+    "info",
+    "warn",
+    "error",
+    "trace",
+    "set_phase",
+    "set_run_total",
+    "set_processed",
+]
+
+# Exclude bench binaries and vendored tree-sitter grammar from mutation.
+# src/bin/ are measurement CLIs, not library logic.
+exclude_globs = [
+    "src/bin/**",
+    "vendor/**",
+]
+
+# Timeouts: the baseline `cargo test --lib` takes ~70s, but some individual
+# tests (e.g. live_handle_blocks_reset) run 60s+. Give mutants headroom so
+# slow-but-correct mutants aren't falsely flagged as timeouts.
+minimum_test_timeout = 300
+
+# Use the dev profile (debug=0, already optimized for fast builds).
+profile = "dev"

@@ -1862,3 +1862,254 @@ mod tests {
         assert_eq!(s2.machine_id.as_deref(), Some(id.as_str()));
     }
 }
+
+/// Mutation-coverage tests: each test pins an exact default value or behavior
+/// so that cargo-mutants mutants that swap a constant (e.g. `64` → `0`/`1`,
+/// `true` → `false`, `vec![…]` → `vec![]`) are caught.
+#[cfg(test)]
+mod mutation_coverage {
+    use super::*;
+    use tempfile::TempDir;
+
+    // ── Default-value functions ───────────────────────────────────────────
+
+    #[test]
+    fn mc_default_index_ignore_filenames_exact() {
+        let v = default_index_ignore_filenames();
+        assert_eq!(
+            v,
+            vec!["CLAUDE.md".to_string(), "AGENTS.md".to_string()],
+            "default_index_ignore_filenames must be [CLAUDE.md, AGENTS.md]"
+        );
+        // Also via Settings::default to cover the serde default path.
+        let s = Settings::default();
+        assert_eq!(s.index_ignore_filenames, v);
+    }
+
+    #[test]
+    fn mc_default_embed_concurrency_exact() {
+        assert_eq!(default_embed_concurrency(), 64);
+        assert_eq!(EmbeddingConfig::default().embed_concurrency, 64);
+    }
+
+    #[test]
+    fn mc_default_vector_resident_cap_mb_exact() {
+        assert_eq!(default_vector_resident_cap_mb(), 2048);
+        assert_eq!(Settings::default().vector_resident_cap_mb, 2048);
+    }
+
+    #[test]
+    fn mc_default_min_prune_lines_exact() {
+        assert_eq!(default_min_prune_lines(), 16);
+        assert_eq!(LlmConfig::default().rerank_min_prune_lines, 16);
+    }
+
+    #[test]
+    fn mc_default_use_structured_output_is_true() {
+        assert!(default_use_structured_output());
+        assert!(
+            LlmConfig::default().use_structured_output,
+            "use_structured_output must default to true"
+        );
+    }
+
+    #[test]
+    fn mc_default_mcp_index_wait_secs_exact() {
+        assert_eq!(default_mcp_index_wait_secs(), 50);
+        assert_eq!(Settings::default().mcp_index_wait_secs, 50);
+    }
+
+    #[test]
+    fn mc_default_mcp_stale_after_days_exact() {
+        assert_eq!(default_mcp_stale_after_days(), 7);
+        assert_eq!(Settings::default().mcp_stale_after_days, 7);
+    }
+
+    #[test]
+    fn mc_default_enabled_mcp_tools_exact() {
+        let v = default_enabled_mcp_tools();
+        assert_eq!(
+            v,
+            vec![
+                "codebase-retrieval".to_string(),
+                "file-retrieval".to_string(),
+            ]
+        );
+        assert_eq!(Settings::default().enabled_mcp_tools, v);
+    }
+
+    // ── Settings::repo_generation ─────────────────────────────────────────
+
+    #[test]
+    fn mc_repo_generation_unknown_is_zero_and_known_returns_value() {
+        let mut s = Settings::default();
+        // Unknown repo → 0.
+        assert_eq!(s.repo_generation("/never/indexed"), 0);
+        // Known repo → the stored value (not always 0).
+        s.repo_generations
+            .insert(crate::store::normalize_repo_path("/some/repo"), 3);
+        assert_eq!(s.repo_generation("/some/repo"), 3);
+    }
+
+    // ── ConfigError::fmt ──────────────────────────────────────────────────
+
+    #[test]
+    fn mc_config_error_display_is_nonempty_and_correct() {
+        let e = ConfigError::VersionTooNew { found: 42 };
+        let s = format!("{e}");
+        assert!(!s.is_empty(), "Display must not be empty");
+        assert!(s.contains("42"), "Display must mention the found version");
+        assert!(
+            s.contains("newer version"),
+            "Display must describe the newer-version scenario"
+        );
+
+        let e2 = ConfigError::MigrationFailed {
+            from: 3,
+            to: 4,
+            detail: "boom".to_string(),
+        };
+        let s2 = format!("{e2}");
+        assert!(s2.contains("v3") && s2.contains("v4"), "MigrationFailed Display must mention from/to versions");
+        assert!(s2.contains("boom"));
+    }
+
+    // ── ensure_dir_and_load: version comparison ───────────────────────────
+
+    /// A file whose version is NEWER than CURRENT_VERSION must be rejected with
+    /// VersionTooNew. Kills the `>` → `==` mutant (which would fall through to
+    /// the migration branch and load instead of erroring).
+    #[test]
+    fn mc_ensure_dir_and_load_version_too_new() {
+        let home = TempDir::new().expect("tempdir");
+        let path = config_path(home.path());
+        fs::create_dir_all(path.parent().expect("has parent")).expect("create dirs");
+
+        let future = CURRENT_VERSION + 1;
+        let content = format!(
+            r#"{{"version":{future},"repos":[],"embedding":{{"provider":"voyage","model":"","api_keys":[]}},"llm":{{"provider":"google","rerank_model":"","api_keys":[]}}}}"#
+        );
+        fs::write(&path, content).expect("write future settings.json");
+
+        match ensure_dir_and_load(home.path()) {
+            Err(ConfigError::VersionTooNew { found }) => {
+                assert_eq!(found, future);
+            }
+            other => panic!("expected VersionTooNew, got: {other:?}"),
+        }
+    }
+
+    /// A file at exactly CURRENT_VERSION loads without error. Kills the `>` →
+    /// `>=` mutant (which would treat CURRENT_VERSION as too-new — except the
+    /// earlier `==` branch guards it; this test also pins that the happy path
+    /// works so any reordering mutant is caught).
+    #[test]
+    fn mc_ensure_dir_and_load_current_version_loads_ok() {
+        let home = TempDir::new().expect("tempdir");
+        let path = config_path(home.path());
+        fs::create_dir_all(path.parent().expect("has parent")).expect("create dirs");
+
+        let s = Settings::default();
+        write_settings_atomic(&path, &s).expect("write current settings");
+
+        let loaded = ensure_dir_and_load(home.path()).expect("current version must load");
+        assert_eq!(loaded.version, CURRENT_VERSION);
+    }
+
+    // ── ensure_dir_and_load: repo normalization rewrite (line 709 `!=`) ────
+
+    /// When `repos` differ from `original_repos` after normalization, the file
+    /// must be rewritten on disk. Kills the `!=` → `==` mutant (which would
+    /// skip the rewrite). We use a trailing slash so normalization changes the
+    /// value on every platform.
+    #[test]
+    fn mc_ensure_dir_and_load_rewrites_normalized_repos() {
+        let home = TempDir::new().expect("tempdir");
+        let path = config_path(home.path());
+        fs::create_dir_all(path.parent().expect("has parent")).expect("create dirs");
+
+        // Write a CURRENT_VERSION file with a repo path that normalization will
+        // change (trailing slash is stripped by normalize_repo_path).
+        let raw = serde_json::to_string_pretty(&Settings {
+            repos: vec!["/foo/bar/".to_string()],
+            ..Settings::default()
+        })
+        .expect("serialize");
+        fs::write(&path, raw).expect("write");
+
+        let loaded = ensure_dir_and_load(home.path()).expect("load");
+        assert_eq!(loaded.repos, vec!["/foo/bar".to_string()]);
+
+        // The on-disk file must have been rewritten with the normalized repo.
+        let disk = fs::read_to_string(&path).expect("re-read");
+        let v: Value = serde_json::from_str(&disk).expect("parse");
+        let repos = v.get("repos").and_then(|r| r.as_array()).expect("repos array");
+        assert_eq!(
+            repos,
+            &[Value::String("/foo/bar".to_string())],
+            "on-disk repos must be normalized after load"
+        );
+    }
+
+    // ── ensure_machine_id: creates when absent & respects existing ─────────
+
+    /// `ensure_machine_id` must populate the field when it is `None`. Kills the
+    /// delete-`!` mutant on line 734 (which would make the guard treat a
+    /// non-empty id as absent and recompute, overwriting a user-supplied id).
+    #[test]
+    fn mc_ensure_machine_id_creates_when_absent() {
+        let home = TempDir::new().expect("tempdir");
+        let mut s = ensure_dir_and_load(home.path()).expect("load default");
+        assert!(s.machine_id.is_none() || s.machine_id.as_deref().map(str::is_empty).unwrap_or(true));
+        ensure_machine_id(home.path(), &mut s).expect("ensure");
+        let id = s.machine_id.as_deref().expect("populated");
+        assert!(!id.is_empty());
+        // Must be a 64-char hex sha256 digest.
+        assert_eq!(id.len(), 64, "machine_id must be a 64-char hex digest");
+        assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    /// `ensure_machine_id` must NOT overwrite an existing non-empty machine_id.
+    /// Kills the delete-`!` mutant: with `!` removed, a non-empty id is treated
+    /// as empty → recompute → the custom id is replaced by the seed.
+    #[test]
+    fn mc_ensure_machine_id_preserves_existing_nonempty() {
+        let home = TempDir::new().expect("tempdir");
+        // Bootstrap a settings file first so the directory exists.
+        let mut s = ensure_dir_and_load(home.path()).expect("load default");
+        // Inject a custom non-empty id and persist it.
+        s.machine_id = Some("custom-machine-id-12345".to_string());
+        let path = config_path(home.path());
+        write_settings_atomic(&path, &s).expect("persist custom id");
+
+        // Now call ensure_machine_id — it must be a no-op (keep custom id).
+        ensure_machine_id(home.path(), &mut s).expect("ensure");
+        assert_eq!(
+            s.machine_id.as_deref(),
+            Some("custom-machine-id-12345"),
+            "ensure_machine_id must not overwrite an existing non-empty id"
+        );
+    }
+
+    // ── compute_seed_machine_id: deterministic & well-formed ───────────────
+
+    /// `compute_seed_machine_id` must return a deterministic 64-char hex
+    /// digest (sha256). Kills the `returns "xyzzy"` mutant. Two consecutive
+    /// calls must agree when `machine_uid::get()` succeeds (the common path).
+    #[test]
+    fn mc_compute_seed_machine_id_is_deterministic_hex() {
+        let a = compute_seed_machine_id();
+        let b = compute_seed_machine_id();
+        assert_eq!(a.len(), 64, "seed must be a 64-char hex sha256 digest, got len {}", a.len());
+        assert!(
+            a.chars().all(|c| c.is_ascii_hexdigit()),
+            "seed must be hex: {a}"
+        );
+        // Deterministic on the hardware-uid path. (If machine_uid fails the
+        // fallback mixes time/pid so it is NOT deterministic — but the common
+        // path is, and the length/hex assertions above already kill "xyzzy".)
+        if machine_uid::get().is_ok() {
+            assert_eq!(a, b, "seed must be deterministic when machine_uid is available");
+        }
+    }
+}
