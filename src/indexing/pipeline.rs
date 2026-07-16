@@ -676,12 +676,16 @@ impl IndexPipeline {
                     "RAM-path crash detected (edges_resolved absent, raw_edge empty, file_meta present) \
                      — forcing full rebuild to recover calls edges"
                 );
-                let (new_vectors, stage_stats) = self.full_rebuild(db, None, event_bus, key_hints, cancel_token.as_ref()).await?;
-                if let Some(vi) = vector_index {
-                    let mut guard = vi.write().await;
-                    guard.replace_repo(&self.repo, &new_vectors, &[]);
-                }
-                self.invalidate_persisted_shard();
+                let stage_stats = self
+                    .full_rebuild(
+                        db,
+                        vector_index,
+                        None,
+                        event_bus,
+                        key_hints,
+                        cancel_token.as_ref(),
+                    )
+                    .await?;
                 let indexed = get_all_file_meta(db, &self.repo).await?.len() as u64;
                 let total_files = stored_meta.len() as u64;
                 return Ok(IndexPipelineStats {

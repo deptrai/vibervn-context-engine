@@ -1473,10 +1473,9 @@ async fn handle_repo_mcp(
                     ))
                 },
                 Arc::new(LocalSessionManager::default()),
-                mcp_config_with_store(
-                    StreamableHttpServerConfig::default(),
-                    state.mcp_session_store.clone(),
-                ),
+                StreamableHttpServerConfig::default()
+                    .with_stateful_mode(false)
+                    .with_json_response(true),
             );
             state
                 .repo_mcp_services

@@ -1710,7 +1710,15 @@ fn build_db_key(workspace: &str, file_path: &str) -> String {
     // Detect Windows-style path by content (backslash separators or drive
     // letter "X:") rather than cfg!(windows), so DB keys are stable across
     // host OSes — a Windows repo indexed on macOS must still use backslashes.
-    let is_windows_style = workspace.contains('\\') || workspace.contains(':');
+    let has_windows_drive_prefix = workspace
+        .as_bytes()
+        .get(1)
+        .is_some_and(|byte| *byte == b':')
+        && workspace
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphabetic);
+    let is_windows_style = workspace.contains('\\') || has_windows_drive_prefix;
     if is_windows_style {
         format!("{}\\{}", workspace, file_path.replace('/', "\\"))
     } else {
@@ -2484,6 +2492,12 @@ mod mutation_coverage {
         assert_eq!(key, r"C:foo\bar\baz");
     }
 
+    #[test]
+    fn db_key_unix_path_with_colon_uses_forward_slashes() {
+        let key = build_db_key("/tmp/api:v2", "src/main.rs");
+        assert_eq!(key, "/tmp/api:v2/src/main.rs");
+    }
+
     // ════════════════════════════════════════════════════════════════════════
     // chunks_for_file_with_embeddings — 1 mutant: Ok(vec![])
     // ════════════════════════════════════════════════════════════════════════
@@ -2737,6 +2751,8 @@ mod mutation_coverage {
             &Settings::default(),
             "find something",
             "/test/mut_do_query",
+            QueryGraphMode::Full,
+            Duration::ZERO,
         )
         .await;
         assert!(!result.is_empty());
