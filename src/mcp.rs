@@ -1707,14 +1707,15 @@ async fn do_query(
 fn build_db_key(workspace: &str, file_path: &str) -> String {
     let workspace = workspace.trim_end_matches(['/', '\\']);
     let file_path = file_path.trim_start_matches(['/', '\\']);
-    let file_path_native = if cfg!(windows) {
-        file_path.replace('/', "\\")
+    // Detect Windows-style path by content (backslash separators or drive
+    // letter "X:") rather than cfg!(windows), so DB keys are stable across
+    // host OSes — a Windows repo indexed on macOS must still use backslashes.
+    let is_windows_style = workspace.contains('\\') || workspace.contains(':');
+    if is_windows_style {
+        format!("{}\\{}", workspace, file_path.replace('/', "\\"))
     } else {
-        file_path.replace('\\', "/")
-    };
-    let repo_path = std::path::Path::new(workspace);
-    let abs_file = repo_path.join(&file_path_native);
-    abs_file.to_string_lossy().to_string()
+        format!("{}/{}", workspace, file_path.replace('\\', "/"))
+    }
 }
 
 /// Single-file semantic retrieval: embed query → fetch file chunks from DB →
@@ -1960,4 +1961,1244 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
         return 0.0;
     }
     dot / (norm_a * norm_b)
+}
+
+// ─── Mutation coverage tests ──────────────────────────────────────────────
+// Targets the missed mutants identified by cargo-mutants. Pure functions are
+// tested with exact-output assertions; DB-dependent functions use tempdir-backed
+// SurrealDB instances. Early-return paths of run_file_retrieval /
+// run_codebase_retrieval / do_query are exercised without network access.
+#[cfg(test)]
+mod mutation_coverage {
+    use super::*;
+    use crate::store::open_db;
+    use tempfile::TempDir;
+
+    // ════════════════════════════════════════════════════════════════════════
+    // cosine_similarity — 4 mutants: || → &&, / → *, * → /
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn cosine_orthogonal_exact_zero() {
+        let a = vec![1.0, 0.0];
+        let b = vec![0.0, 1.0];
+        assert_eq!(cosine_similarity(&a, &b), 0.0);
+    }
+
+    #[test]
+    fn cosine_identical_unit_vector() {
+        let a = vec![1.0, 0.0];
+        assert_eq!(cosine_similarity(&a, &a), 1.0);
+    }
+
+    #[test]
+    fn cosine_identical_non_unit_norm() {
+        // [3,4] vs [3,4]: dot=25, norms=5,5, cosine=25/25=1.0
+        // Kills `/` → `*`: 25 * (5*5) = 625 ≠ 1.0
+        // Kills `*` → `/` in norm product: 25 / (5/5) = 25 ≠ 1.0
+        let a = vec![3.0, 4.0];
+        assert_eq!(cosine_similarity(&a, &a), 1.0);
+    }
+
+    #[test]
+    fn cosine_known_value_partial_similarity() {
+        // [1,0] vs [1,1]: dot=1, norm_a=1, norm_b=sqrt(2)
+        // cosine = 1 / (1 * sqrt(2)) = 1/sqrt(2) ≈ 0.7071
+        // Kills `/` → `*`: 1 * (1*sqrt(2)) = sqrt(2) ≈ 1.414
+        // Kills `*` → `/` in norm product: 1 / (1/sqrt(2)) = sqrt(2) ≈ 1.414
+        let a = vec![1.0, 0.0];
+        let b = vec![1.0, 1.0];
+        let expected = 1.0 / 2.0_f32.sqrt();
+        assert!((cosine_similarity(&a, &b) - expected).abs() < 1e-6);
+    }
+
+    #[test]
+    fn cosine_known_value_3d_vectors() {
+        // [1,2,3] vs [4,5,6]: dot=32, norm_a=sqrt(14), norm_b=sqrt(77)
+        // cosine = 32 / (sqrt(14) * sqrt(77))
+        let a = vec![1.0, 2.0, 3.0];
+        let b = vec![4.0, 5.0, 6.0];
+        let expected = 32.0 / (14.0_f32.sqrt() * 77.0_f32.sqrt());
+        assert!((cosine_similarity(&a, &b) - expected).abs() < 1e-5);
+    }
+
+    #[test]
+    fn cosine_zero_vector_one_side_returns_zero() {
+        // Kills `||` → `&&`: with `&&`, only one norm being 0 wouldn't trigger guard.
+        // [0,0] vs [1,0]: norm_a=0, norm_b=1.
+        // Original (||): 0==0 || 1==0 → true → return 0.0
+        // Mutant (&&):  0==0 && 1==0 → false → dot/(0*1) = NaN
+        let a = vec![0.0, 0.0];
+        let b = vec![1.0, 0.0];
+        assert_eq!(cosine_similarity(&a, &b), 0.0);
+        assert_eq!(cosine_similarity(&b, &a), 0.0);
+    }
+
+    #[test]
+    fn cosine_same_direction_non_unit() {
+        // [1,0] vs [2,0]: same direction → cosine = 1.0
+        let a = vec![1.0, 0.0];
+        let b = vec![2.0, 0.0];
+        assert_eq!(cosine_similarity(&a, &b), 1.0);
+    }
+
+    #[test]
+    fn cosine_different_lengths_returns_zero() {
+        assert_eq!(cosine_similarity(&[1.0, 2.0], &[1.0]), 0.0);
+    }
+
+    #[test]
+    fn cosine_empty_returns_zero() {
+        assert_eq!(cosine_similarity(&[], &[]), 0.0);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // assemble_with_budget — 8 mutants: - → /, + → -, + → *, > → >=
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn budget_exact_output_single_block() {
+        let blocks = vec![OutputBlock {
+            header: "x.rs#L1-3".to_string(),
+            content: "1: hello\n2: world".to_string(),
+            file: "x.rs".to_string(),
+            line_start: 1,
+            line_end: 3,
+            ..Default::default()
+        }];
+        let out = assemble_with_budget(&blocks);
+        assert_eq!(out, "x.rs#L1-3\n1: hello\n2: world");
+    }
+
+    #[test]
+    fn budget_exact_output_two_blocks_fit() {
+        // Exact output verification catches arithmetic mutants (+ → *, + → -)
+        // that would alter candidate_len and change the flow.
+        let blocks = vec![
+            OutputBlock {
+                header: "a.rs#L1-5".to_string(),
+                content: "1: fn a() {}".to_string(),
+                file: "a.rs".to_string(),
+                line_start: 1,
+                line_end: 5,
+                ..Default::default()
+            },
+            OutputBlock {
+                header: "b.rs#L10-20".to_string(),
+                content: "10: fn b() {}".to_string(),
+                file: "b.rs".to_string(),
+                line_start: 10,
+                line_end: 20,
+                ..Default::default()
+            },
+        ];
+        let out = assemble_with_budget(&blocks);
+        assert_eq!(out, "a.rs#L1-5\n1: fn a() {}\n\nb.rs#L10-20\n10: fn b() {}");
+    }
+
+    #[test]
+    fn budget_empty_blocks_returns_empty() {
+        let out = assemble_with_budget(&[]);
+        assert_eq!(out, "");
+    }
+
+    #[test]
+    fn budget_minus_to_division_mutant() {
+        // effective_budget = MAX_TOOL_OUTPUT_CHARS - FOOTER_RESERVE = 47850
+        // Mutant (- → /): 48000 / 150 = 320
+        // A 500-char single-line block fits in 47850 but not 320.
+        let content = "x".repeat(500);
+        let blocks = vec![OutputBlock {
+            header: "f.rs#L1-1".to_string(),
+            content: content.clone(),
+            file: "f.rs".to_string(),
+            line_start: 1,
+            line_end: 1,
+            ..Default::default()
+        }];
+        let out = assemble_with_budget(&blocks);
+        assert!(
+            out.contains(&content),
+            "full 500-char content must be present (budget 47850), got len {}",
+            out.len()
+        );
+        assert!(!out.contains("truncated"));
+    }
+
+    #[test]
+    fn budget_plus_to_times_mutant() {
+        // Kills `+` → `*` in `out.len() + separator.len() + full_text.len()`
+        // Block 1: ~24000 chars → out.len() ≈ 24012
+        // Block 2: ~200 chars
+        // Original: 24012 + 2 + 214 = 24228 ≤ 47850 → both fit
+        // Mutant (*): 24012 * 2 + 214 = 48238 > 47850 → block 2 truncated
+        let big_content = "x".repeat(24000);
+        let small_content = "y".repeat(200);
+        let blocks = vec![
+            OutputBlock {
+                header: "big.rs#L1-1".to_string(),
+                content: big_content.clone(),
+                file: "big.rs".to_string(),
+                line_start: 1,
+                line_end: 1,
+                ..Default::default()
+            },
+            OutputBlock {
+                header: "small.rs#L1-1".to_string(),
+                content: small_content.clone(),
+                file: "small.rs".to_string(),
+                line_start: 1,
+                line_end: 1,
+                ..Default::default()
+            },
+        ];
+        let out = assemble_with_budget(&blocks);
+        assert!(out.contains(&small_content), "small block must fit fully");
+        assert!(out.contains(&big_content), "big block must fit fully");
+        assert!(!out.contains("truncated"));
+    }
+
+    #[test]
+    fn budget_first_line_exactly_120_no_ellipsis() {
+        // Kills `>` → `>=` in `first_line.len() > MAX_FIRST_LINE_CHARS`
+        // First block exceeds budget (short first line + huge body) → truncated.
+        // Second block's first line is exactly 120 chars → also truncated form.
+        // Original: 120 > 120 = false → no ellipsis on second block.
+        // Mutant (>=): 120 >= 120 = true → ellipsis appended on second block.
+        // The first block's first line is short (< 120) so it never gets ellipsis,
+        // making the second block the only possible source of "…".
+        let big = format!("1: short\n{}", "z".repeat(MAX_TOOL_OUTPUT_CHARS));
+        let exact_120 = "x".repeat(120);
+        let blocks = vec![
+            OutputBlock {
+                header: "big.rs#L1-999".to_string(),
+                content: big,
+                file: "big.rs".to_string(),
+                line_start: 1,
+                line_end: 999,
+                ..Default::default()
+            },
+            OutputBlock {
+                header: "line.rs#L1-1".to_string(),
+                content: exact_120.clone(),
+                file: "line.rs".to_string(),
+                line_start: 1,
+                line_end: 1,
+                ..Default::default()
+            },
+        ];
+        let out = assemble_with_budget(&blocks);
+        assert!(
+            out.contains(&exact_120),
+            "120-char first line must appear without ellipsis"
+        );
+        assert!(!out.contains('…'), "no ellipsis for exactly 120 chars");
+    }
+
+    #[test]
+    fn budget_truncation_footer_exact_count() {
+        // Verify truncated_count and blocks.len() in the footer.
+        let big = "z".repeat(MAX_TOOL_OUTPUT_CHARS);
+        let blocks = vec![
+            OutputBlock {
+                header: "big.rs#L1-999".to_string(),
+                content: big,
+                file: "big.rs".to_string(),
+                line_start: 1,
+                line_end: 999,
+                ..Default::default()
+            },
+            OutputBlock {
+                header: "small.rs#L1-5".to_string(),
+                content: "1: small".to_string(),
+                file: "small.rs".to_string(),
+                line_start: 1,
+                line_end: 5,
+                ..Default::default()
+            },
+        ];
+        let out = assemble_with_budget(&blocks);
+        assert!(out.contains("truncated to fit output size limit"));
+        assert!(out.contains("2 of 2 results truncated"));
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // merge_overlapping_blocks — 3 mutants: > → >=
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn merge_caller_count_equal_keeps_first_names() {
+        // Kills `>` → `>=` in `next.callers.unwrap_or(0) > current.callers.unwrap_or(0)`
+        // Two overlapping blocks with EQUAL caller counts but different names.
+        // Original (>): equal → don't adopt → keeps first block's names/caller_files.
+        // Mutant (>=): equal → adopt → takes second block's names/caller_files.
+        let blocks = vec![
+            OutputBlock {
+                file: "a.rs".into(),
+                content: "1: aaa".into(),
+                line_start: 1,
+                line_end: 50,
+                callers: Some(3),
+                caller_files: Some(2),
+                caller_names: vec!["first".into(), "second".into(), "third".into()],
+                ..Default::default()
+            },
+            OutputBlock {
+                file: "a.rs".into(),
+                content: "26: bbb".into(),
+                line_start: 26,
+                line_end: 75,
+                callers: Some(3),
+                caller_files: Some(1),
+                caller_names: vec!["alpha".into(), "beta".into(), "gamma".into()],
+                ..Default::default()
+            },
+        ];
+        let merged = merge_overlapping_blocks(blocks);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(
+            merged[0].caller_names,
+            vec!["first".to_string(), "second".to_string(), "third".to_string()]
+        );
+        assert_eq!(merged[0].caller_files, Some(2));
+    }
+
+    #[test]
+    fn merge_callee_count_equal_keeps_first_names() {
+        // Kills `>` → `>=` in `next.callees.unwrap_or(0) > current.callees.unwrap_or(0)`
+        let blocks = vec![
+            OutputBlock {
+                file: "a.rs".into(),
+                content: "1: aaa".into(),
+                line_start: 1,
+                line_end: 50,
+                callees: Some(2),
+                callee_names: vec!["call_a".into(), "call_b".into()],
+                ..Default::default()
+            },
+            OutputBlock {
+                file: "a.rs".into(),
+                content: "26: bbb".into(),
+                line_start: 26,
+                line_end: 75,
+                callees: Some(2),
+                callee_names: vec!["call_x".into(), "call_y".into()],
+                ..Default::default()
+            },
+        ];
+        let merged = merge_overlapping_blocks(blocks);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(
+            merged[0].callee_names,
+            vec!["call_a".to_string(), "call_b".to_string()]
+        );
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // build_augmented_query — 3 mutants: String::new(), "xyzzy", delete !
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn augmented_query_all_filters_exact() {
+        let result = build_augmented_query(
+            "find the parser",
+            Some(&["function".to_string(), "class".to_string()]),
+            Some(&["rust".to_string()]),
+            Some("src/"),
+        );
+        assert_eq!(
+            result,
+            "kind:function kind:class lang:rust path:src/ find the parser"
+        );
+    }
+
+    #[test]
+    fn augmented_query_no_filters_returns_original() {
+        let result = build_augmented_query("find the parser", None, None, None);
+        assert_eq!(result, "find the parser");
+    }
+
+    #[test]
+    fn augmented_query_empty_path_not_included() {
+        // Kills `delete !` in `!path.is_empty()`
+        // Original: empty path → not included.
+        // Mutant (delete !): empty path → included as "path:".
+        let result = build_augmented_query("find the parser", None, None, Some(""));
+        assert_eq!(result, "find the parser");
+        assert!(!result.contains("path:"));
+    }
+
+    #[test]
+    fn augmented_query_kind_only() {
+        let result = build_augmented_query(
+            "find the parser",
+            Some(&["function".to_string()]),
+            None,
+            None,
+        );
+        assert_eq!(result, "kind:function find the parser");
+    }
+
+    #[test]
+    fn augmented_query_lang_only() {
+        let result = build_augmented_query(
+            "find the parser",
+            None,
+            Some(&["python".to_string()]),
+            None,
+        );
+        assert_eq!(result, "lang:python find the parser");
+    }
+
+    #[test]
+    fn augmented_query_path_only() {
+        let result = build_augmented_query("find the parser", None, None, Some("src/main.rs"));
+        assert_eq!(result, "path:src/main.rs find the parser");
+    }
+
+    #[test]
+    fn augmented_query_non_empty_output() {
+        // Kills `String::new()` and `"xyzzy"` return mutants
+        let result = build_augmented_query("hello world", None, None, None);
+        assert!(!result.is_empty());
+        assert!(result.contains("hello world"));
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // format_enriched_caller_tag — 3 mutants: c > 0 → true, > → >=, > → <
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn caller_tag_count_zero_returns_empty() {
+        // Kills `c > 0` → `true`: with `true`, count=0 would produce a non-empty tag.
+        assert_eq!(format_enriched_caller_tag(Some(0), &[], None), "");
+    }
+
+    #[test]
+    fn caller_tag_count_none_returns_empty() {
+        assert_eq!(format_enriched_caller_tag(None, &[], None), "");
+    }
+
+    #[test]
+    fn caller_tag_names_exact_count_no_more_suffix() {
+        // Kills `>` → `>=` in `remaining > 0`
+        // count=3, 3 names → remaining=0.
+        // Original: 0 > 0 = false → " [callers: a, b, c]"
+        // Mutant (>=): 0 >= 0 = true → " [callers: a, b, c +0 more]"
+        let names = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        assert_eq!(
+            format_enriched_caller_tag(Some(3), &names, None),
+            " [callers: a, b, c]"
+        );
+    }
+
+    #[test]
+    fn caller_tag_more_names_than_count() {
+        let names = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        assert_eq!(
+            format_enriched_caller_tag(Some(5), &names, None),
+            " [callers: a, b, c +2 more]"
+        );
+    }
+
+    #[test]
+    fn caller_tag_no_names_count_only() {
+        assert_eq!(format_enriched_caller_tag(Some(3), &[], None), " [callers:3]");
+    }
+
+    #[test]
+    fn caller_tag_positive_count_non_empty() {
+        // Kills `>` → `<` in `c > 0`: with `<`, count=1 would fail (1 < 0 = false).
+        let names = vec!["foo".to_string()];
+        let tag = format_enriched_caller_tag(Some(1), &names, None);
+        assert!(!tag.is_empty());
+        assert!(tag.contains("foo"));
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // format_enriched_callee_tag — 3 mutants: c > 0 → true, > → >=, > → <
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn callee_tag_count_zero_returns_empty() {
+        // Kills `c > 0` → `true`
+        assert_eq!(format_enriched_callee_tag(Some(0), &[]), "");
+    }
+
+    #[test]
+    fn callee_tag_count_none_returns_empty() {
+        assert_eq!(format_enriched_callee_tag(None, &[]), "");
+    }
+
+    #[test]
+    fn callee_tag_names_exact_count_no_more_suffix() {
+        // Kills `>` → `>=` in `remaining > 0`
+        let names = vec!["x".to_string(), "y".to_string()];
+        assert_eq!(
+            format_enriched_callee_tag(Some(2), &names),
+            " [calls: x, y]"
+        );
+    }
+
+    #[test]
+    fn callee_tag_more_names_than_count() {
+        let names = vec!["x".to_string(), "y".to_string()];
+        assert_eq!(
+            format_enriched_callee_tag(Some(4), &names),
+            " [calls: x, y +2 more]"
+        );
+    }
+
+    #[test]
+    fn callee_tag_no_names_count_only() {
+        assert_eq!(format_enriched_callee_tag(Some(2), &[]), " [calls:2]");
+    }
+
+    #[test]
+    fn callee_tag_positive_count_non_empty() {
+        // Kills `>` → `<` in `c > 0`
+        let names = vec!["bar".to_string()];
+        let tag = format_enriched_callee_tag(Some(1), &names);
+        assert!(!tag.is_empty());
+        assert!(tag.contains("bar"));
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // build_db_key — 1 mutant: || → &&
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn db_key_backslash_without_colon_is_windows_style() {
+        // Kills `||` → `&&` in `workspace.contains('\\') || workspace.contains(':')`
+        // Path has backslash but no colon.
+        // Original (||): has \ → true → windows-style → backslash join
+        // Mutant (&&):  has \ but no : → false → unix-style → forward slash join
+        let key = build_db_key(r"\projects\foo", "src/main.rs");
+        assert_eq!(key, r"\projects\foo\src\main.rs");
+    }
+
+    #[test]
+    fn db_key_colon_without_backslash_is_windows_style() {
+        // Also kills `||` → `&&`: path has colon but no backslash.
+        let key = build_db_key("C:foo", "bar/baz");
+        assert_eq!(key, r"C:foo\bar\baz");
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // chunks_for_file_with_embeddings — 1 mutant: Ok(vec![])
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn chunks_for_file_returns_non_empty_results() {
+        // Kills `Ok(vec![])` return mutant
+        let home = TempDir::new().expect("tempdir");
+        let db = open_db(home.path(), "/test/mut_chunks", 0)
+            .await
+            .expect("open db");
+
+        let embedding = vec![0.1_f32, 0.2, 0.3];
+        db.query(
+            "CREATE chunk SET file = $f, line_start = 1, line_end = 10, \
+             content = 'fn hello() {}', embedding = $e, symbol_ref = NONE",
+        )
+        .bind(("f", "/test/mut_chunks/main.rs".to_string()))
+        .bind(("e", embedding.clone()))
+        .await
+        .expect("insert chunk");
+
+        let chunks = chunks_for_file_with_embeddings(&db, "/test/mut_chunks/main.rs")
+            .await
+            .expect("fetch chunks");
+
+        assert!(!chunks.is_empty(), "chunks must be non-empty");
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].line_start, 1);
+        assert_eq!(chunks[0].line_end, 10);
+        assert_eq!(chunks[0].content, "fn hello() {}");
+        assert_eq!(chunks[0].embedding, embedding);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // run_file_retrieval — early return paths
+    // Kills: non-empty output, delete ! in conditionals
+    // ════════════════════════════════════════════════════════════════════════
+
+    fn empty_repo_dbs() -> Arc<RwLock<HashMap<String, Surreal<Db>>>> {
+        Arc::new(RwLock::new(HashMap::new()))
+    }
+
+    #[tokio::test]
+    async fn file_retrieval_empty_workspace_returns_error() {
+        // Kills `delete !` in `repo.is_empty()` + non-empty output mutant
+        let home = TempDir::new().expect("tempdir");
+        let result = run_file_retrieval(
+            home.path(),
+            &empty_repo_dbs(),
+            &Settings::default(),
+            "",
+            "src/main.rs",
+            "find something",
+            5,
+        )
+        .await;
+        assert!(!result.is_empty());
+        assert!(result.contains("workspace_full_path is required"));
+    }
+
+    #[tokio::test]
+    async fn file_retrieval_empty_file_path_returns_error() {
+        // Kills `delete !` in `file_path.is_empty()`
+        let home = TempDir::new().expect("tempdir");
+        let result = run_file_retrieval(
+            home.path(),
+            &empty_repo_dbs(),
+            &Settings::default(),
+            "/some/repo",
+            "",
+            "find something",
+            5,
+        )
+        .await;
+        assert!(!result.is_empty());
+        assert!(result.contains("file_path is required"));
+    }
+
+    #[tokio::test]
+    async fn file_retrieval_whitespace_info_request_returns_error() {
+        // Kills `delete !` in `information_request.trim().is_empty()`
+        let home = TempDir::new().expect("tempdir");
+        let result = run_file_retrieval(
+            home.path(),
+            &empty_repo_dbs(),
+            &Settings::default(),
+            "/some/repo",
+            "src/main.rs",
+            "   ",
+            5,
+        )
+        .await;
+        assert!(!result.is_empty());
+        assert!(result.contains("information_request is required"));
+    }
+
+    #[tokio::test]
+    async fn file_retrieval_no_api_keys_returns_error() {
+        // Kills `delete !` in `settings.embedding.api_keys.is_empty()`
+        let home = TempDir::new().expect("tempdir");
+        let result = run_file_retrieval(
+            home.path(),
+            &empty_repo_dbs(),
+            &Settings::default(),
+            "/some/repo",
+            "src/main.rs",
+            "find something",
+            5,
+        )
+        .await;
+        assert!(!result.is_empty());
+        assert!(result.contains("no embedding API keys"));
+    }
+
+    #[tokio::test]
+    async fn file_retrieval_no_chunks_returns_not_found() {
+        // Kills `delete !` in `chunks.is_empty()`
+        // Needs: non-empty api_keys (to pass that check) + a DB with no chunks.
+        let home = TempDir::new().expect("tempdir");
+        let mut settings = Settings::default();
+        settings.embedding.api_keys = vec!["fake-key".to_string()];
+
+        let result = run_file_retrieval(
+            home.path(),
+            &empty_repo_dbs(),
+            &settings,
+            "/test/mut_no_chunks",
+            "src/main.rs",
+            "find something",
+            5,
+        )
+        .await;
+        assert!(!result.is_empty());
+        assert!(result.contains("No indexed chunks found for file"));
+        assert!(result.contains("src/main.rs"));
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // run_codebase_retrieval — early return paths
+    // Kills: non-empty output, delete ! in conditionals, == → !=
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// Build a minimal IndexEngine in a tempdir for tests that need the
+    /// parameter but never exercise it (early-return paths).
+    async fn make_test_engine(
+        home: &TempDir,
+    ) -> (
+        Arc<IndexEngine>,
+        Arc<RwLock<HashMap<String, Surreal<Db>>>>,
+    ) {
+        let repo_dbs: Arc<RwLock<HashMap<String, Surreal<Db>>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        let settings = Settings::default();
+        let settings_handle = Arc::new(RwLock::new(settings.clone()));
+        let engine = IndexEngine::start(
+            home.path().to_path_buf(),
+            home.path().join("embeddings"),
+            &settings,
+            repo_dbs.clone(),
+            settings_handle,
+            true, // no_watchers
+        )
+        .await;
+        (engine, repo_dbs)
+    }
+
+    #[tokio::test]
+    async fn codebase_retrieval_empty_workspace_returns_error() {
+        // Kills `delete !` in `repo.is_empty()` + non-empty output mutant
+        let home = TempDir::new().expect("tempdir");
+        let (engine, repo_dbs) = make_test_engine(&home).await;
+
+        let result = run_codebase_retrieval(
+            home.path(),
+            home.path(),
+            &engine,
+            &repo_dbs,
+            &Settings::default(),
+            "find something",
+            "",
+        )
+        .await;
+        assert!(!result.is_empty());
+        assert!(result.contains("workspace_full_path is required"));
+    }
+
+    #[tokio::test]
+    async fn codebase_retrieval_nonexistent_dir_returns_error() {
+        // Kills `delete !` in `!std::path::Path::new(repo).is_dir()`
+        // Also kills `delete !` in `!settings.repos.iter().any(|r| r == repo)`
+        //   (if that ! is deleted, the auto-register block is skipped, and the
+        //    function proceeds to the api_keys check instead of the is_dir check)
+        let home = TempDir::new().expect("tempdir");
+        let (engine, repo_dbs) = make_test_engine(&home).await;
+
+        let result = run_codebase_retrieval(
+            home.path(),
+            home.path(),
+            &engine,
+            &repo_dbs,
+            &Settings::default(),
+            "find something",
+            "/nonexistent/path/that/does/not/exist",
+        )
+        .await;
+        assert!(!result.is_empty());
+        assert!(result.contains("does not exist or is not a directory"));
+    }
+
+    #[tokio::test]
+    async fn codebase_retrieval_no_api_keys_returns_error() {
+        // Kills `delete !` in `settings.embedding.api_keys.is_empty()`
+        // Repo IS in settings.repos → skip auto-register → reach api_keys check.
+        let home = TempDir::new().expect("tempdir");
+        let repo = "/test/mut_repo_no_keys";
+        let (engine, repo_dbs) = make_test_engine(&home).await;
+        let settings = Settings {
+            repos: vec![repo.to_string()],
+            ..Default::default()
+        };
+
+        let result = run_codebase_retrieval(
+            home.path(),
+            home.path(),
+            &engine,
+            &repo_dbs,
+            &settings,
+            "find something",
+            repo,
+        )
+        .await;
+        assert!(!result.is_empty());
+        assert!(result.contains("no embedding API keys"));
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // do_query — non-empty output via VoyageClient error
+    // Kills: String::new(), "xyzzy" return mutants
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn do_query_no_api_keys_returns_non_empty_error() {
+        // VoyageClient::new fails with empty api_keys → non-empty error string.
+        let home = TempDir::new().expect("tempdir");
+        let (engine, repo_dbs) = make_test_engine(&home).await;
+
+        let result = do_query(
+            &engine,
+            &repo_dbs,
+            &Settings::default(),
+            "find something",
+            "/test/mut_do_query",
+        )
+        .await;
+        assert!(!result.is_empty());
+        assert!(result.contains("Error:"));
+        assert!(result.contains("embedding client"));
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // assemble_with_budget — remaining mutants
+    // Line 70: + → - in candidate_len (full-text path)
+    // Line 84: -= → += (multi-byte char at boundary 120)
+    // Line 84: -= → /= (same test → timeout)
+    // Line 91: > → >= in line_end > line_start
+    // Line 108: + → - in candidate_len (truncated path)
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// effective_budget = 48000 - 150 = 47850
+    #[test]
+    fn assemble_budget_boundary_plus_to_minus_full_text() {
+        // Two blocks: first fills most of budget, second's full_text
+        // fits with mutant (out.len() - sep + full) but not original (out.len() + sep + full).
+        // Block 1: header="H1", content = "a" * 47845 → full_text = "H1\n" + 47845 = 47848
+        // Block 2: header="H", content = "UNIQUE_XYZ" → full_text = "H\nUNIQUE_XYZ" = 13
+        // Original: 47848 + 2 + 13 = 47863 > 47850 → truncated path
+        //   Truncated text also too large → NOT pushed → output has only block 1 + footer
+        // Mutant:   47848 - 2 + 13 = 47859 > 47850 → still doesn't fit!
+        // Need: out.len() - 2 + full_text.len() ≤ 47850 AND out.len() + 2 + full_text.len() > 47850
+        // So full_text.len() must be in (47850 - out.len() + 2, 47850 - out.len() + 2]
+        // Wait: out.len() + 2 + ft > 47850 AND out.len() - 2 + ft ≤ 47850
+        // → ft > 47850 - out.len() - 2 AND ft ≤ 47850 - out.len() + 2
+        // → ft in (47850 - out.len() - 2, 47850 - out.len() + 2]
+        // out.len() = 47848 → ft in (0, 4] → ft must be 1,2,3, or 4
+        // Block 2: header="H", content="b" → full_text = "H\nb" = 3 bytes ✓
+        // Original: 47848 + 2 + 3 = 47853 > 47850 → truncated
+        // Mutant:   47848 - 2 + 3 = 47849 ≤ 47850 → full text included
+        // With original: block 2 goes to truncated path, but truncated text also doesn't fit
+        // → block 2 NOT in output. With mutant: block 2 full text IS in output.
+        // Use distinctive content to check presence.
+        let blocks = vec![
+            OutputBlock {
+                header: "H1".into(),
+                content: "a".repeat(47845),
+                file: "f.rs".into(),
+                line_start: 1,
+                line_end: 10,
+                ..Default::default()
+            },
+            OutputBlock {
+                header: "H".into(),
+                content: "Z".into(), // full_text = "H\nZ" = 3 bytes
+                file: "f2.rs".into(),
+                line_start: 1,
+                line_end: 10,
+                ..Default::default()
+            },
+        ];
+        let result = assemble_with_budget(&blocks);
+        // With original: block 2's full text doesn't fit, truncated text also doesn't fit
+        // → "H\nZ" should NOT appear in output (only in footer count)
+        // With mutant: "H\nZ" IS pushed to output
+        // Check that the output does NOT contain "H\nZ" (block 2's full text)
+        // The footer says "2 of 2 results truncated" in both cases.
+        assert!(
+            !result.contains("H\nZ"),
+            "block 2 full text must NOT be in output (candidate > budget with +), got suffix:\n{}",
+            &result[result.len().saturating_sub(100)..]
+        );
+    }
+
+    #[test]
+    fn assemble_budget_multibyte_first_line_boundary() {
+        // Kills `end -= 1` → `end += 1`: multi-byte char at byte 120.
+        // 119 ASCII chars + "é" (2 bytes: 0xC3 0xA9) + more chars.
+        // Byte 120 is 0xA9 (continuation byte) → not a char boundary.
+        // Original: end=120 → not boundary → end=119 → boundary → output 119 chars + "…"
+        // Mutant +=: end=120 → not boundary → end=121 → boundary → output 121 chars + "…"
+        // The outputs differ (119 vs 121 bytes before "…").
+        let first_line = format!("{}{}", "a".repeat(119), "ébcdefgh");
+        // first_line.len() = 119 + 8 = 127 bytes (é is 2 bytes)
+        // Need this block to be in truncated form (budget exceeded)
+        let big_block = OutputBlock {
+            header: "H".into(),
+            content: first_line,
+            file: "f.rs".into(),
+            line_start: 1,
+            line_end: 100,
+            ..Default::default()
+        };
+        // Create a first block that fills the budget
+        let filler = OutputBlock {
+            header: "F".into(),
+            content: "x".repeat(47845),
+            file: "f2.rs".into(),
+            line_start: 1,
+            line_end: 10,
+            ..Default::default()
+        };
+        let result = assemble_with_budget(&[filler, big_block]);
+        // The big_block is truncated. Its first line display should be
+        // 119 'a' chars + "…" (original) vs 119 'a' + "é" + "…" (mutant).
+        // Assert the truncated form contains exactly 119 'a's before "…"
+        // and does NOT contain "é" in the first line display.
+        assert!(
+            !result.contains("é"),
+            "truncated first line must NOT contain é (end should back off to 119, not advance to 121)"
+        );
+    }
+
+    #[test]
+    fn assemble_budget_line_end_equals_line_start_no_elision() {
+        // Kills `>` → `>=` in `block.line_end > block_start`
+        // When line_end == line_start, original shows no elision.
+        // Mutant (>=) would show elision marker.
+        // Need a block that gets truncated (budget exceeded) but whose
+        // truncated text still fits in the budget.
+        // Use a filler that leaves enough room for the truncated block.
+        let _filler = OutputBlock {
+            header: "F".into(),
+            content: "x".repeat(47800),
+            file: "f2.rs".into(),
+            line_start: 1,
+            line_end: 10,
+            ..Default::default()
+        };
+        // filler full_text = "F\n" + 47800 = 47802. out = 47802.
+        // budget_exceeded after filler? 47802 ≤ 47850 → fits → no truncation yet.
+        // Need second block to trigger budget_exceeded.
+        // Block 2: header="H", content="hello world", line_start=5, line_end=5
+        // full_text = "H\nhello world" = 13. candidate = 47802 + 2 + 13 = 47817 ≤ 47850 → fits!
+        // That won't trigger truncation. Need bigger filler.
+        // filler content = 47844 → full_text = 47846. out = 47846.
+        // Block 2: full_text = 13. candidate = 47846 + 2 + 13 = 47861 > 47850 → truncated!
+        // Truncated text (no elision, line_end==line_start) = "H\nhello world" = 13
+        // candidate_truncated = 47846 + 2 + 13 = 47861 > 47850 → doesn't fit!
+        // Need smaller filler. filler content = 47834 → full_text = 47836. out = 47836.
+        // Block 2 full_text = 13. candidate = 47836 + 2 + 13 = 47851 > 47850 → truncated!
+        // Truncated text = "H\nhello world" = 13. candidate_truncated = 47836 + 2 + 13 = 47851 > 47850 → doesn't fit!
+        // Need filler content = 47833 → out = 47835. candidate = 47835 + 2 + 13 = 47850 ≤ 47850 → fits!
+        // That won't trigger truncation.
+        // I need the full text to NOT fit but the truncated text to fit.
+        // full_text = "H\nhello world" = 13. truncated_text (no elision) = same = 13.
+        // So if full doesn't fit, truncated doesn't either (same size).
+        // I need elision to make truncated DIFFERENT from full. But line_end == line_start
+        // means no elision. So truncated == full. Can't distinguish.
+        // Instead, use content with multiple lines. full_text = "H\nhello\nworld" = 14.
+        // first_line = "hello". truncated (no elision) = "H\nhello" = 7.
+        // Now truncated < full. If full doesn't fit but truncated does, we can test.
+        // filler content = 47840 → out = 47842.
+        // full_text = "H\nhello\nworld" = 14. candidate = 47842 + 2 + 14 = 47858 > 47850 → truncated.
+        // truncated = "H\nhello" = 7. candidate_truncated = 47842 + 2 + 7 = 47851 > 47850 → doesn't fit!
+        // filler content = 47839 → out = 47841.
+        // candidate = 47841 + 2 + 14 = 47857 > 47850 → truncated.
+        // truncated = 7. candidate_truncated = 47841 + 2 + 7 = 47850 ≤ 47850 → fits!
+        // With original (no elision): truncated = "H\nhello" → pushed.
+        // With mutant (>=, elision present): truncated = "H\nhello\n... (L6-5 elided, use Read)" = 38
+        // candidate = 47841 + 2 + 38 = 47881 > 47850 → doesn't fit → NOT pushed.
+        // So original has "hello" in output, mutant doesn't.
+        let filler = OutputBlock {
+            header: "F".into(),
+            content: "x".repeat(47839),
+            file: "f2.rs".into(),
+            line_start: 1,
+            line_end: 10,
+            ..Default::default()
+        };
+        let truncated_block = OutputBlock {
+            header: "H".into(),
+            content: "hello\nworld".into(),
+            file: "f.rs".into(),
+            line_start: 5,
+            line_end: 5, // line_end == line_start → no elision
+            ..Default::default()
+        };
+        let result = assemble_with_budget(&[filler, truncated_block]);
+        // With original: truncated text "H\nhello" fits → "hello" is in output
+        // With mutant (>=): elision added → truncated text too large → "hello" NOT in output
+        assert!(
+            result.contains("hello"),
+            "truncated block with line_end==line_start must include first line (no elision marker)"
+        );
+        assert!(
+            !result.contains("elided"),
+            "must not show elision when line_end == line_start"
+        );
+    }
+
+    #[test]
+    fn assemble_budget_truncated_path_plus_to_minus() {
+        // Kills `+` → `-` at line 108 (truncated path candidate_len).
+        // After budget is exceeded, truncated blocks are added if they fit.
+        // Need: first block fills budget → budget_exceeded = true.
+        // Second truncated block: with original, candidate = out.len() + 2 + truncated.len() > budget
+        // With mutant: candidate = out.len() - 2 + truncated.len() ≤ budget
+        // So second truncated block is NOT included with original but IS with mutant.
+        // The difference: with original, the truncated text is not pushed to `out`
+        // but truncated_count is still incremented. With mutant, it IS pushed.
+        // We can detect this by checking the output length or content.
+        // Block 1: header="H1", content = "a" * 47844 → full_text = 47848. out = 47848.
+        // Block 2: header="H", content="b", line_start=5, line_end=5 (no elision)
+        //   full_text = "H\nb" = 3. candidate = 47848 + 2 + 3 = 47853 > 47850 → truncated
+        //   truncated_text = "H\nb" = 3 (same, no elision). candidate = 47848 + 2 + 3 = 47853 > 47850 → NOT pushed
+        //   Mutant: 47848 - 2 + 3 = 47849 ≤ 47850 → IS pushed
+        let block1_fixed = OutputBlock {
+            header: "H1".into(),
+            content: "a".repeat(47844),
+            file: "f.rs".into(),
+            line_start: 1,
+            line_end: 10,
+            ..Default::default()
+        };
+        let block2 = OutputBlock {
+            header: "H".into(),
+            content: "b".into(),
+            file: "f2.rs".into(),
+            line_start: 5,
+            line_end: 5, // no elision → truncated_text = "H\nb" = 3 bytes
+            ..Default::default()
+        };
+        let result = assemble_with_budget(&[block1_fixed, block2]);
+        // With original: block 2's truncated text is NOT pushed (candidate > budget)
+        // but truncated_count = 2. Footer is present.
+        // With mutant: block 2's truncated text IS pushed.
+        // Check: the result should NOT contain "\n\nH\nb" (block 2's truncated text with separator)
+        // right before the footer. With the mutant, it would be present.
+        // Actually, let's check if "H\nb" appears after block 1's content.
+        // The footer starts with "\n\n---\n". If "H\nb" appears before "---", it's the mutant.
+        let before_footer = result.split("---").next().unwrap_or(&result);
+        assert!(
+            !before_footer.ends_with("H\nb"),
+            "block 2 truncated text must NOT be included (candidate > budget with +)"
+        );
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // merge_overlapping_blocks — remaining mutant
+    // Line 213: > → >= in originals.len() > 1
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn merge_blocks_non_overlapping_same_file_preserves_content() {
+        // Two blocks from same file, NON-overlapping (not merged).
+        // originals.len() == 1 for each → original skips re-read (1 > 1 is false).
+        // Mutant (>= 1) would try re-read from FS for single-original blocks.
+        // If the file doesn't exist, mutant falls back to merge_content_fallback
+        // which with a single original returns the same content. So we need a
+        // file that EXISTS but has different content than the block.
+        // Create a temp file with known content, then use blocks with DIFFERENT content.
+        let tmp = TempDir::new().unwrap();
+        let file_path = tmp.path().join("test.rs");
+        std::fs::write(&file_path, "REAL FILE CONTENT\nLINE2\nLINE3\n").unwrap();
+        let file_str = file_path.to_str().unwrap();
+
+        let blocks = vec![
+            OutputBlock {
+                file: file_str.into(),
+                content: "FAKE CONTENT A".into(),
+                line_start: 1,
+                line_end: 1,
+                ..Default::default()
+            },
+            OutputBlock {
+                file: file_str.into(),
+                content: "FAKE CONTENT B".into(),
+                line_start: 10,
+                line_end: 10,
+                ..Default::default()
+            },
+        ];
+        let merged = merge_overlapping_blocks(blocks);
+        // With original (1 > 1 = false): no re-read → content stays "FAKE CONTENT A/B"
+        // With mutant (1 >= 1 = true): re-reads from FS → content becomes "REAL FILE CONTENT..."
+        assert_eq!(merged.len(), 2, "non-overlapping blocks should not merge");
+        assert!(
+            merged[0].content.contains("FAKE") || merged.iter().any(|b| b.content.contains("FAKE")),
+            "original content must be preserved (no FS re-read for single-original blocks)"
+        );
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // ServerHandler get_info — kills Default::default() mutant
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn mcp_handler_get_info_has_correct_implementation_name() {
+        // Kills `get_info → Default::default()` mutant.
+        // Default ServerInfo would have empty implementation name/version.
+        // Real get_info returns "context-engine-rs" + CARGO_PKG_VERSION.
+        let home = TempDir::new().unwrap();
+        let (engine, repo_dbs) = make_test_engine(&home).await;
+        let settings = Arc::new(RwLock::new(Settings::default()));
+        let handler = McpHandler::new(
+            home.path().to_path_buf(),
+            home.path().to_path_buf(),
+            engine,
+            repo_dbs,
+            settings,
+            &["codebase-retrieval".into(), "file-retrieval".into()],
+        );
+        let info = handler.get_info();
+        // Verify non-default: implementation name must be "context-engine-rs"
+        let impl_info = info.server_info;
+        assert_eq!(
+            impl_info.name.to_string(),
+            "context-engine-rs",
+            "get_info must return correct implementation name"
+        );
+        assert!(
+            !impl_info.version.to_string().is_empty(),
+            "get_info must return non-empty version"
+        );
+    }
+
+    #[tokio::test]
+    async fn repo_mcp_handler_get_info_has_correct_implementation_name() {
+        // Kills `RepoMcpHandler::get_info → Default::default()` mutant.
+        let home = TempDir::new().unwrap();
+        let (engine, repo_dbs) = make_test_engine(&home).await;
+        let settings = Arc::new(RwLock::new(Settings::default()));
+        let handler = RepoMcpHandler::new(
+            home.path().to_path_buf(),
+            home.path().to_path_buf(),
+            "/test/repo".to_string(),
+            engine,
+            repo_dbs,
+            settings,
+            &["codebase-retrieval".into(), "file-retrieval".into()],
+        );
+        let info = handler.get_info();
+        let impl_info = info.server_info;
+        assert_eq!(
+            impl_info.name.to_string(),
+            "context-engine-rs",
+            "get_info must return correct implementation name"
+        );
+        assert!(
+            !impl_info.version.to_string().is_empty(),
+            "get_info must return non-empty version"
+        );
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // McpHandler::codebase_retrieval / file_retrieval — kills Ok(Default::default())
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn mcp_handler_codebase_retrieval_returns_non_default_result() {
+        // Kills `codebase_retrieval → Ok(Default::default())` mutant.
+        // Default CallToolResult has empty content. Real method returns error text.
+        let home = TempDir::new().unwrap();
+        let (engine, repo_dbs) = make_test_engine(&home).await;
+        let settings = Arc::new(RwLock::new(Settings::default()));
+        let handler = McpHandler::new(
+            home.path().to_path_buf(),
+            home.path().to_path_buf(),
+            engine,
+            repo_dbs,
+            settings,
+            &["codebase-retrieval".into(), "file-retrieval".into()],
+        );
+        let args = CodebaseRetrievalArgs {
+            information_request: "find something".into(),
+            filter_kind: None,
+            filter_lang: None,
+            filter_path: None,
+            workspace_full_path: "".into(), // empty → error message
+        };
+        let result = handler
+            .codebase_retrieval(Parameters(args))
+            .await
+            .expect("method should succeed");
+        // Default CallToolResult has no content. Real result has error text.
+        assert!(
+            !result.content.is_empty(),
+            "codebase_retrieval must return non-empty content (not Default::default())"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_handler_file_retrieval_returns_non_default_result() {
+        // Kills `file_retrieval → Ok(Default::default())` mutant.
+        let home = TempDir::new().unwrap();
+        let (engine, repo_dbs) = make_test_engine(&home).await;
+        let settings = Arc::new(RwLock::new(Settings::default()));
+        let handler = McpHandler::new(
+            home.path().to_path_buf(),
+            home.path().to_path_buf(),
+            engine,
+            repo_dbs,
+            settings,
+            &["codebase-retrieval".into(), "file-retrieval".into()],
+        );
+        let args = FileRetrievalArgs {
+            workspace_full_path: "".into(), // empty → error message
+            file_path: "src/main.rs".into(),
+            information_request: "find something".into(),
+            top_k: None,
+        };
+        let result = handler
+            .file_retrieval(Parameters(args))
+            .await
+            .expect("method should succeed");
+        assert!(
+            !result.content.is_empty(),
+            "file_retrieval must return non-empty content (not Default::default())"
+        );
+    }
+
+    #[tokio::test]
+    async fn repo_mcp_handler_codebase_retrieval_returns_non_default_result() {
+        // Kills `RepoMcpHandler::codebase_retrieval → Ok(Default::default())` mutant.
+        let home = TempDir::new().unwrap();
+        let (engine, repo_dbs) = make_test_engine(&home).await;
+        let settings = Arc::new(RwLock::new(Settings::default()));
+        let handler = RepoMcpHandler::new(
+            home.path().to_path_buf(),
+            home.path().to_path_buf(),
+            "/test/repo".to_string(),
+            engine,
+            repo_dbs,
+            settings,
+            &["codebase-retrieval".into(), "file-retrieval".into()],
+        );
+        let args = RepoCodebaseRetrievalArgs {
+            information_request: "find something".into(),
+        };
+        let result = handler
+            .codebase_retrieval(Parameters(args))
+            .await
+            .expect("method should succeed");
+        assert!(
+            !result.content.is_empty(),
+            "codebase_retrieval must return non-empty content (not Default::default())"
+        );
+    }
+
+    #[tokio::test]
+    async fn repo_mcp_handler_file_retrieval_returns_non_default_result() {
+        // Kills `RepoMcpHandler::file_retrieval → Ok(Default::default())` mutant.
+        let home = TempDir::new().unwrap();
+        let (engine, repo_dbs) = make_test_engine(&home).await;
+        let settings = Arc::new(RwLock::new(Settings::default()));
+        let handler = RepoMcpHandler::new(
+            home.path().to_path_buf(),
+            home.path().to_path_buf(),
+            "/test/repo".to_string(),
+            engine,
+            repo_dbs,
+            settings,
+            &["codebase-retrieval".into(), "file-retrieval".into()],
+        );
+        let args = RepoFileRetrievalArgs {
+            file_path: "src/main.rs".into(),
+            information_request: "find something".into(),
+            top_k: None,
+        };
+        let result = handler
+            .file_retrieval(Parameters(args))
+            .await
+            .expect("method should succeed");
+        assert!(
+            !result.content.is_empty(),
+            "file_retrieval must return non-empty content (not Default::default())"
+        );
+    }
 }

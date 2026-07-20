@@ -1,0 +1,24 @@
+--- src/config.rs
++++ replace migrate_v1_to_v2 -> Result<Value, ConfigError> with Ok(Default::default())
+@@ -20,20 +20,17 @@
+ pub const MIGRATIONS: &[MigrationFn] = &[migrate_v1_to_v2, migrate_v2_to_v3, migrate_v3_to_v4, migrate_v4_to_v5, migrate_v5_to_v6, migrate_v6_to_v7, migrate_v7_to_v8, migrate_v8_to_v9];
+ 
+ /// v1→v2: introduce `data_dir` (Option<PathBuf>). The body is a no-op stamp —
+ /// `serde(default)` already handles missing fields on deserialize, but we
+ /// persist an explicit `null` and bump the file's `version` so that an older
+ /// v1 binary refuses to read this file (VersionTooNew) instead of silently
+ /// dropping the new field on the next save.
+ fn migrate_v1_to_v2(mut value: Value) -> Result<Value, ConfigError> {
+-    if let Value::Object(ref mut obj) = value {
+-        obj.entry("data_dir".to_string()).or_insert(Value::Null);
+-    }
+-    Ok(value)
++    Ok(Default::default()) /* ~ changed by cargo-mutants ~ */
+ }
+ 
+ /// v2→v3: introduce `embeddings_dir` (Option<PathBuf>). Same no-op stamp +
+ /// forward-incompat tripwire rationale as v1→v2. `embeddings_dir` lets the
+ /// content-addressed embedding cache live at its own location — typically a
+ /// SHARED path across multiple instances, so identical code chunks are embedded
+ /// once (the cache is concurrency-safe; only RocksDB needs per-instance
+ /// isolation). `None` means the builtin default

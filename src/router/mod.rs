@@ -163,11 +163,25 @@ pub async fn build_router_app(opts: RouterBootOptions) -> Result<(Router, ProxyC
     let enabled_tools = settings.enabled_mcp_tools.clone();
     let bind_host = opts.bind.clone();
     let mcp_config = {
+        // Stateless + JSON-response mode: bypass SSE framing entirely.
+        // Claude Code's interactive MCP client opens an SSE GET stream after the
+        // handshake, then aborts it immediately (subscribe=false). In stateful
+        // mode rmcp treats that abort as a session drop and clears the session
+        // cache, so subsequent tools/list calls 404 and the client sees no tools
+        // even though `claude mcp list` reports "Connected". Stateless mode has
+        // no session to drop, and json_response returns each response as a plain
+        // `application/json` body (allowed by MCP Streamable HTTP spec 2025-06-18)
+        // so there is no SSE stream for the client to abort. The proxy tools are
+        // stateless by design (every call carries workspace_full_path), so no
+        // session state is lost.
         let is_loopback = matches!(bind_host.as_str(), "127.0.0.1" | "localhost" | "::1");
+        let base = StreamableHttpServerConfig::default()
+            .with_stateful_mode(false)
+            .with_json_response(true);
         if is_loopback {
-            StreamableHttpServerConfig::default()
+            base
         } else {
-            StreamableHttpServerConfig::default().with_allowed_hosts(vec![
+            base.with_allowed_hosts(vec![
                 bind_host.clone(),
                 "localhost".to_string(),
                 "127.0.0.1".to_string(),

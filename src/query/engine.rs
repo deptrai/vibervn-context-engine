@@ -1274,3 +1274,633 @@ mod tests {
         assert_eq!(format_callee_tag(&stats), " [calls: foo, bar, baz]");
     }
 }
+
+// ─── Mutation coverage tests ──────────────────────────────────────────────
+//
+// These tests exist to kill mutants reported by `cargo-mutants`. They target
+// pure helpers (lang_matches_alias, apply_query_filters, read_lines_from_fs,
+// slice_numbered) and DB-backed helpers (fetch_chunk_content,
+// fetch_symbol_kind, fetch_caller_stats_batch, query_caller_callee_stats).
+
+#[cfg(test)]
+mod mutation_coverage {
+    use super::*;
+    use crate::query::filters::QueryFilters;
+    use crate::query::merger::MergeChunk;
+    use std::collections::HashMap;
+
+    /// Build a MergeChunk with the given file path, optional symbol short name,
+    /// and optional symbol kind. Other fields are filled with benign defaults.
+    fn mk_chunk(file: &str, symbol: Option<&str>, kind: Option<&str>) -> MergeChunk {
+        MergeChunk {
+            file: file.to_string(),
+            line_start: 1,
+            line_end: 10,
+            score: 1.0,
+            content: "x".to_string(),
+            symbol: symbol.map(|s| s.to_string()),
+            symbol_fqn: None,
+            symbol_kind: kind.map(|s| s.to_string()),
+        }
+    }
+
+    // ── lang_matches_alias ─────────────────────────────────────────────────
+    // Single test covering ALL 14+ language aliases. Kills: replace-with-true,
+    // replace-with-false, delete-each-arm, == -> !=, || -> && (first arm).
+
+    #[test]
+    fn lang_matches_alias_all_aliases_and_negatives() {
+        // Every (filter, detected) pair MUST return true.
+        let true_cases: &[(&str, &str)] = &[
+            ("ts", "typescript"),
+            ("typescript", "typescript"),
+            ("ts", "tsx"),
+            ("typescript", "tsx"),
+            ("js", "javascript"),
+            ("javascript", "javascript"),
+            ("tsx", "tsx"),
+            ("py", "python"),
+            ("python", "python"),
+            ("rs", "rust"),
+            ("rust", "rust"),
+            ("go", "go"),
+            ("golang", "go"),
+            ("java", "java"),
+            ("c", "c"),
+            ("cpp", "cpp"),
+            ("c++", "cpp"),
+            ("cxx", "cpp"),
+            ("cs", "csharp"),
+            ("csharp", "csharp"),
+            ("c#", "csharp"),
+            ("rb", "ruby"),
+            ("ruby", "ruby"),
+            ("php", "php"),
+            ("swift", "swift"),
+            ("kotlin", "kotlin"),
+            ("kt", "kotlin"),
+            ("dart", "dart"),
+        ];
+        for (filter, detected) in true_cases {
+            assert!(
+                lang_matches_alias(filter, detected),
+                "lang_matches_alias({filter:?}, {detected:?}) should be true"
+            );
+        }
+
+        // Wrong/unknown matches MUST return false.
+        let false_cases: &[(&str, &str)] = &[
+            ("ts", "rust"),
+            ("rust", "typescript"),
+            ("py", "javascript"),
+            ("go", "python"),
+            ("java", "c"),
+            ("c", "cpp"),
+            ("cpp", "c"),
+            ("cs", "cpp"),
+            ("rb", "php"),
+            ("php", "ruby"),
+            ("swift", "kotlin"),
+            ("kotlin", "swift"),
+            ("dart", "go"),
+            ("tsx", "typescript"),
+            ("unknownlang", "rust"),
+            ("rust", "unknownlang"),
+            ("xyz", "abc"),
+            ("ts", "javascript"),
+            ("js", "typescript"),
+        ];
+        for (filter, detected) in false_cases {
+            assert!(
+                !lang_matches_alias(filter, detected),
+                "lang_matches_alias({filter:?}, {detected:?}) should be false"
+            );
+        }
+    }
+
+    // ── apply_query_filters ────────────────────────────────────────────────
+    // Kills: replace-with-vec![] (non-empty when filters match), delete-!,
+    // && -> ||, and <= -> > in the fuzzy fallback.
+
+    #[test]
+    fn apply_filters_empty_returns_all() {
+        let chunks = vec![
+            mk_chunk("/src/main.rs", None, None),
+            mk_chunk("/lib/util.rs", None, None),
+        ];
+        let filters = QueryFilters::default();
+        let out = apply_query_filters(chunks, &filters);
+        assert_eq!(out.len(), 2, "no filters → all chunks retained");
+    }
+
+    #[test]
+    fn apply_filters_path_keeps_matching_drops_rest() {
+        let chunks = vec![
+            mk_chunk("/src/main.rs", None, None),
+            mk_chunk("/lib/util.rs", None, None),
+        ];
+        let filters = QueryFilters {
+            path_filters: vec!["src/".into()],
+            ..Default::default()
+        };
+        let out = apply_query_filters(chunks, &filters);
+        assert_eq!(out.len(), 1, "only the path-matching chunk survives");
+        assert_eq!(out[0].file, "/src/main.rs");
+    }
+
+    #[test]
+    fn apply_filters_path_backslash_separator() {
+        let chunks = vec![mk_chunk("src\\main.rs", None, None)];
+        let filters = QueryFilters {
+            path_filters: vec!["src/".into()],
+            ..Default::default()
+        };
+        let out = apply_query_filters(chunks, &filters);
+        assert_eq!(out.len(), 1, "backslash-normalized path should match");
+    }
+
+    #[test]
+    fn apply_filters_language_by_name_and_alias() {
+        let chunks = vec![
+            mk_chunk("/a/main.rs", None, None),
+            mk_chunk("/b/main.py", None, None),
+            mk_chunk("/c/main.ts", None, None),
+        ];
+        // Full language name.
+        let filters = QueryFilters {
+            languages: vec!["rust".into()],
+            ..Default::default()
+        };
+        let out = apply_query_filters(chunks.clone(), &filters);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].file.ends_with(".rs"));
+
+        // Alias "rs" maps to rust.
+        let filters = QueryFilters {
+            languages: vec!["rs".into()],
+            ..Default::default()
+        };
+        let out = apply_query_filters(chunks.clone(), &filters);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].file.ends_with(".rs"));
+
+        // "ts" alias matches both .ts (typescript) and .tsx.
+        let filters = QueryFilters {
+            languages: vec!["ts".into()],
+            ..Default::default()
+        };
+        let out = apply_query_filters(chunks, &filters);
+        assert_eq!(out.len(), 1, "ts alias keeps the .ts file");
+        assert!(out[0].file.ends_with(".ts"));
+    }
+
+    #[test]
+    fn apply_filters_kind_keeps_matching() {
+        let chunks = vec![
+            mk_chunk("/a.rs", Some("foo"), Some("function")),
+            mk_chunk("/b.rs", Some("bar"), Some("class")),
+        ];
+        let filters = QueryFilters {
+            kinds: vec!["function".into()],
+            ..Default::default()
+        };
+        let out = apply_query_filters(chunks, &filters);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].symbol.as_deref(), Some("foo"));
+    }
+
+    #[test]
+    fn apply_filters_kind_case_insensitive() {
+        let chunks = vec![mk_chunk("/a.rs", Some("foo"), Some("Function"))];
+        let filters = QueryFilters {
+            kinds: vec!["FUNCTION".into()],
+            ..Default::default()
+        };
+        let out = apply_query_filters(chunks, &filters);
+        assert_eq!(out.len(), 1);
+    }
+
+    #[test]
+    fn apply_filters_name_exact_match() {
+        let chunks = vec![
+            mk_chunk("/a.rs", Some("parse_file"), None),
+            mk_chunk("/b.rs", Some("run_query"), None),
+        ];
+        let filters = QueryFilters {
+            name_filters: vec!["parse_file".into()],
+            ..Default::default()
+        };
+        let out = apply_query_filters(chunks, &filters);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].symbol.as_deref(), Some("parse_file"));
+    }
+
+    #[test]
+    fn apply_filters_name_case_insensitive_substring() {
+        let chunks = vec![mk_chunk("/a.rs", Some("ParseFile"), None)];
+        let filters = QueryFilters {
+            name_filters: vec!["parsefile".into()],
+            ..Default::default()
+        };
+        let out = apply_query_filters(chunks, &filters);
+        assert_eq!(out.len(), 1);
+    }
+
+    #[test]
+    fn apply_filters_name_fuzzy_fallback_distance_two() {
+        // "parse" vs "porso": two substitutions (a→o, e→o) → edit distance 2.
+        // Exact pass yields zero → fuzzy fallback triggers. `<= 2` keeps it;
+        // the `> 2` mutant would drop it.
+        let chunks = vec![mk_chunk("/a.rs", Some("parse"), None)];
+        let filters = QueryFilters {
+            name_filters: vec!["porso".into()],
+            ..Default::default()
+        };
+        let out = apply_query_filters(chunks, &filters);
+        assert_eq!(
+            out.len(),
+            1,
+            "fuzzy fallback must retain within-edit-distance-2 match"
+        );
+    }
+
+    #[test]
+    fn apply_filters_name_fuzzy_rejects_distance_three() {
+        // "parse" vs "xyzzy": distance > 2 → fuzzy fallback drops it.
+        let chunks = vec![mk_chunk("/a.rs", Some("parse"), None)];
+        let filters = QueryFilters {
+            name_filters: vec!["xyzzy".into()],
+            ..Default::default()
+        };
+        let out = apply_query_filters(chunks, &filters);
+        assert!(out.is_empty(), "distance > 2 must be rejected");
+    }
+
+    #[test]
+    fn apply_filters_name_no_symbol_kept_in_exact_pass() {
+        // Chunks without symbol info are conservatively kept during the exact
+        // pass (so they survive when name filters are active).
+        let chunks = vec![mk_chunk("/a.rs", None, None)];
+        let filters = QueryFilters {
+            name_filters: vec!["anything".into()],
+            ..Default::default()
+        };
+        let out = apply_query_filters(chunks, &filters);
+        assert_eq!(
+            out.len(),
+            1,
+            "no-symbol chunk is kept in the exact name pass"
+        );
+    }
+
+    #[test]
+    fn apply_filters_combined_path_and_language() {
+        let chunks = vec![
+            mk_chunk("/src/main.rs", Some("foo"), Some("function")),
+            mk_chunk("/src/main.py", Some("foo"), Some("function")),
+            mk_chunk("/lib/main.rs", Some("foo"), Some("function")),
+        ];
+        let filters = QueryFilters {
+            path_filters: vec!["src/".into()],
+            languages: vec!["rust".into()],
+            ..Default::default()
+        };
+        let out = apply_query_filters(chunks, &filters);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].file, "/src/main.rs");
+    }
+
+    // ── read_lines_from_fs ─────────────────────────────────────────────────
+    // Kills: replace-with-Ok(String::new()), Ok("xyzzy"), >= -> < boundary.
+
+    #[test]
+    fn read_lines_from_fs_returns_numbered_content() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("sample.txt");
+        std::fs::write(&path, "alpha\nbeta\ngamma\ndelta\nepsilon").unwrap();
+        let path_str = path.to_str().unwrap();
+
+        let content = read_lines_from_fs(path_str, 1, 3).unwrap();
+        assert!(content.starts_with("1: alpha"));
+        assert!(content.contains("2: beta"));
+        assert!(content.contains("3: gamma"));
+        assert!(!content.contains("delta"), "line_end=3 must exclude line 4");
+
+        // Full file.
+        let full = read_lines_from_fs(path_str, 1, 5).unwrap();
+        assert!(full.contains("5: epsilon"));
+    }
+
+    #[test]
+    fn read_lines_from_fs_line_start_beyond_file_errors() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("small.txt");
+        std::fs::write(&path, "only\ntwo\nlines").unwrap();
+        let path_str = path.to_str().unwrap();
+        // 3 lines → indices 0,1,2. line_start=4 → start_idx=3 == lines.len()=3.
+        // `>=` bails (Err); the `<` mutant would proceed and return Ok("").
+        let res = read_lines_from_fs(path_str, 4, 5);
+        assert!(res.is_err(), "line_start beyond EOF must error");
+    }
+
+    #[test]
+    fn read_lines_from_fs_line_end_clamped_to_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("clamp.txt");
+        std::fs::write(&path, "a\nb\nc").unwrap();
+        let path_str = path.to_str().unwrap();
+        // line_end past EOF is clamped, not an error.
+        let content = read_lines_from_fs(path_str, 2, 99).unwrap();
+        assert!(content.contains("2: b"));
+        assert!(content.contains("3: c"));
+        assert!(!content.contains("1: a"));
+    }
+
+    // ── slice_numbered ─────────────────────────────────────────────────────
+    // Kills: || -> && at the guard `from >= lines.len() || from >= to`.
+
+    #[test]
+    fn slice_numbered_guard_or_semantics() {
+        // chunk_start=100, text holds absolute lines 100..=104 (5 lines).
+        // s=101, e=100 → from=1, to=min(1,5)=1. `from >= to` is true but
+        // `from >= lines.len()` (1 >= 5) is false. The `||` guard returns the
+        // whole text; an `&&` mutant would fall through and slice lines[1..1]
+        // (empty), failing this assertion.
+        let sample = "100: a\n101: b\n102: c\n103: d\n104: e".to_owned();
+        let out = slice_numbered(&sample, 100, 101, 100);
+        assert_eq!(out, sample);
+    }
+
+    // ── DB-backed helpers ──────────────────────────────────────────────────
+
+    /// Insert a symbol row mirroring the production writer (bound Thing id).
+    async fn insert_symbol(db: &Surreal<Db>, fqn: &str, file: &str, name: &str, kind: &str) {
+        let thing = surrealdb::sql::Thing::from((
+            "symbol",
+            surrealdb::sql::Id::String(fqn.to_string()),
+        ));
+        db.query(
+            "CREATE $t SET name = $n, kind = $k, file = $f, \
+             line_start = 1, line_end = 5, signature = NONE, parent = NONE",
+        )
+        .bind(("t", thing))
+        .bind(("n", name.to_string()))
+        .bind(("k", kind.to_string()))
+        .bind(("f", file.to_string()))
+        .await
+        .expect("insert symbol");
+    }
+
+    /// Insert a call edge mirroring the production calls table layout.
+    async fn insert_call(db: &Surreal<Db>, from_fqn: &str, to_fqn: &str, file: &str) {
+        db.query(format!(
+            "INSERT INTO calls {{ in: symbol:`⟨{from_fqn}⟩`, out: symbol:`⟨{to_fqn}⟩`, \
+             line: 1, in_file: '{file}', out_file: '{file}', \
+             in_name: '{from_fqn}', out_name: '{to_fqn}' }}"
+        ))
+        .await
+        .expect("insert call");
+    }
+
+    // ── fetch_chunk_content ────────────────────────────────────────────────
+    // Kills the ~80 FnValue-replacement mutants by asserting ALL four return
+    // values are the real, non-default values stored in the DB.
+
+    #[tokio::test]
+    async fn fetch_chunk_content_returns_all_real_values() {
+        let home = tempfile::TempDir::new().unwrap();
+        let repo = "/test/fetch_chunk";
+        let db = crate::store::open_db(home.path(), repo, 0).await.unwrap();
+
+        let file = "/test/repo/a.rs";
+        let fqn = "/test/repo/a.rs::my_func";
+        let content = "fn my_func() { /* body */ }";
+
+        // Symbol row with a non-default kind.
+        insert_symbol(&db, fqn, file, "my_func", "function").await;
+
+        // Chunk row referencing the symbol via the "symbol:⟨fqn⟩" convention.
+        db.query(
+            "CREATE chunk SET file = $f, line_start = 1, line_end = 5, \
+             content = $c, embedding = [0.1, 0.2, 0.3], symbol_ref = $s",
+        )
+        .bind(("f", file.to_string()))
+        .bind(("c", content.to_string()))
+        .bind(("s", format!("symbol:⟨{fqn}⟩")))
+        .await
+        .expect("insert chunk");
+
+        let mut map: HashMap<String, Surreal<Db>> = HashMap::new();
+        map.insert(repo.to_string(), db);
+
+        let (got_content, got_symbol, got_fqn, got_kind) =
+            fetch_chunk_content(&map, file, 1, 5).await;
+
+        assert_eq!(got_content, content, "content must match stored value");
+        assert_eq!(
+            got_symbol.as_deref(),
+            Some("my_func"),
+            "symbol short name must be extracted from FQN"
+        );
+        assert_eq!(
+            got_fqn.as_deref(),
+            Some(fqn),
+            "full FQN must be parsed from symbol_ref"
+        );
+        assert_eq!(
+            got_kind.as_deref(),
+            Some("function"),
+            "symbol kind must be fetched from the symbol table"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_chunk_content_no_db_returns_defaults() {
+        // No DB in the map → all defaults.
+        let map: HashMap<String, Surreal<Db>> = HashMap::new();
+        let (content, symbol, fqn, kind) =
+            fetch_chunk_content(&map, "/nope.rs", 1, 5).await;
+        assert_eq!(content, "");
+        assert!(symbol.is_none());
+        assert!(fqn.is_none());
+        assert!(kind.is_none());
+    }
+
+    #[tokio::test]
+    async fn fetch_chunk_content_missing_row_returns_defaults() {
+        let home = tempfile::TempDir::new().unwrap();
+        let repo = "/test/fetch_chunk_missing";
+        let db = crate::store::open_db(home.path(), repo, 0).await.unwrap();
+        let mut map: HashMap<String, Surreal<Db>> = HashMap::new();
+        map.insert(repo.to_string(), db);
+
+        // No chunk row for this file/line range.
+        let (content, symbol, fqn, kind) =
+            fetch_chunk_content(&map, "/test/repo/none.rs", 1, 5).await;
+        assert_eq!(content, "");
+        assert!(symbol.is_none());
+        assert!(fqn.is_none());
+        assert!(kind.is_none());
+    }
+
+    // ── fetch_symbol_kind ──────────────────────────────────────────────────
+    // Kills: replace-with-None, Some(String::new()), Some("xyzzy").
+
+    #[tokio::test]
+    async fn fetch_symbol_kind_returns_real_kind() {
+        let home = tempfile::TempDir::new().unwrap();
+        let repo = "/test/symbol_kind";
+        let db = crate::store::open_db(home.path(), repo, 0).await.unwrap();
+        let fqn = "/test/repo/b.rs::MyClass";
+        insert_symbol(&db, fqn, "/test/repo/b.rs", "MyClass", "class").await;
+
+        let kind = fetch_symbol_kind(&db, fqn).await;
+        assert_eq!(kind.as_deref(), Some("class"));
+    }
+
+    #[tokio::test]
+    async fn fetch_symbol_kind_missing_symbol_returns_none() {
+        let home = tempfile::TempDir::new().unwrap();
+        let repo = "/test/symbol_kind_missing";
+        let db = crate::store::open_db(home.path(), repo, 0).await.unwrap();
+        let kind = fetch_symbol_kind(&db, "/test/repo/ghost.rs::missing").await;
+        assert!(kind.is_none());
+    }
+
+    // ── query_caller_callee_stats ──────────────────────────────────────────
+    // Kills: replace-with-None, >= -> < (schema branch), delete-! (in_name filter).
+
+    #[tokio::test]
+    async fn query_caller_callee_stats_schema_v2_fqn_match() {
+        let home = tempfile::TempDir::new().unwrap();
+        let repo = "/test/caller_callee_v2";
+        let db = crate::store::open_db(home.path(), repo, 0).await.unwrap();
+        let file = "/test/repo/c.rs";
+        let caller = "/test/repo/c.rs::caller_fn";
+        let callee = "/test/repo/c.rs::callee_fn";
+
+        insert_symbol(&db, caller, file, "caller_fn", "function").await;
+        insert_symbol(&db, callee, file, "callee_fn", "function").await;
+        insert_call(&db, caller, callee, file).await;
+
+        // schema_version = 2 → uses the FQN-based query (WHERE out_name = $fqn).
+        // The `>= -> <` mutant would take the short-name branch and find nothing.
+        let stats = query_caller_callee_stats(&db, callee, file, 2).await;
+        assert!(stats.is_some(), "stats must be Some for a real symbol");
+        let s = stats.unwrap();
+        assert_eq!(s.caller_count, 1, "one caller edge expected");
+        assert_eq!(s.caller_file_count, 1);
+        assert_eq!(s.caller_names, vec!["caller_fn"]);
+        // callee has no outgoing edges.
+        assert_eq!(s.callee_count, 0);
+    }
+
+    #[tokio::test]
+    async fn query_caller_callee_stats_schema_v1_short_name_match() {
+        let home = tempfile::TempDir::new().unwrap();
+        let repo = "/test/caller_callee_v1";
+        let db = crate::store::open_db(home.path(), repo, 0).await.unwrap();
+        let file = "/test/repo/d.rs";
+        let caller = "/test/repo/d.rs::caller_fn";
+        let callee = "/test/repo/d.rs::callee_fn";
+
+        insert_symbol(&db, caller, file, "caller_fn", "function").await;
+        insert_symbol(&db, callee, file, "callee_fn", "function").await;
+        insert_call(&db, caller, callee, file).await;
+
+        // schema_version = 1 → short-name branch. The calls row stores the full
+        // FQN in out_name, so the short-name query ("callee_fn") will NOT match
+        // the full FQN — caller_count must be 0 here. This pins the v1 branch
+        // behaviour (and distinguishes it from the v2 branch above).
+        let stats = query_caller_callee_stats(&db, callee, file, 1).await;
+        assert!(stats.is_some());
+        let s = stats.unwrap();
+        assert_eq!(s.caller_count, 0, "v1 short-name query does not match full FQN");
+    }
+
+    #[tokio::test]
+    async fn query_caller_callee_stats_callee_edges() {
+        let home = tempfile::TempDir::new().unwrap();
+        let repo = "/test/callee_edges";
+        let db = crate::store::open_db(home.path(), repo, 0).await.unwrap();
+        let file = "/test/repo/e.rs";
+        let caller = "/test/repo/e.rs::caller_fn";
+        let callee = "/test/repo/e.rs::callee_fn";
+
+        insert_symbol(&db, caller, file, "caller_fn", "function").await;
+        insert_symbol(&db, callee, file, "callee_fn", "function").await;
+        insert_call(&db, caller, callee, file).await;
+
+        // Query the CALLER: it has one outgoing callee edge.
+        let stats = query_caller_callee_stats(&db, caller, file, 2).await;
+        let s = stats.unwrap();
+        assert_eq!(s.callee_count, 1, "caller has one callee edge");
+        assert_eq!(s.callee_names, vec!["callee_fn"]);
+        assert_eq!(s.callee_file_count, 1);
+        assert_eq!(s.caller_count, 0, "caller has no incoming edges");
+    }
+
+    // ── fetch_caller_stats_batch ───────────────────────────────────────────
+    // Kills: replace-with-vec![] and vec![None].
+
+    #[tokio::test]
+    async fn fetch_caller_stats_batch_returns_real_stats() {
+        let home = tempfile::TempDir::new().unwrap();
+        let repo = "/test/caller_stats_batch";
+        let db = crate::store::open_db(home.path(), repo, 0).await.unwrap();
+        let file = "/test/repo/f.rs";
+        let caller = "/test/repo/f.rs::caller_fn";
+        let callee = "/test/repo/f.rs::callee_fn";
+
+        insert_symbol(&db, caller, file, "caller_fn", "function").await;
+        insert_symbol(&db, callee, file, "callee_fn", "function").await;
+        insert_call(&db, caller, callee, file).await;
+
+        let chunk = MergeChunk {
+            file: file.to_string(),
+            line_start: 1,
+            line_end: 5,
+            score: 1.0,
+            content: "x".to_string(),
+            symbol: Some("callee_fn".to_string()),
+            symbol_fqn: Some(callee.to_string()),
+            symbol_kind: Some("function".to_string()),
+        };
+
+        let mut map: HashMap<String, Surreal<Db>> = HashMap::new();
+        map.insert(repo.to_string(), db);
+
+        let stats = fetch_caller_stats_batch(&[chunk], &map, 2).await;
+        assert_eq!(stats.len(), 1);
+        assert!(stats[0].is_some(), "batch must return Some stats for a real symbol");
+        let s = stats[0].as_ref().unwrap();
+        assert_eq!(s.caller_count, 1);
+        assert_eq!(s.caller_names, vec!["caller_fn"]);
+    }
+
+    #[tokio::test]
+    async fn fetch_caller_stats_batch_no_fqn_returns_none() {
+        let home = tempfile::TempDir::new().unwrap();
+        let repo = "/test/caller_stats_batch_none";
+        let db = crate::store::open_db(home.path(), repo, 0).await.unwrap();
+
+        // Chunk without a symbol_fqn → no stats lookup → None.
+        let chunk = MergeChunk {
+            file: "/test/repo/g.rs".to_string(),
+            line_start: 1,
+            line_end: 5,
+            score: 1.0,
+            content: "x".to_string(),
+            symbol: None,
+            symbol_fqn: None,
+            symbol_kind: None,
+        };
+
+        let mut map: HashMap<String, Surreal<Db>> = HashMap::new();
+        map.insert(repo.to_string(), db);
+
+        let stats = fetch_caller_stats_batch(&[chunk], &map, 2).await;
+        assert_eq!(stats.len(), 1);
+        assert!(stats[0].is_none());
+    }
+}
