@@ -53,6 +53,24 @@ pub fn read_current_gen(root: &Path) -> Option<u64> {
         .and_then(|s| s.trim().parse::<u64>().ok())
 }
 
+/// Remove a repo's `CURRENT` pointer only if it still points at `expected`.
+///
+/// A failed index run captures the generation visible before it publishes. A
+/// concurrent warm may later write and flip to a newer generation; comparing the
+/// pointer before removal prevents the old rollback from invalidating that newer
+/// persisted shard. `expected = None` fences the no-CURRENT state in the same way.
+pub fn invalidate_current_if_generation(
+    data_dir: &Path,
+    repo: &str,
+    expected: Option<u64>,
+) -> bool {
+    let root = repo_shard_root(data_dir, repo);
+    if read_current_gen(&root) != expected {
+        return false;
+    }
+    std::fs::remove_file(root.join("CURRENT")).is_ok()
+}
+
 /// Atomically write the CURRENT pointer (tmp + rename — a tiny file, always safe
 /// to replace since nobody mmaps CURRENT itself).
 fn write_current_gen(root: &Path, generation: u64) -> Result<()> {

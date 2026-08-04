@@ -18,6 +18,7 @@ use tracing::{debug, info, warn};
 
 use crate::embedding::InputType;
 use crate::embedding::cache::EmbeddingCache;
+use crate::embedding::identity::{EMBEDDING_IDENTITY_KEY, EmbeddingIdentity};
 use crate::embedding::voyage::VoyageClient;
 use crate::indexing::ProgressHandle;
 use crate::indexing::events::{IndexEvent, IndexEventBus};
@@ -423,6 +424,9 @@ pub struct IndexPipeline {
     /// incremental updates invalidate the repo's persisted shard (delete CURRENT)
     /// so the next warm rebuilds + re-persists it. None in tests that don't need it.
     data_dir: Option<std::path::PathBuf>,
+    /// Explicit test-only escape hatch for parser/graph tests that intentionally
+    /// exercise unembedded DB mutations. Production constructors leave this false.
+    allow_no_client_mutation: bool,
 }
 
 impl IndexPipeline {
@@ -446,6 +450,7 @@ impl IndexPipeline {
             ignore_filenames: HashSet::new(),
             ignore_paths: HashSet::new(),
             data_dir: None,
+            allow_no_client_mutation: false,
         }
     }
 
@@ -453,6 +458,12 @@ impl IndexPipeline {
     /// shard file (the engine sets this; tests that don't exercise persistence omit it).
     pub fn with_data_dir(mut self, data_dir: std::path::PathBuf) -> Self {
         self.data_dir = Some(data_dir);
+        self
+    }
+
+    #[cfg(test)]
+    fn allow_no_client_mutation_for_test(mut self) -> Self {
+        self.allow_no_client_mutation = true;
         self
     }
 
@@ -465,6 +476,73 @@ impl IndexPipeline {
         if let Some(dd) = &self.data_dir {
             let root = crate::vector::shard_file::repo_shard_root(dd, &self.repo);
             let _ = std::fs::remove_file(root.join("CURRENT"));
+        }
+    }
+
+    /// Enter the destructive full-rebuild window while the consumer's per-repo
+    /// serialization lock is held. The vector write lock is released before the DB
+    /// await (preserving `repo_dbs → vector_index`), but the mutation fence remains
+    /// set so neither query nor warm can expose a shard until publish succeeds.
+    async fn begin_full_vector_update(
+        &self,
+        vector_index: Option<&tokio::sync::RwLock<ShardedVectorIndex>>,
+    ) {
+        if let Some(vi) = vector_index {
+            vi.write().await.begin_full_update(&self.repo);
+        }
+        self.invalidate_persisted_shard();
+    }
+
+    /// Incremental counterpart: the old shard is removed from search but retained
+    /// privately so unaffected vectors can be re-used when the delta publishes.
+    async fn begin_incremental_vector_update(
+        &self,
+        vector_index: Option<&tokio::sync::RwLock<ShardedVectorIndex>>,
+    ) {
+        if let Some(vi) = vector_index {
+            vi.write().await.begin_incremental_update(&self.repo);
+        }
+        self.invalidate_persisted_shard();
+    }
+
+    /// Fail-closed cleanup after a resident vector publish whose DB commit did not
+    /// complete. Every resource is fenced so an older rollback cannot remove a
+    /// newer concurrent warm/install.
+    async fn rollback_published_vectors(
+        &self,
+        db: &Surreal<Db>,
+        vector_index: Option<&tokio::sync::RwLock<ShardedVectorIndex>>,
+        published_identity: &str,
+        pre_publish_generation: Option<u64>,
+    ) {
+        if let Err(e) = db
+            .query("DELETE FROM index_meta WHERE key = $k")
+            .bind(("k", EMBEDDING_IDENTITY_KEY))
+            .await
+        {
+            warn!(repo = %self.repo, error = %e, "rollback: delete embedding identity marker failed");
+        }
+        if let Err(e) = set_meta(db, "needs_rebuild", "1").await {
+            warn!(repo = %self.repo, error = %e, "rollback: set needs_rebuild failed");
+        }
+        if let Err(e) = db
+            .query("DELETE FROM index_meta WHERE key = $k")
+            .bind(("k", EDGES_RESOLVED_KEY))
+            .await
+        {
+            warn!(repo = %self.repo, error = %e, "rollback: clear edges_resolved failed");
+        }
+        if let Some(vi) = vector_index {
+            let mut vi = vi.write().await;
+            vi.evict_if_identity(&self.repo, published_identity);
+            vi.abort_update_fail_closed(&self.repo);
+        }
+        if let Some(data_dir) = &self.data_dir {
+            crate::vector::shard_file::invalidate_current_if_generation(
+                data_dir,
+                &self.repo,
+                pre_publish_generation,
+            );
         }
     }
 
@@ -501,6 +579,36 @@ impl IndexPipeline {
         let stored_meta = get_all_file_meta(db, &self.repo).await?;
         let incr_meta_load_ms = meta_load_start.elapsed().as_millis() as u64;
         let is_first_run = stored_meta.is_empty();
+        let has_data = !is_first_run;
+
+        // Snapshot the REAL client used by this run before any tracker/parse/store
+        // work. This same snapshot is used for mixed-index gating, resident publish,
+        // persisted-shard stamp, and the final commit marker.
+        let run_identity = self.voyage.as_ref().map(EmbeddingIdentity::from_client);
+        let stored_identity = get_meta(db, EMBEDDING_IDENTITY_KEY).await?;
+        let identity_forces_rebuild = match (&run_identity, &stored_identity) {
+            (Some(current), Some(stored)) => current.as_key_string() != *stored,
+            (Some(_), None) => has_data,
+            (None, _) => false,
+        };
+
+        // `changes=None` is manual/poll mode and may discover changes after walking;
+        // treat it as potentially mutating. An explicitly-empty watcher set is the
+        // only no-op shape known before tracker work.
+        let content_change = match &changes {
+            Some(explicit) => !explicit.is_empty(),
+            None => true,
+        };
+        let will_reembed =
+            is_first_run || force_rebuild || content_change || identity_forces_rebuild;
+        if self.voyage.is_none() && has_data && will_reembed && !self.allow_no_client_mutation {
+            anyhow::bail!(
+                "embedding client required to re-index repo {} with existing data; refusing to mutate without a client",
+                self.repo
+            );
+        }
+        let force_rebuild = force_rebuild || identity_forces_rebuild;
+        let run_identity_key = run_identity.as_ref().map(EmbeddingIdentity::as_key_string);
 
         if is_first_run || force_rebuild {
             if force_rebuild && !is_first_run {
@@ -534,6 +642,7 @@ impl IndexPipeline {
                     event_bus,
                     key_hints,
                     cancel_token.as_ref(),
+                    run_identity_key.as_deref(),
                 )
                 .await?;
             let indexed = get_all_file_meta(db, &self.repo).await?.len() as u64;
@@ -731,6 +840,12 @@ impl IndexPipeline {
                 let raw_edge_total = raw_edge_count.first().map(|r| r.count).unwrap_or(0);
 
                 if raw_edge_total == 0 && !stored_meta.is_empty() {
+                    if self.voyage.is_none() && !self.allow_no_client_mutation {
+                        anyhow::bail!(
+                            "embedding client required for RAM-path full rebuild of {}",
+                            self.repo
+                        );
+                    }
                     // RAM-path crash: Stage 3 completed, Phase 2 never ran, no DB raw_edges.
                     // Force a full rebuild to regenerate calls edges.
                     warn!(
@@ -746,6 +861,7 @@ impl IndexPipeline {
                             event_bus,
                             key_hints,
                             cancel_token.as_ref(),
+                            run_identity_key.as_deref(),
                         )
                         .await?;
                     let indexed = get_all_file_meta(db, &self.repo).await?.len() as u64;
@@ -800,6 +916,7 @@ impl IndexPipeline {
                 event_bus,
                 key_hints,
                 cancel_token.as_ref(),
+                run_identity_key.as_deref(),
             )
             .await?;
 
@@ -861,6 +978,7 @@ impl IndexPipeline {
         &self,
         vector_index: Option<&tokio::sync::RwLock<ShardedVectorIndex>>,
         new_vectors: &[(ChunkId, Vec<f32>)],
+        identity_key: &str,
     ) -> u64 {
         let start = Instant::now();
         if let Some(vi) = vector_index {
@@ -870,7 +988,7 @@ impl IndexPipeline {
                 // bound. The repo being (re)built is protected internally by
                 // replace_repo → install_shard. Query safety is guaranteed by the
                 // shared write lock, not the active set.
-                guard.replace_repo(&self.repo, new_vectors, &[]);
+                guard.publish_full_update(&self.repo, new_vectors, identity_key.to_owned(), &[]);
             }
         }
         // The shard changed → invalidate the persisted file so the next warm
@@ -885,6 +1003,7 @@ impl IndexPipeline {
         vector_index: Option<&tokio::sync::RwLock<ShardedVectorIndex>>,
         removed_files: &[String],
         new_vectors: &[(ChunkId, Vec<f32>)],
+        identity_key: &str,
     ) -> u64 {
         let start = Instant::now();
         if let Some(vi) = vector_index {
@@ -892,7 +1011,13 @@ impl IndexPipeline {
                 let mut guard = vi.write().await;
                 // Empty active set — see replace_repo above for the rationale.
                 // apply_incremental protects `self.repo` internally.
-                guard.apply_incremental(&self.repo, removed_files, new_vectors, &[]);
+                guard.publish_incremental_update(
+                    &self.repo,
+                    removed_files,
+                    new_vectors,
+                    identity_key.to_owned(),
+                    &[],
+                );
             }
         }
         // Incremental changed the in-RAM shard → invalidate the persisted file
@@ -902,6 +1027,7 @@ impl IndexPipeline {
         start.elapsed().as_millis() as u64
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn full_rebuild(
         &self,
         db: &Surreal<Db>,
@@ -910,7 +1036,14 @@ impl IndexPipeline {
         event_bus: Option<&IndexEventBus>,
         key_hints: &[String],
         cancel_token: Option<&CancellationToken>,
+        identity_key: Option<&str>,
     ) -> Result<IndexPipelineStats> {
+        // Persisted-shard generation fence captured before this run changes CURRENT.
+        // Rollback removes the pointer only if no newer concurrent warm flipped it.
+        let pre_publish_generation = self.data_dir.as_ref().and_then(|data_dir| {
+            let root = crate::vector::shard_file::repo_shard_root(data_dir, &self.repo);
+            crate::vector::shard_file::read_current_gen(&root)
+        });
         let all_files = walk_repo_with(
             &self.repo,
             &self.extra_extensions,
@@ -926,6 +1059,15 @@ impl IndexPipeline {
         {
             return Err(PipelineAbort::Cancelled.into());
         }
+
+        // Enter the fail-closed mutation window BEFORE deleting any durable row.
+        // The caller holds the per-repo run lock; query sees Cold and warm install
+        // is rejected until the replacement publish atomically releases the fence.
+        self.begin_full_vector_update(vector_index).await;
+        db.query("DELETE FROM index_meta WHERE key = $k")
+            .bind(("k", EMBEDDING_IDENTITY_KEY))
+            .await
+            .context("full_rebuild: clear committed embedding identity before delete")?;
 
         // Delete everything first (crash-safe: file_meta is the commit marker,
         // written per-file only after its chunks are durable).
@@ -962,9 +1104,12 @@ impl IndexPipeline {
         // MCP can answer vector-only while Phase 2 builds the call graph. If the
         // process dies during Phase 2, this RAM shard is lost and the existing
         // edges_resolved/raw_edge recovery path remains the source of truth.
-        let vi_publish_ms = self
-            .publish_full_vectors(vector_index, &chunk_vectors)
-            .await;
+        let vi_publish_ms = if let Some(identity_key) = identity_key {
+            self.publish_full_vectors(vector_index, &chunk_vectors, identity_key)
+                .await
+        } else {
+            0
+        };
         info!(repo = %self.repo, vi_publish_ms, "stage3: published vector shard before Phase 2");
         drop(chunk_vectors);
 
@@ -976,18 +1121,29 @@ impl IndexPipeline {
             });
         }
         let phase2_start = Instant::now();
-        let p2: Phase2Stats = if !ram_edges_overflowed && !ram_raw_edges.is_empty() {
-            // Fast path: all raw_edges are in RAM — skip DB scan entirely. Pass the
-            // in-RAM symbol buffer so Phase 2 reuses it instead of reloading every
-            // symbol from the DB (None when the buffer overflowed → DB reload).
-            self.resolve_edges_from_ram(db, ram_raw_edges, ram_symbols, progress, cancel_token)
-                .await
-                .context("full_rebuild: resolve_edges_from_ram")?
-        } else {
-            // DB path: overflow or incremental — use keyset scan as before.
-            self.resolve_edges_phase2(db, progress, cancel_token)
-                .await
-                .context("full_rebuild: resolve_edges_phase2")?
+        let phase2_result: Result<Phase2Stats> =
+            if !ram_edges_overflowed && !ram_raw_edges.is_empty() {
+                // Fast path: all raw_edges are in RAM — skip DB scan entirely. Pass the
+                // in-RAM symbol buffer so Phase 2 reuses it instead of reloading every
+                // symbol from the DB (None when the buffer overflowed → DB reload).
+                self.resolve_edges_from_ram(db, ram_raw_edges, ram_symbols, progress, cancel_token)
+                    .await
+                    .context("full_rebuild: resolve_edges_from_ram")
+            } else {
+                // DB path: overflow or incremental — use keyset scan as before.
+                self.resolve_edges_phase2(db, progress, cancel_token)
+                    .await
+                    .context("full_rebuild: resolve_edges_phase2")
+            };
+        let p2 = match phase2_result {
+            Ok(stats) => stats,
+            Err(e) => {
+                if let Some(key) = identity_key {
+                    self.rollback_published_vectors(db, vector_index, key, pre_publish_generation)
+                        .await;
+                }
+                return Err(e);
+            }
         };
         let phase2_ms = phase2_start.elapsed().as_millis() as u64;
         stats.phase2_ms = phase2_ms;
@@ -1005,6 +1161,18 @@ impl IndexPipeline {
             });
         }
 
+        // LAST commit marker: every chunk/file_meta row and all resolved edges are
+        // durable before the run identity becomes authoritative.
+        if let Some(key) = identity_key
+            && let Err(e) = set_meta(db, EMBEDDING_IDENTITY_KEY, key)
+                .await
+                .context("commit embedding_identity marker")
+        {
+            self.rollback_published_vectors(db, vector_index, key, pre_publish_generation)
+                .await;
+            return Err(e);
+        }
+
         Ok(stats)
     }
 
@@ -1020,7 +1188,12 @@ impl IndexPipeline {
         event_bus: Option<&IndexEventBus>,
         key_hints: &[String],
         cancel_token: Option<&CancellationToken>,
+        identity_key: Option<&str>,
     ) -> Result<(IncrementalRunStats, u64)> {
+        let pre_publish_generation = self.data_dir.as_ref().and_then(|data_dir| {
+            let root = crate::vector::shard_file::repo_shard_root(data_dir, &self.repo);
+            crate::vector::shard_file::read_current_gen(&root)
+        });
         let mut run_stats = IncrementalRunStats::default();
         let to_process: Vec<String> = changes
             .iter()
@@ -1055,6 +1228,17 @@ impl IndexPipeline {
         // computed resolve_set — wiping incoming edges here (as the OR-deleting
         // bulk helper does) is exactly the blow-up we are fixing.
         let delete_bulk_start = Instant::now();
+        self.begin_incremental_vector_update(vector_index).await;
+        db.query("DELETE FROM index_meta WHERE key IN $keys")
+            .bind((
+                "keys",
+                vec![
+                    EMBEDDING_IDENTITY_KEY.to_owned(),
+                    EDGES_RESOLVED_KEY.to_owned(),
+                ],
+            ))
+            .await
+            .context("incremental_run: clear committed readiness before delete")?;
         delete_files_data_incremental(db, &all_affected)
             .await
             .context("incremental_run: delete_files_data_incremental")?;
@@ -1093,9 +1277,12 @@ impl IndexPipeline {
         // is being rebuilt. The existing file_meta/raw_edge markers remain the
         // crash-recovery source of truth; this shard is RAM-only and disappears on
         // restart.
-        let vi_apply_ms = self
-            .publish_incremental_vectors(vector_index, &all_affected, &chunk_vectors)
-            .await;
+        let vi_apply_ms = if let Some(key) = identity_key {
+            self.publish_incremental_vectors(vector_index, &all_affected, &chunk_vectors, key)
+                .await
+        } else {
+            0
+        };
         drop(chunk_vectors);
 
         // ── Compute the surface delta now that NEW symbols are written ──────────
@@ -1104,9 +1291,19 @@ impl IndexPipeline {
         // that gained a (name,fqn) pair (these gate direction-2). A pure-addition or
         // surface-unchanged file appears in NEITHER gate's file set.
         let surface_start2 = Instant::now();
-        let new_surface = load_file_surface(db, &to_process)
+        let new_surface = match load_file_surface(db, &to_process)
             .await
-            .context("incremental_run: load new symbol surface")?;
+            .context("incremental_run: load new symbol surface")
+        {
+            Ok(surface) => surface,
+            Err(e) => {
+                if let Some(key) = identity_key {
+                    self.rollback_published_vectors(db, vector_index, key, pre_publish_generation)
+                        .await;
+                }
+                return Err(e);
+            }
+        };
         let delta = compute_surface_delta(&old_surface, &new_surface, &to_process, &to_delete);
         run_stats.surface_delta_ms += surface_start2.elapsed().as_millis() as u64;
 
@@ -1128,8 +1325,8 @@ impl IndexPipeline {
             struct CallerRow {
                 in_file: String,
             }
-            let rows: Vec<CallerRow> = db
-                .query(
+            let rows_result: Result<Vec<CallerRow>> = async {
+                db.query(
                     "SELECT in_file FROM calls \
                      WHERE out_file IN $changed AND in_file NOT IN $affected \
                      GROUP BY in_file",
@@ -1138,7 +1335,25 @@ impl IndexPipeline {
                 .bind(("affected", all_affected.clone()))
                 .await
                 .context("incremental_run: direction-1 caller query")?
-                .take(0)?;
+                .take(0)
+                .context("incremental_run: decode direction-1 callers")
+            }
+            .await;
+            let rows = match rows_result {
+                Ok(rows) => rows,
+                Err(e) => {
+                    if let Some(key) = identity_key {
+                        self.rollback_published_vectors(
+                            db,
+                            vector_index,
+                            key,
+                            pre_publish_generation,
+                        )
+                        .await;
+                    }
+                    return Err(e);
+                }
+            };
             rows.into_iter().map(|r| r.in_file).collect()
         };
         run_stats.predelete_callers_ms = predelete_start.elapsed().as_millis() as u64;
@@ -1157,10 +1372,20 @@ impl IndexPipeline {
             });
         }
         let phase2_start = Instant::now();
-        let phase2_stats = self
+        let phase2_result = self
             .resolve_edges_incremental(db, &all_affected, &dir1_callers, &delta.added_names)
             .await
-            .context("incremental_run: resolve_edges_incremental")?;
+            .context("incremental_run: resolve_edges_incremental");
+        let phase2_stats = match phase2_result {
+            Ok(stats) => stats,
+            Err(e) => {
+                if let Some(key) = identity_key {
+                    self.rollback_published_vectors(db, vector_index, key, pre_publish_generation)
+                        .await;
+                }
+                return Err(e);
+            }
+        };
         run_stats.phase2_total_ms = phase2_start.elapsed().as_millis() as u64;
         run_stats.phase2 = phase2_stats;
         if let Some(bus) = event_bus {
@@ -1168,6 +1393,18 @@ impl IndexPipeline {
                 repo: self.repo.clone(),
                 elapsed_ms: run_stats.phase2_total_ms,
             });
+        }
+
+        // LAST commit marker for the incremental path, after changed chunks,
+        // file_meta, and resolved edges are durable.
+        if let Some(key) = identity_key
+            && let Err(e) = set_meta(db, EMBEDDING_IDENTITY_KEY, key)
+                .await
+                .context("commit embedding_identity marker")
+        {
+            self.rollback_published_vectors(db, vector_index, key, pre_publish_generation)
+                .await;
+            return Err(e);
         }
 
         Ok((run_stats, vi_apply_ms))
@@ -4263,7 +4500,7 @@ mod symbol_index_drop_rebuild {
         let repo = repo_dir.path().to_str().unwrap().replace('\\', "/");
 
         let db = open_db(home.path(), &repo, 0).await.expect("open db");
-        let pipeline = IndexPipeline::new(repo.clone(), None);
+        let pipeline = IndexPipeline::new(repo.clone(), None).allow_no_client_mutation_for_test();
 
         // Initial full rebuild establishes the indexes.
         pipeline
@@ -6658,7 +6895,7 @@ mod perf_fix_tests {
         let db = open_db(home.path(), &repo, 0).await.expect("open db");
 
         // First, do a full build so all four files are indexed.
-        let pipeline = IndexPipeline::new(repo.clone(), None);
+        let pipeline = IndexPipeline::new(repo.clone(), None).allow_no_client_mutation_for_test();
         pipeline
             .run(&db, None, true, None, None, None, &[], None)
             .await
@@ -8281,7 +8518,7 @@ mod raw_edge_batching_tests {
         std::fs::write(&file_b, "fn beta() { alpha(); }\n").unwrap();
 
         let db = open_db(home.path(), &repo, 0).await.expect("open db");
-        let pipeline = IndexPipeline::new(repo.clone(), None);
+        let pipeline = IndexPipeline::new(repo.clone(), None).allow_no_client_mutation_for_test();
 
         // Full rebuild — both files indexed.
         pipeline

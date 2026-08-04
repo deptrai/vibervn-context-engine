@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use surrealdb::Surreal;
 use surrealdb::engine::local::Db;
@@ -20,9 +20,14 @@ use rmcp::{
     schemars, tool, tool_handler, tool_router,
 };
 
+pub(crate) mod query_gate;
+pub(crate) mod readiness;
+#[cfg(test)]
+mod tests;
+
 use crate::config::Settings;
 use crate::embedding::voyage::VoyageClient;
-use crate::indexing::{IndexEngine, IndexPhase, IndexState, RepoStatus};
+use crate::indexing::IndexEngine;
 use crate::llm::LlmClient;
 use crate::query::engine::QueryGraphMode;
 use crate::store;
@@ -535,6 +540,9 @@ impl ServerHandler for RepoMcpHandler {
 /// must NOT be reported as "no results" (the index is complete on disk). Only when
 /// the shard is resident (`warming=false`) do we report a genuine empty, with the
 /// rerank-rejected wording when the reranker actively rejected all candidates.
+const MCP_PARTIAL_RESULTS_PREFIX: &str =
+    "(index update is still publishing; showing only content-verified partial results)\n\n";
+
 fn select_empty_or_warming_message(
     warming: bool,
     rerank_rejected: bool,
@@ -553,34 +561,6 @@ fn select_empty_or_warming_message(
             .to_string();
     }
     format!("No results found for: {information_request}")
-}
-
-fn is_resolve_edges_status(status: Option<&RepoStatus>) -> bool {
-    status.is_some_and(|s| s.state == IndexState::Indexing && s.phase == IndexPhase::ResolveEdges)
-}
-
-async fn do_vector_only_query(
-    index_engine: &Arc<IndexEngine>,
-    repo_dbs: &Arc<RwLock<HashMap<String, Surreal<Db>>>>,
-    settings: &Settings,
-    information_request: &str,
-    repo: &str,
-) -> String {
-    let prefix = "(index is resolving the call graph; showing vector-only results without callers/callees)\n\n";
-    format!(
-        "{}{}",
-        prefix,
-        do_query(
-            index_engine,
-            repo_dbs,
-            settings,
-            information_request,
-            repo,
-            QueryGraphMode::VectorOnly,
-            Duration::ZERO,
-        )
-        .await
-    )
 }
 
 pub async fn run_codebase_retrieval(
@@ -640,878 +620,46 @@ pub async fn run_codebase_retrieval(
             .to_string();
     }
 
-    // 4. Open the repo DB and determine freshness from durable state.
-    let db =
-        match store::get_or_open(repo_dbs, data_dir, repo, settings.repo_generation(repo)).await {
-            Ok(d) => d,
-            Err(e) => {
-                return format!("Error: could not open index database: {e}");
-            }
-        };
-
-    let chunk_count = store::ops::count_chunks(&db).await.unwrap_or(0);
-    let last_indexed_ts = store::ops::get_meta(&db, "last_indexed_at")
-        .await
-        .unwrap_or(None);
-
-    let stale_threshold = chrono::Duration::days(settings.mcp_stale_after_days as i64);
-    let is_usable = check_usable(chunk_count, &last_indexed_ts, stale_threshold);
-
-    // 5. Check in-flight indexing state and trigger if needed.
-    let current_status = index_engine.repo_status(repo).await;
-    if is_resolve_edges_status(current_status.as_ref()) {
-        return do_vector_only_query(index_engine, repo_dbs, settings, information_request, repo)
-            .await;
-    }
-    let currently_indexing = current_status
-        .as_ref()
-        .map(|s| s.state == IndexState::Indexing)
-        .unwrap_or(false);
-
-    let need_wait = if currently_indexing {
-        // Already in flight — join the wait loop without triggering again.
-        true
-    } else if !is_usable {
-        // Not usable and not currently indexing — trigger incremental.
-        let _ = index_engine.trigger_index(repo).await;
-        true
-    } else {
-        // Usable. If the durable stamp is missing or unparseable (legacy pre-timestamp
-        // index, or corrupt stamp), kick a NON-BLOCKING refresh so a real timestamp gets
-        // written for next time — but don't wait; serve current results immediately.
-        let has_valid_stamp = last_indexed_ts
-            .as_deref()
-            .and_then(|ts| ts.parse::<chrono::DateTime<chrono::Utc>>().ok())
-            .is_some();
-        if !has_valid_stamp {
-            let _ = index_engine.trigger_index(repo).await;
+    // 4. One shared readiness decision selects both the wait budget and graph
+    // mode. MCP and REST therefore cannot drift on the ResolveEdges fast path.
+    let (query_graph_mode, query_warm_wait, output_prefix) = match readiness::await_index_ready(
+        settings,
+        index_engine,
+        repo_dbs,
+        data_dir,
+        repo,
+    )
+    .await
+    {
+        readiness::IndexReadiness::Ready { warm_budget } => (QueryGraphMode::Full, warm_budget, ""),
+        readiness::IndexReadiness::ReadyVectorOnly { warm_budget } => (
+            QueryGraphMode::VectorOnly,
+            warm_budget,
+            crate::prompts::MCP_GRAPH_PENDING,
+        ),
+        readiness::IndexReadiness::Timeout => {
+            return crate::prompts::MCP_DEGRADE_INDEXING.to_string();
         }
-        false
+        readiness::IndexReadiness::Failed(error) => {
+            let message = format!("{error:#}");
+            return crate::prompts::render(
+                crate::prompts::MCP_DEGRADE_INDEX_FAILED,
+                &[("err", &message)],
+            );
+        }
     };
 
-    let default_warm_wait = Duration::from_secs(settings.mcp_index_wait_secs);
-    let mut query_warm_wait = default_warm_wait;
-
-    if need_wait {
-        let deadline = Instant::now() + default_warm_wait;
-        loop {
-            tokio::time::sleep(Duration::from_millis(500)).await;
-
-            let status = index_engine.repo_status(repo).await;
-            if is_resolve_edges_status(status.as_ref()) {
-                return do_vector_only_query(
-                    index_engine,
-                    repo_dbs,
-                    settings,
-                    information_request,
-                    repo,
-                )
-                .await;
-            }
-            let state = status.as_ref().map(|s| s.state.clone());
-            let err_msg = status.as_ref().and_then(|s| s.error.clone());
-
-            match state {
-                Some(IndexState::Idle) => {
-                    // Success — proceed to query with fresh results. Bound any
-                    // cold-shard warm by the original MCP wait budget instead of
-                    // starting a second full wait window.
-                    query_warm_wait = deadline
-                        .checked_duration_since(Instant::now())
-                        .unwrap_or(Duration::ZERO);
-                    break;
-                }
-                Some(IndexState::Error) => {
-                    // Indexing failed — return immediately without burning the budget.
-                    let err = err_msg.unwrap_or_else(|| "unknown error".to_string());
-                    if is_usable {
-                        // Had usable data before — run query with stale data + note.
-                        let prefix = format!(
-                            "(index refresh failed: {}; showing previous results)\n\n",
-                            err
-                        );
-                        return format!(
-                            "{}{}",
-                            prefix,
-                            do_query(
-                                index_engine,
-                                repo_dbs,
-                                settings,
-                                information_request,
-                                repo,
-                                QueryGraphMode::Full,
-                                deadline
-                                    .checked_duration_since(Instant::now())
-                                    .unwrap_or(Duration::ZERO),
-                            )
-                            .await
-                        );
-                    } else {
-                        return crate::prompts::render(
-                            crate::prompts::MCP_DEGRADE_INDEX_FAILED,
-                            &[("err", &err.to_string())],
-                        );
-                    }
-                }
-                _ => {
-                    // Still indexing.
-                    if Instant::now() >= deadline {
-                        if is_usable {
-                            let prefix = "(still indexing; results may be incomplete)\n\n";
-                            return format!(
-                                "{}{}",
-                                prefix,
-                                do_query(
-                                    index_engine,
-                                    repo_dbs,
-                                    settings,
-                                    information_request,
-                                    repo,
-                                    QueryGraphMode::Full,
-                                    Duration::ZERO,
-                                )
-                                .await
-                            );
-                        } else {
-                            return crate::prompts::MCP_DEGRADE_INDEXING.to_string();
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    do_query(
+    let output = do_query(
         index_engine,
         repo_dbs,
         settings,
         information_request,
         repo,
-        QueryGraphMode::Full,
+        query_graph_mode,
         query_warm_wait,
     )
-    .await
-}
-
-/// Returns true if the DB has chunks AND the durable timestamp is within the
-/// staleness threshold. The durable timestamp is the source of truth — in-memory
-/// `RepoStatus.last_indexed_at` is intentionally NOT consulted here.
-///
-/// Staleness rules:
-/// * chunk_count == 0 → false (never indexed)
-/// * chunk_count > 0, timestamp missing → true (pre-timestamp legacy index; chunks exist so usable)
-/// * chunk_count > 0, timestamp unparseable → true (corrupt stamp but chunks exist; don't punish user)
-/// * chunk_count > 0, age <= threshold → true (fresh)
-/// * chunk_count > 0, age > threshold → false (genuinely stale)
-fn check_usable(
-    chunk_count: u64,
-    last_indexed_ts: &Option<String>,
-    threshold: chrono::Duration,
-) -> bool {
-    if chunk_count == 0 {
-        return false;
-    }
-    match last_indexed_ts {
-        // Legacy index (pre-timestamp upgrade) or missing stamp: chunks exist, assume usable.
-        None => true,
-        Some(ts) => match ts.parse::<chrono::DateTime<chrono::Utc>>() {
-            // Unparseable/corrupt stamp: chunks exist, assume usable rather than punishing user.
-            Err(_) => true,
-            Ok(dt) => (chrono::Utc::now() - dt) <= threshold,
-        },
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    const THRESHOLD: fn() -> chrono::Duration = || chrono::Duration::days(7);
-
-    fn ts_days_ago(n: i64) -> String {
-        (chrono::Utc::now() - chrono::Duration::days(n)).to_rfc3339()
-    }
-
-    #[test]
-    fn vector_only_fast_path_only_for_resolve_edges() {
-        let resolving = RepoStatus {
-            state: IndexState::Indexing,
-            phase: IndexPhase::ResolveEdges,
-            ..Default::default()
-        };
-        assert!(is_resolve_edges_status(Some(&resolving)));
-
-        let embedding = RepoStatus {
-            state: IndexState::Indexing,
-            phase: IndexPhase::Embedding,
-            ..Default::default()
-        };
-        assert!(!is_resolve_edges_status(Some(&embedding)));
-
-        let idle_resolve = RepoStatus {
-            state: IndexState::Idle,
-            phase: IndexPhase::ResolveEdges,
-            ..Default::default()
-        };
-        assert!(!is_resolve_edges_status(Some(&idle_resolve)));
-        assert!(!is_resolve_edges_status(None));
-    }
-
-    // 1. chunk_count == 0 → always false, regardless of timestamp.
-    #[test]
-    fn no_chunks_is_not_usable() {
-        assert!(!check_usable(0, &None, THRESHOLD()));
-        assert!(!check_usable(0, &Some(ts_days_ago(1)), THRESHOLD()));
-    }
-
-    // 2. chunk_count > 0, timestamp None → true (legacy backfill / pre-timestamp regression guard).
-    #[test]
-    fn legacy_index_no_timestamp_is_usable() {
-        assert!(check_usable(1, &None, THRESHOLD()));
-    }
-
-    // 3. chunk_count > 0, timestamp 1 day ago (≤ 7d threshold) → true.
-    #[test]
-    fn fresh_timestamp_is_usable() {
-        assert!(check_usable(100, &Some(ts_days_ago(1)), THRESHOLD()));
-    }
-
-    // 4. chunk_count > 0, timestamp 30 days ago (> 7d threshold) → false.
-    #[test]
-    fn old_timestamp_is_not_usable() {
-        assert!(!check_usable(100, &Some(ts_days_ago(30)), THRESHOLD()));
-    }
-
-    // 5. chunk_count > 0, unparseable timestamp → true (corrupt stamp, chunks exist).
-    #[test]
-    fn unparseable_timestamp_is_usable() {
-        assert!(check_usable(
-            50,
-            &Some("not-a-date".to_string()),
-            THRESHOLD()
-        ));
-    }
-
-    // 6a. Boundary: just inside threshold (6 days ago ≤ 7d) → true.
-    #[test]
-    fn just_inside_threshold_is_usable() {
-        assert!(check_usable(10, &Some(ts_days_ago(6)), THRESHOLD()));
-    }
-
-    // 6b. Boundary: just outside threshold (8 days ago > 7d) → false.
-    #[test]
-    fn just_outside_threshold_is_not_usable() {
-        assert!(!check_usable(10, &Some(ts_days_ago(8)), THRESHOLD()));
-    }
-
-    #[test]
-    fn file_retrieval_db_key_windows_backslash_input() {
-        let repo = r"D:\projects\Python\local-context-engine";
-        let file_path = r"context-engine-rs\Cargo.toml";
-        let db_key = build_db_key(repo, file_path);
-        assert_eq!(
-            db_key,
-            r"D:\projects\Python\local-context-engine\context-engine-rs\Cargo.toml"
-        );
-    }
-
-    #[test]
-    fn file_retrieval_db_key_forward_slash_input() {
-        let repo = r"D:\projects\Python\local-context-engine";
-        let file_path = "context-engine-rs/Cargo.toml";
-        let db_key = build_db_key(repo, file_path);
-        assert_eq!(
-            db_key,
-            r"D:\projects\Python\local-context-engine\context-engine-rs\Cargo.toml"
-        );
-    }
-
-    #[test]
-    fn file_retrieval_db_key_mixed_slashes() {
-        let repo = r"D:\projects\Python\local-context-engine";
-        let file_path = r"src/indexing\pipeline.rs";
-        let db_key = build_db_key(repo, file_path);
-        assert_eq!(
-            db_key,
-            r"D:\projects\Python\local-context-engine\src\indexing\pipeline.rs"
-        );
-    }
-
-    #[test]
-    fn file_retrieval_db_key_leading_slash_in_file_path() {
-        let repo = r"D:\projects\Python\local-context-engine";
-        let file_path = "/context-engine-rs/Cargo.toml";
-        let db_key = build_db_key(repo, file_path);
-        assert_eq!(
-            db_key,
-            r"D:\projects\Python\local-context-engine\context-engine-rs\Cargo.toml"
-        );
-    }
-
-    #[test]
-    fn file_retrieval_db_key_leading_backslash_in_file_path() {
-        let repo = r"D:\projects\Python\local-context-engine";
-        let file_path = r"\context-engine-rs\Cargo.toml";
-        let db_key = build_db_key(repo, file_path);
-        assert_eq!(
-            db_key,
-            r"D:\projects\Python\local-context-engine\context-engine-rs\Cargo.toml"
-        );
-    }
-
-    #[test]
-    fn file_retrieval_db_key_trailing_slash_in_workspace() {
-        let repo = r"D:\projects\Python\local-context-engine\";
-        let file_path = "context-engine-rs/Cargo.toml";
-        let db_key = build_db_key(repo, file_path);
-        assert_eq!(
-            db_key,
-            r"D:\projects\Python\local-context-engine\context-engine-rs\Cargo.toml"
-        );
-    }
-
-    #[test]
-    fn file_retrieval_db_key_both_edge_cases() {
-        let repo = r"D:\projects\Python\local-context-engine/";
-        let file_path = "/context-engine-rs/Cargo.toml";
-        let db_key = build_db_key(repo, file_path);
-        assert_eq!(
-            db_key,
-            r"D:\projects\Python\local-context-engine\context-engine-rs\Cargo.toml"
-        );
-    }
-
-    #[test]
-    fn file_retrieval_db_key_unix_paths() {
-        let repo = "/home/user/project";
-        let file_path = "src/main.rs";
-        let db_key = build_db_key(repo, file_path);
-        assert!(db_key.contains("src"));
-        assert!(db_key.contains("main.rs"));
-        assert!(!db_key.contains("//"));
-    }
-
-    #[test]
-    fn cosine_identical_vectors() {
-        let v = vec![1.0, 0.0, 0.0];
-        assert!((cosine_similarity(&v, &v) - 1.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn cosine_orthogonal_vectors() {
-        let a = vec![1.0, 0.0, 0.0];
-        let b = vec![0.0, 1.0, 0.0];
-        assert!(cosine_similarity(&a, &b).abs() < 1e-6);
-    }
-
-    #[test]
-    fn cosine_empty_returns_zero() {
-        assert_eq!(cosine_similarity(&[], &[]), 0.0);
-        assert_eq!(cosine_similarity(&[1.0], &[]), 0.0);
-    }
-
-    #[test]
-    fn budget_all_fit() {
-        let blocks = vec![
-            OutputBlock {
-                header: "file.rs#L1-10".to_string(),
-                content: "1: fn main() {\n2:   println!(\"hi\");\n3: }".to_string(),
-                file: "file.rs".to_string(),
-                line_start: 1,
-                line_end: 10,
-                callers: None,
-                caller_files: None,
-                ..Default::default()
-            },
-            OutputBlock {
-                header: "file.rs#L20-30".to_string(),
-                content: "20: fn foo() {\n21:   bar();\n22: }".to_string(),
-                file: "file.rs".to_string(),
-                line_start: 20,
-                line_end: 30,
-                callers: None,
-                caller_files: None,
-                ..Default::default()
-            },
-        ];
-        let out = assemble_with_budget(&blocks);
-        assert!(out.contains("1: fn main()"));
-        assert!(out.contains("20: fn foo()"));
-        assert!(!out.contains("truncated"));
-    }
-
-    #[test]
-    fn budget_exceeded_shows_header_and_first_line() {
-        let big_content = (1..=500)
-            .map(|i| format!("{}: // line {}", i, "x".repeat(80)))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let mut blocks = Vec::new();
-        for i in 0..200 {
-            blocks.push(OutputBlock {
-                header: format!("big.rs#L{}-{}", i * 500 + 1, (i + 1) * 500),
-                content: big_content.clone(),
-                file: "big.rs".to_string(),
-                line_start: i * 500 + 1,
-                line_end: (i + 1) * 500,
-                callers: None,
-                caller_files: None,
-                ..Default::default()
-            });
-        }
-        let out = assemble_with_budget(&blocks);
-        assert!(out.len() <= MAX_TOOL_OUTPUT_CHARS);
-        assert!(out.contains("truncated to fit output size limit"));
-        assert!(out.contains("elided, use Read"));
-    }
-
-    #[test]
-    fn budget_first_line_capped_at_120() {
-        let long_line = format!("1: {}", "x".repeat(200));
-        let blocks = vec![OutputBlock {
-            header: "file.rs#L1-5".to_string(),
-            content: "1: short line".to_string(),
-            file: "file.rs".to_string(),
-            line_start: 1,
-            line_end: 5,
-            callers: None,
-            caller_files: None,
-            ..Default::default()
-        }];
-        // This block fits fully, so test the truncation on a block that exceeds budget.
-        let big = "y".repeat(MAX_TOOL_OUTPUT_CHARS);
-        let blocks2 = vec![
-            OutputBlock {
-                header: "a.rs#L1-999".to_string(),
-                content: big,
-                file: "a.rs".to_string(),
-                line_start: 1,
-                line_end: 999,
-                callers: None,
-                caller_files: None,
-                ..Default::default()
-            },
-            OutputBlock {
-                header: "b.rs#L1-10".to_string(),
-                content: long_line,
-                file: "b.rs".to_string(),
-                line_start: 1,
-                line_end: 10,
-                callers: None,
-                caller_files: None,
-                ..Default::default()
-            },
-        ];
-        let out = assemble_with_budget(&blocks2);
-        // The second block should be truncated. Its first line is >120 chars.
-        // Verify the output contains the ellipsis marker for long line.
-        assert!(out.contains("…"));
-        // Verify within budget.
-        assert!(out.len() <= MAX_TOOL_OUTPUT_CHARS);
-        // First block's full output (all 'y's) also gets budget-applied:
-        // since it alone exceeds budget, even it gets truncated form.
-        assert!(out.contains("elided, use Read"));
-
-        // Test blocks that fit fine.
-        let out1 = assemble_with_budget(&blocks);
-        assert!(out1.contains("1: short line"));
-        assert!(!out1.contains("truncated"));
-    }
-
-    #[test]
-    fn budget_single_line_chunk_no_elision() {
-        // Single-line chunk: line_end == line_start, so no elision marker needed.
-        // Put it behind a budget-buster so it gets truncated form.
-        let big = "z".repeat(MAX_TOOL_OUTPUT_CHARS);
-        let blocks2 = vec![
-            OutputBlock {
-                header: "huge.rs#L1-999".to_string(),
-                content: big,
-                file: "huge.rs".to_string(),
-                line_start: 1,
-                line_end: 999,
-                callers: None,
-                caller_files: None,
-                ..Default::default()
-            },
-            OutputBlock {
-                header: "file.rs#L5-5".to_string(),
-                content: "5: let x = 1;".to_string(),
-                file: "file.rs".to_string(),
-                line_start: 5,
-                line_end: 5,
-                callers: None,
-                caller_files: None,
-                ..Default::default()
-            },
-        ];
-        let out = assemble_with_budget(&blocks2);
-        // line_end == line_start → no "elided" line for this block
-        assert!(out.contains("file.rs#L5-5"));
-        assert!(out.contains("5: let x = 1;"));
-        // But the "elided" marker should appear for the first (big) block
-        assert!(out.contains("elided, use Read"));
-    }
-
-    #[test]
-    fn merge_blocks_no_overlap() {
-        let blocks = vec![
-            OutputBlock {
-                header: "a.rs#L1-10".into(),
-                content: "1: aaa".into(),
-                file: "a.rs".into(),
-                line_start: 1,
-                line_end: 10,
-                callers: None,
-                caller_files: None,
-                ..Default::default()
-            },
-            OutputBlock {
-                header: "a.rs#L20-30".into(),
-                content: "20: bbb".into(),
-                file: "a.rs".into(),
-                line_start: 20,
-                line_end: 30,
-                callers: None,
-                caller_files: None,
-                ..Default::default()
-            },
-        ];
-        let merged = merge_overlapping_blocks(blocks);
-        assert_eq!(merged.len(), 2);
-        assert_eq!(merged[0].line_start, 1);
-        assert_eq!(merged[1].line_start, 20);
-    }
-
-    #[test]
-    fn merge_blocks_overlap_same_file() {
-        let blocks = vec![
-            OutputBlock {
-                header: "a.rs#L1-50".into(),
-                content: "1: aaa\n2: bbb".into(),
-                file: "a.rs".into(),
-                line_start: 1,
-                line_end: 50,
-                callers: None,
-                caller_files: None,
-                ..Default::default()
-            },
-            OutputBlock {
-                header: "a.rs#L26-75".into(),
-                content: "26: ccc\n27: ddd".into(),
-                file: "a.rs".into(),
-                line_start: 26,
-                line_end: 75,
-                callers: None,
-                caller_files: None,
-                ..Default::default()
-            },
-        ];
-        let merged = merge_overlapping_blocks(blocks);
-        assert_eq!(merged.len(), 1);
-        assert_eq!(merged[0].line_start, 1);
-        assert_eq!(merged[0].line_end, 75);
-        // Header uses the same file path as inputs + merged range, no caller tag.
-        assert_eq!(merged[0].header, "a.rs#L1-75");
-    }
-
-    #[test]
-    fn merge_blocks_combines_caller_tags() {
-        let blocks = vec![
-            OutputBlock {
-                header: "a.rs#L1-50 [callers:3 files:2]".into(),
-                content: "1: aaa".into(),
-                file: "a.rs".into(),
-                line_start: 1,
-                line_end: 50,
-                callers: Some(3),
-                caller_files: Some(2),
-                ..Default::default()
-            },
-            OutputBlock {
-                header: "a.rs#L26-75 [callers:7 files:4]".into(),
-                content: "26: bbb".into(),
-                file: "a.rs".into(),
-                line_start: 26,
-                line_end: 75,
-                callers: Some(7),
-                caller_files: Some(4),
-                ..Default::default()
-            },
-        ];
-        let merged = merge_overlapping_blocks(blocks);
-        assert_eq!(merged.len(), 1);
-        // Caller stats: max(3,7)=7, max(2,4)=4
-        assert_eq!(merged[0].callers, Some(7));
-        assert_eq!(merged[0].caller_files, Some(4));
-        // Header includes the combined caller tag (count-only format for merged blocks).
-        assert_eq!(merged[0].header, "a.rs#L1-75 [callers:7]");
-    }
-
-    #[test]
-    fn merge_blocks_carries_caller_and_callee_names() {
-        // Regression: the names MUST travel with the count through a merge.
-        // Block A is name-less (the import region), Block B carries the real
-        // symbol's counts AND names. Old merge logic bumped only the counts,
-        // leaving A's empty names → bare "[callers:N]". Now the higher-count
-        // block's names are adopted atomically with its count.
-        let blocks = vec![
-            OutputBlock {
-                file: "a.rs".into(),
-                content: "1: use foo;".into(),
-                line_start: 1,
-                line_end: 50,
-                callers: None,
-                caller_names: vec![],
-                callees: None,
-                callee_names: vec![],
-                ..Default::default()
-            },
-            OutputBlock {
-                file: "a.rs".into(),
-                content: "26: fn x".into(),
-                line_start: 26,
-                line_end: 75,
-                callers: Some(2),
-                caller_files: Some(1),
-                caller_names: vec!["foo".into(), "bar".into()],
-                callees: Some(1),
-                callee_names: vec!["baz".into()],
-                ..Default::default()
-            },
-        ];
-        let merged = merge_overlapping_blocks(blocks);
-        assert_eq!(merged.len(), 1);
-        assert_eq!(merged[0].callers, Some(2));
-        assert_eq!(
-            merged[0].caller_names,
-            vec!["foo".to_string(), "bar".to_string()]
-        );
-        assert_eq!(merged[0].callees, Some(1));
-        assert_eq!(merged[0].callee_names, vec!["baz".to_string()]);
-        // Header renders the NAMED form, not the bare count fallback.
-        // (a.rs doesn't exist on disk, so the multi-block merge falls back to a
-        // content union — only the header tags matter for this assertion.)
-        assert!(
-            merged[0].header.contains("[callers: foo, bar]"),
-            "header missing named callers: {}",
-            merged[0].header
-        );
-        assert!(
-            merged[0].header.contains("[calls: baz]"),
-            "header missing named callees: {}",
-            merged[0].header
-        );
-        assert!(
-            !merged[0].header.contains("[callers:2]"),
-            "header fell back to bare count: {}",
-            merged[0].header
-        );
-    }
-
-    #[test]
-    fn merge_blocks_adjacent() {
-        let blocks = vec![
-            OutputBlock {
-                header: "a.rs#L1-10".into(),
-                content: "1: x".into(),
-                file: "a.rs".into(),
-                line_start: 1,
-                line_end: 10,
-                callers: None,
-                caller_files: None,
-                ..Default::default()
-            },
-            OutputBlock {
-                header: "a.rs#L11-20".into(),
-                content: "11: y".into(),
-                file: "a.rs".into(),
-                line_start: 11,
-                line_end: 20,
-                callers: None,
-                caller_files: None,
-                ..Default::default()
-            },
-        ];
-        let merged = merge_overlapping_blocks(blocks);
-        assert_eq!(merged.len(), 1);
-        assert_eq!(merged[0].line_start, 1);
-        assert_eq!(merged[0].line_end, 20);
-    }
-
-    #[test]
-    fn merge_blocks_different_files_no_merge() {
-        let blocks = vec![
-            OutputBlock {
-                header: "a.rs#L1-50".into(),
-                content: "1: aaa".into(),
-                file: "a.rs".into(),
-                line_start: 1,
-                line_end: 50,
-                callers: None,
-                caller_files: None,
-                ..Default::default()
-            },
-            OutputBlock {
-                header: "b.rs#L1-50".into(),
-                content: "1: bbb".into(),
-                file: "b.rs".into(),
-                line_start: 1,
-                line_end: 50,
-                callers: None,
-                caller_files: None,
-                ..Default::default()
-            },
-        ];
-        let merged = merge_overlapping_blocks(blocks);
-        assert_eq!(merged.len(), 2);
-    }
-
-    #[test]
-    fn merge_blocks_preserves_priority_order() {
-        let blocks = vec![
-            OutputBlock {
-                header: "b.rs#L1-10".into(),
-                content: "1: first".into(),
-                file: "b.rs".into(),
-                line_start: 1,
-                line_end: 10,
-                callers: None,
-                caller_files: None,
-                ..Default::default()
-            },
-            OutputBlock {
-                header: "a.rs#L1-50".into(),
-                content: "1: second".into(),
-                file: "a.rs".into(),
-                line_start: 1,
-                line_end: 50,
-                callers: None,
-                caller_files: None,
-                ..Default::default()
-            },
-            OutputBlock {
-                header: "a.rs#L26-75".into(),
-                content: "26: third".into(),
-                file: "a.rs".into(),
-                line_start: 26,
-                line_end: 75,
-                callers: None,
-                caller_files: None,
-                ..Default::default()
-            },
-            OutputBlock {
-                header: "b.rs#L20-30".into(),
-                content: "20: fourth".into(),
-                file: "b.rs".into(),
-                line_start: 20,
-                line_end: 30,
-                callers: None,
-                caller_files: None,
-                ..Default::default()
-            },
-        ];
-        let merged = merge_overlapping_blocks(blocks);
-        // b.rs: L1-10 and L20-30 not overlapping → 2 blocks
-        // a.rs: L1-50 and L26-75 overlap → 1 merged block
-        assert_eq!(merged.len(), 3);
-        // b.rs appeared first (index 0), so its blocks come first
-        assert_eq!(merged[0].file, "b.rs");
-        assert_eq!(merged[0].line_start, 1);
-        // a.rs appeared at index 1
-        assert_eq!(merged[1].file, "a.rs");
-        assert_eq!(merged[1].line_start, 1);
-        assert_eq!(merged[1].line_end, 75);
-        // b.rs second block at index 3 → comes after a.rs
-        assert_eq!(merged[2].file, "b.rs");
-        assert_eq!(merged[2].line_start, 20);
-    }
-
-    #[test]
-    fn merge_blocks_fallback_preserves_content_on_fs_failure() {
-        // Use a non-existent file path so read_lines_from_fs will fail,
-        // exercising the fallback content-merge path.
-        let blocks = vec![
-            OutputBlock {
-                header: "/nonexistent/z.rs#L1-50".into(),
-                content: "1: aaa\n2: bbb\n3: ccc".into(),
-                file: "/nonexistent/z.rs".into(),
-                line_start: 1,
-                line_end: 50,
-                callers: None,
-                caller_files: None,
-                ..Default::default()
-            },
-            OutputBlock {
-                header: "/nonexistent/z.rs#L26-75".into(),
-                content: "2: bbb\n26: ddd\n27: eee".into(),
-                file: "/nonexistent/z.rs".into(),
-                line_start: 26,
-                line_end: 75,
-                callers: None,
-                caller_files: None,
-                ..Default::default()
-            },
-        ];
-        let merged = merge_overlapping_blocks(blocks);
-        assert_eq!(merged.len(), 1);
-        assert_eq!(merged[0].line_start, 1);
-        assert_eq!(merged[0].line_end, 75);
-        assert!(merged[0].header.contains("L1-75"));
-        // Fallback should preserve original lines, deduped by line number.
-        assert!(merged[0].content.contains("1: aaa"));
-        assert!(merged[0].content.contains("2: bbb"));
-        assert!(merged[0].content.contains("3: ccc"));
-        assert!(merged[0].content.contains("26: ddd"));
-        assert!(merged[0].content.contains("27: eee"));
-        // Line "2: bbb" appeared in both blocks but should only appear once.
-        assert_eq!(merged[0].content.matches("2: bbb").count(), 1);
-    }
-
-    // ─── select_empty_or_warming_message (warming-vs-empty signal) ───────────
-
-    #[test]
-    fn warming_message_takes_precedence_and_says_retry() {
-        // warming=true → retry message, regardless of rerank_rejected.
-        for rr in [false, true] {
-            let msg = select_empty_or_warming_message(true, rr, "find the parser");
-            assert!(
-                msg.contains("warming"),
-                "warming msg must mention warming: {msg}"
-            );
-            assert!(
-                msg.to_lowercase().contains("retry"),
-                "must tell caller to retry: {msg}"
-            );
-            // MUST NOT use the genuine-empty wording.
-            assert!(
-                !msg.contains("No results found"),
-                "warming must not say 'No results found'"
-            );
-            assert!(
-                !msg.contains("No relevant code found"),
-                "warming must not say 'No relevant code found'"
-            );
-        }
-    }
-
-    #[test]
-    fn genuine_empty_resident_shard_keeps_existing_wording() {
-        // warming=false, not rejected → the unchanged "No results found for: <q>".
-        let msg = select_empty_or_warming_message(false, false, "find the parser");
-        assert_eq!(msg, "No results found for: find the parser");
-
-        // warming=false, rerank actively rejected → the unchanged rerank-rejected wording.
-        let msg = select_empty_or_warming_message(false, true, "find the parser");
-        assert!(
-            msg.starts_with("No relevant code found."),
-            "rerank-rejected wording preserved: {msg}"
-        );
-        assert!(
-            !msg.contains("warming"),
-            "genuine empty must not mention warming"
-        );
-    }
+    .await;
+    format!("{output_prefix}{output}")
 }
 
 /// Build an augmented query string that prepends structured filter params as inline
@@ -1652,7 +800,7 @@ async fn do_query(
             // caller the codebase has nothing relevant; instead signal a retry. The
             // decision is a pure function of (warming, empty, rerank_rejected) so it is
             // unit-tested directly (see select_empty_or_warming_message).
-            if result.warming || result.results.is_empty() {
+            if result.results.is_empty() {
                 let rerank_rejected = result.rerank.as_ref().is_some_and(|r| {
                     !r.fallback_used && r.skip_reason.is_none() && !r.raw_response.is_empty()
                 });
@@ -1694,7 +842,12 @@ async fn do_query(
                 .partition(|b| !crate::parsing::generated::is_generated_file(&b.file));
             let mut blocks = hand_written;
             blocks.extend(generated);
-            assemble_with_budget(&blocks)
+            let assembled = assemble_with_budget(&blocks);
+            if result.warming {
+                format!("{MCP_PARTIAL_RESULTS_PREFIX}{assembled}")
+            } else {
+                assembled
+            }
         }
     }
 }

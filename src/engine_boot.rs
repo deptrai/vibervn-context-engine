@@ -119,6 +119,17 @@ pub fn set_rocksdb_memory_bounds() {
 /// `EnvFilter` default) and does NOT build the HTTP router or bind a socket —
 /// the caller decides what to do with the booted engine.
 pub async fn boot_engine(opts: BootOptions) -> Result<BootedEngine> {
+    boot_engine_with_home(opts, None).await
+}
+
+/// Boot the engine with an explicit settings home.
+///
+/// Router workers use this to inherit the router's settings location without
+/// widening [`BootOptions`] and forcing unrelated embedded callers to change.
+pub async fn boot_engine_with_home(
+    opts: BootOptions,
+    home_dir: Option<PathBuf>,
+) -> Result<BootedEngine> {
     // Bound RocksDB memory BEFORE any datastore opens. SurrealDB derives its
     // RocksDB defaults from total system RAM and applies the write buffers PER
     // database: on a 64 GiB host the block cache defaults to ~31 GiB and each DB
@@ -130,9 +141,12 @@ pub async fn boot_engine(opts: BootOptions) -> Result<BootedEngine> {
     set_rocksdb_memory_bounds();
 
     // Home-dir probe: fail early if we can't determine the home directory.
-    let home_dir = dirs::home_dir().context(
-        "could not determine user home directory; set HOME (Unix) or USERPROFILE (Windows)",
-    )?;
+    let home_dir = match home_dir {
+        Some(home) => home,
+        None => dirs::home_dir().context(
+            "could not determine user home directory; set HOME (Unix) or USERPROFILE (Windows)",
+        )?,
+    };
 
     // Load settings (needed to know which repos to watch).
     let mut settings = ensure_dir_and_load(&home_dir).context("could not load settings")?;

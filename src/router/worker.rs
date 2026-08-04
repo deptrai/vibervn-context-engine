@@ -44,6 +44,10 @@ use axum::response::Response;
 use tokio::sync::{Mutex as AsyncMutex, RwLock};
 use tracing::info;
 
+/// Grace period after closing the shared DB handle so its final flush can settle
+/// before process exit releases the OS-level RocksDB lock.
+const WORKER_EXIT_FLUSH_GRACE: Duration = Duration::from_millis(500);
+
 use crate::config::{Settings, maybe_reload_settings};
 use crate::indexing::IndexEngine;
 use crate::store::RepoDbMap;
@@ -247,7 +251,7 @@ pub fn spawn_idle_watchdog(
             // open begins only after this process has exited and the OS has begun
             // releasing the handle — and (b) `open_db`'s 30s LOCK-drain retry,
             // which rides out any residual OS-level drain after exit.
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            tokio::time::sleep(WORKER_EXIT_FLUSH_GRACE).await;
 
             info!(repo = %repo, "worker exiting (scale-to-zero)");
             std::process::exit(0);

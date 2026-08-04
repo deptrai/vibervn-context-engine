@@ -8,7 +8,7 @@ use crate::path_in_repo;
 
 pub mod shard_file;
 pub mod sharded;
-pub use sharded::{ShardedSearch, ShardedVectorIndex};
+pub use sharded::{ScopedAll, ScopedSearch, ShardedSearch, ShardedVectorIndex};
 
 // ─── Public types ─────────────────────────────────────────────────────────
 

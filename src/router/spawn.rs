@@ -31,7 +31,8 @@ use super::worker::READY_PREFIX;
 /// Upper bound on the spawn→ready handshake. Generous relative to the measured
 /// 0.6–1.4s cold open: covers a cold process load + kernel-scale open + bind
 /// with wide margin, while still failing fast on a wedged worker. The caller's
-/// own request budget (`mcp_index_wait_secs`, default 50s) is far larger, so a
+/// own configured request budget (`Settings::mcp_index_wait_secs`, defaulted by
+/// `config::DEFAULT_MCP_INDEX_WAIT_SECS`) is larger, so a
 /// spawn that lands inside this window leaves ample budget for the actual query.
 pub const SPAWN_READY_TIMEOUT: Duration = Duration::from_secs(20);
 

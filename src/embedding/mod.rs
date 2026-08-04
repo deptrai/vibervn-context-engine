@@ -1,4 +1,5 @@
 pub mod cache;
+pub mod identity;
 pub mod voyage;
 
 // Re-export the transient-exhausted marker so the pipeline can classify errors.

@@ -28,6 +28,7 @@ use tracing_subscriber::EnvFilter;
 use context_engine_rs::engine_boot::{BootOptions, BootedEngine, boot_engine};
 use context_engine_rs::engine_ops;
 use context_engine_rs::indexing::IndexState;
+use context_engine_rs::query::engine::QueryGraphMode;
 use context_engine_rs::store;
 use surrealdb::Surreal;
 use surrealdb::engine::local::Db;
@@ -268,6 +269,9 @@ async fn run() -> i32 {
     let settings_snapshot = settings.read().await.clone();
     // Safe: the non-diagnose path required --query (validated at startup).
     let query_text = cli.query.as_deref().unwrap_or_default();
+    // The bench already waited for the index to reach Idle above (its own,
+    // deliberately much larger `INDEX_WAIT_CAP` budget), so it asks for the full
+    // call graph and grants the standard per-request warm budget.
     let result = match engine_ops::run_query_op(
         &settings_snapshot,
         &index_engine,
@@ -276,6 +280,8 @@ async fn run() -> i32 {
         query_text,
         cli.top_k,
         cli.rerank,
+        QueryGraphMode::Full,
+        Duration::from_secs(settings_snapshot.mcp_index_wait_secs),
     )
     .await
     {

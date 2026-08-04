@@ -9,7 +9,7 @@ use serde_json::Value;
 use tempfile::NamedTempFile;
 
 /// Bump this when a new migration is appended to MIGRATIONS.
-pub const CURRENT_VERSION: u32 = 12;
+pub const CURRENT_VERSION: u32 = 13;
 
 /// Migration function type: transforms a JSON Value from version N to version N+1.
 pub type MigrationFn = fn(Value) -> Result<Value, ConfigError>;
@@ -28,6 +28,7 @@ pub const MIGRATIONS: &[MigrationFn] = &[
     migrate_v9_to_v10,
     migrate_v10_to_v11,
     migrate_v11_to_v12,
+    migrate_v12_to_v13,
 ];
 
 /// v1→v2: introduce `data_dir` (Option<PathBuf>). The body is a no-op stamp —
@@ -183,6 +184,18 @@ fn migrate_v11_to_v12(mut value: Value) -> Result<Value, ConfigError> {
     if let Value::Object(ref mut obj) = value {
         obj.entry("worker_idle_secs".to_string())
             .or_insert_with(|| Value::from(default_worker_idle_secs()));
+    }
+    Ok(value)
+}
+
+/// v12→v13: make `file-retrieval` an advanced, opt-in MCP tool. Earlier
+/// versions enabled it by default, so remove it during upgrade as well as from
+/// the default for fresh installs. Users can explicitly re-enable it afterward.
+fn migrate_v12_to_v13(mut value: Value) -> Result<Value, ConfigError> {
+    if let Value::Object(ref mut obj) = value
+        && let Some(Value::Array(tools)) = obj.get_mut("enabled_mcp_tools")
+    {
+        tools.retain(|tool| tool.as_str() != Some("file-retrieval"));
     }
     Ok(value)
 }
@@ -403,19 +416,23 @@ impl Default for LlmConfig {
     }
 }
 
+/// Default total MCP request budget for waiting on index completion.
+pub const DEFAULT_MCP_INDEX_WAIT_SECS: u64 = 50;
+/// Default age after which a committed index is considered stale by MCP.
+pub const DEFAULT_MCP_STALE_AFTER_DAYS: u64 = 7;
+
 fn default_mcp_index_wait_secs() -> u64 {
-    50
+    DEFAULT_MCP_INDEX_WAIT_SECS
 }
 
 fn default_mcp_stale_after_days() -> u64 {
-    7
+    DEFAULT_MCP_STALE_AFTER_DAYS
 }
 
 fn default_enabled_mcp_tools() -> Vec<String> {
-    vec![
-        "codebase-retrieval".to_string(),
-        "file-retrieval".to_string(),
-    ]
+    // Only `codebase-retrieval` is on by default. `file-retrieval` is an
+    // advanced, opt-in tool — new installs must enable it explicitly in the UI.
+    vec!["codebase-retrieval".to_string()]
 }
 
 /// A plan/key the user has bought (or claimed as a free trial) through the buy
@@ -1795,6 +1812,312 @@ mod tests {
             Some(30),
             "existing worker_idle_secs must be preserved, not reset to default"
         );
+    }
+
+    /// v12→v13: an existing install that had `file-retrieval` enabled (the old
+    /// default) must have it removed on upgrade — it becomes an opt-in tool.
+    /// `codebase-retrieval` stays enabled, and the version is bumped on disk.
+    #[test]
+    fn test_v12_to_v13_migration_drops_file_retrieval() {
+        let home = TempDir::new().expect("tempdir");
+        let path = config_path(home.path());
+        fs::create_dir_all(path.parent().expect("has parent")).expect("create dirs");
+
+        let v12 = r#"{
+            "version": 12,
+            "repos": [],
+            "embedding": {"provider":"voyage","model":"voyage-4-lite","api_keys":[],"embed_concurrency":16,"voyage_base_url":null,"dimensions":null},
+            "llm": {"provider":"google","rerank_model":"gemini-3.1-flash-lite","api_keys":[],"chat_custom_endpoints":[]},
+            "data_dir": null,
+            "embeddings_dir": null,
+            "enabled_mcp_tools": ["codebase-retrieval","file-retrieval"],
+            "custom_extensions": [],
+            "index_ignore_filenames": ["CLAUDE.md","AGENTS.md"],
+            "repo_generations": {},
+            "purchased_plans": [],
+            "worker_idle_secs": 300
+        }"#;
+        fs::write(&path, v12).expect("write v12 settings.json");
+
+        let loaded = ensure_dir_and_load(home.path()).expect("load v12");
+        assert_eq!(loaded.version, CURRENT_VERSION);
+        assert_eq!(
+            loaded.enabled_mcp_tools,
+            vec!["codebase-retrieval".to_string()],
+            "file-retrieval must be removed from enabled tools on upgrade"
+        );
+
+        let raw = fs::read_to_string(&path).expect("re-read");
+        let v: Value = serde_json::from_str(&raw).expect("parse re-read");
+        assert_eq!(
+            v.get("version").and_then(|x| x.as_u64()),
+            Some(CURRENT_VERSION as u64)
+        );
+        let tools = v
+            .get("enabled_mcp_tools")
+            .and_then(|x| x.as_array())
+            .expect("enabled_mcp_tools array");
+        assert!(
+            !tools.iter().any(|t| t.as_str() == Some("file-retrieval")),
+            "on-disk enabled_mcp_tools must not contain file-retrieval after migration"
+        );
+    }
+
+    /// v12→v13 preserves a user who had ONLY `codebase-retrieval` (never turned
+    /// file-retrieval on): the migration is a no-op for their tool list.
+    #[test]
+    fn test_v12_to_v13_migration_leaves_codebase_only_intact() {
+        let value: Value =
+            serde_json::from_str(r#"{"enabled_mcp_tools":["codebase-retrieval"]}"#).expect("parse");
+        let migrated = migrate_v12_to_v13(value).expect("migrate");
+        let tools: Vec<String> = migrated
+            .get("enabled_mcp_tools")
+            .and_then(|x| x.as_array())
+            .expect("array")
+            .iter()
+            .filter_map(|t| t.as_str().map(str::to_string))
+            .collect();
+        assert_eq!(tools, vec!["codebase-retrieval".to_string()]);
+    }
+
+    /// New installs default to `codebase-retrieval` only; `file-retrieval` is
+    /// opt-in and must NOT appear in the default tool list.
+    #[test]
+    fn test_default_enabled_mcp_tools_excludes_file_retrieval() {
+        let tools = default_enabled_mcp_tools();
+        assert_eq!(tools, vec!["codebase-retrieval".to_string()]);
+        assert!(
+            !tools.iter().any(|t| t == "file-retrieval"),
+            "file-retrieval must not be enabled by default"
+        );
+    }
+
+    /// Blast-radius guard: a config from EVERY prior schema version (1..=12)
+    /// must run the full migration chain — including the terminal v12→v13 —
+    /// so `file-retrieval` is stripped no matter which build the user upgraded
+    /// from. v3 was the last version before `enabled_mcp_tools` existed; the
+    /// v3→v4 migration injects both tools, then v12→v13 removes file-retrieval,
+    /// leaving codebase-retrieval. This pins that no old version escapes the
+    /// opt-in switch.
+    #[test]
+    fn test_all_prior_versions_migrate_and_drop_file_retrieval() {
+        for from in 1..=12u32 {
+            let home = TempDir::new().expect("tempdir");
+            let path = config_path(home.path());
+            fs::create_dir_all(path.parent().expect("has parent")).expect("create dirs");
+
+            // Minimal but valid body for the given version. Versions ≥ 4 carry an
+            // explicit enabled_mcp_tools with BOTH tools (the old default / an
+            // upgraded-from-older file); versions ≤ 3 omit it so the v3→v4
+            // migration injects it. `serde(default)` fills every other field.
+            let body = if from >= 4 {
+                format!(
+                    r#"{{
+                        "version": {from},
+                        "repos": [],
+                        "embedding": {{"provider":"voyage","model":"voyage-4-lite","api_keys":[]}},
+                        "llm": {{"provider":"google","rerank_model":"gemini-3.1-flash-lite","api_keys":[]}},
+                        "enabled_mcp_tools": ["codebase-retrieval","file-retrieval"]
+                    }}"#
+                )
+            } else {
+                format!(
+                    r#"{{
+                        "version": {from},
+                        "repos": [],
+                        "embedding": {{"provider":"voyage","model":"voyage-4-lite","api_keys":[]}},
+                        "llm": {{"provider":"google","rerank_model":"gemini-3.1-flash-lite","api_keys":[]}}
+                    }}"#
+                )
+            };
+            fs::write(&path, body).unwrap_or_else(|e| panic!("write v{from}: {e}"));
+
+            let loaded =
+                ensure_dir_and_load(home.path()).unwrap_or_else(|e| panic!("load v{from}: {e:?}"));
+            assert_eq!(
+                loaded.version, CURRENT_VERSION,
+                "v{from} config must be stamped to CURRENT_VERSION after migration"
+            );
+            assert!(
+                !loaded
+                    .enabled_mcp_tools
+                    .iter()
+                    .any(|t| t == "file-retrieval"),
+                "v{from} config must have file-retrieval removed by v12→v13"
+            );
+            assert!(
+                loaded
+                    .enabled_mcp_tools
+                    .iter()
+                    .any(|t| t == "codebase-retrieval"),
+                "v{from} config must retain codebase-retrieval"
+            );
+        }
+    }
+
+    /// The migration removes ONLY `file-retrieval`; any other (custom / unknown /
+    /// future) tool names in the list are preserved verbatim and in order. This
+    /// guards against an over-broad retain that would clobber tools the config
+    /// layer intentionally doesn't whitelist (forward-compat by design).
+    #[test]
+    fn test_v12_to_v13_migration_preserves_other_tools() {
+        let value: Value = serde_json::from_str(
+            r#"{"enabled_mcp_tools":["codebase-retrieval","file-retrieval","some-future-tool"]}"#,
+        )
+        .expect("parse");
+        let migrated = migrate_v12_to_v13(value).expect("migrate");
+        let tools: Vec<String> = migrated
+            .get("enabled_mcp_tools")
+            .and_then(|x| x.as_array())
+            .expect("array")
+            .iter()
+            .filter_map(|t| t.as_str().map(str::to_string))
+            .collect();
+        assert_eq!(
+            tools,
+            vec![
+                "codebase-retrieval".to_string(),
+                "some-future-tool".to_string()
+            ],
+            "only file-retrieval is removed; other tools stay in original order"
+        );
+    }
+
+    /// v12→v13 with a MISSING `enabled_mcp_tools` field: the migration is a
+    /// no-op (nothing to strip), and serde fills the new opt-in default
+    /// (codebase-retrieval only) on deserialize.
+    #[test]
+    fn test_v12_to_v13_missing_field_defaults_to_codebase_only() {
+        let home = TempDir::new().expect("tempdir");
+        let path = config_path(home.path());
+        fs::create_dir_all(path.parent().expect("has parent")).expect("create dirs");
+
+        // A v12 file that never wrote enabled_mcp_tools (hand-edited / partial).
+        let v12 = r#"{
+            "version": 12,
+            "repos": [],
+            "embedding": {"provider":"voyage","model":"voyage-4-lite","api_keys":[]},
+            "llm": {"provider":"google","rerank_model":"gemini-3.1-flash-lite","api_keys":[]}
+        }"#;
+        fs::write(&path, v12).expect("write v12");
+
+        let loaded = ensure_dir_and_load(home.path()).expect("load v12 missing tools");
+        assert_eq!(
+            loaded.enabled_mcp_tools,
+            vec!["codebase-retrieval".to_string()],
+            "missing enabled_mcp_tools must default to codebase-retrieval only"
+        );
+    }
+
+    /// v12→v13 with an EXPLICIT empty tool list: the empty list is preserved
+    /// (serde default does NOT clobber an explicit `[]`), so a user who disabled
+    /// everything stays with everything disabled after upgrade.
+    #[test]
+    fn test_v12_to_v13_explicit_empty_list_preserved() {
+        let home = TempDir::new().expect("tempdir");
+        let path = config_path(home.path());
+        fs::create_dir_all(path.parent().expect("has parent")).expect("create dirs");
+
+        let v12 = r#"{
+            "version": 12,
+            "repos": [],
+            "embedding": {"provider":"voyage","model":"voyage-4-lite","api_keys":[]},
+            "llm": {"provider":"google","rerank_model":"gemini-3.1-flash-lite","api_keys":[]},
+            "enabled_mcp_tools": []
+        }"#;
+        fs::write(&path, v12).expect("write v12");
+
+        let loaded = ensure_dir_and_load(home.path()).expect("load v12 empty tools");
+        assert!(
+            loaded.enabled_mcp_tools.is_empty(),
+            "explicit empty enabled_mcp_tools must not be overwritten by the default; got {:?}",
+            loaded.enabled_mcp_tools
+        );
+    }
+
+    /// One-time-only guard: once a file is at CURRENT_VERSION (v13), loading it
+    /// does NOT re-run the migration. A user who deliberately RE-ENABLES
+    /// file-retrieval after the upgrade keeps it — the migration never strips it
+    /// again. Also proves the on-disk file is untouched (no rewrite) on a
+    /// current-version load.
+    #[test]
+    fn test_v13_reenabled_file_retrieval_is_not_stripped_again() {
+        let home = TempDir::new().expect("tempdir");
+        let path = config_path(home.path());
+        fs::create_dir_all(path.parent().expect("has parent")).expect("create dirs");
+
+        // Already at CURRENT_VERSION, with file-retrieval turned back on.
+        let v13 = format!(
+            r#"{{
+                "version": {CURRENT_VERSION},
+                "repos": [],
+                "embedding": {{"provider":"voyage","model":"voyage-4-lite","api_keys":[]}},
+                "llm": {{"provider":"google","rerank_model":"gemini-3.1-flash-lite","api_keys":[]}},
+                "enabled_mcp_tools": ["codebase-retrieval","file-retrieval"]
+            }}"#
+        );
+        fs::write(&path, &v13).expect("write v13");
+
+        let loaded = ensure_dir_and_load(home.path()).expect("load v13");
+        assert!(
+            loaded
+                .enabled_mcp_tools
+                .iter()
+                .any(|t| t == "file-retrieval"),
+            "a current-version config that re-enabled file-retrieval must keep it"
+        );
+        assert_eq!(
+            loaded.enabled_mcp_tools,
+            vec![
+                "codebase-retrieval".to_string(),
+                "file-retrieval".to_string()
+            ]
+        );
+    }
+
+    /// Validation stays centralized in `Settings` deserialization: the field is
+    /// a `Vec<String>`, so malformed values cannot reach UI persistence or MCP
+    /// runtime construction. Unknown STRING names remain allowed for forward
+    /// compatibility and are simply not routed by today's runtime.
+    #[test]
+    fn test_enabled_mcp_tools_rejects_non_string_entries() {
+        let mut value = serde_json::to_value(Settings::default()).expect("serialize default");
+        value["enabled_mcp_tools"] = serde_json::json!(["codebase-retrieval", 42]);
+        let err = serde_json::from_value::<Settings>(value)
+            .expect_err("non-string tool entry must fail Settings validation");
+        assert!(
+            err.to_string().contains("string"),
+            "validation error should identify the non-string entry: {err}"
+        );
+    }
+
+    /// Round-trip: a re-enabled file-retrieval survives write → load unchanged,
+    /// confirming serialization has no parallel default that would drop it.
+    #[test]
+    fn test_enabled_mcp_tools_round_trips_file_retrieval() {
+        let home = TempDir::new().expect("tempdir");
+        let path = config_path(home.path());
+        fs::create_dir_all(path.parent().expect("has parent")).expect("create dirs");
+
+        let s = Settings {
+            enabled_mcp_tools: vec![
+                "codebase-retrieval".to_string(),
+                "file-retrieval".to_string(),
+            ],
+            ..Settings::default()
+        };
+        write_settings_atomic(&path, &s).expect("write");
+
+        let loaded = ensure_dir_and_load(home.path()).expect("load");
+        assert_eq!(
+            loaded.enabled_mcp_tools,
+            vec![
+                "codebase-retrieval".to_string(),
+                "file-retrieval".to_string()
+            ],
+            "enabled_mcp_tools must round-trip through write+load"
+        );
+        assert_eq!(loaded.version, CURRENT_VERSION);
     }
 
     #[test]

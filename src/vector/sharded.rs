@@ -24,7 +24,7 @@
 //! cosine scores in `[-1, 1]`. A global top-k over per-shard top-k candidates is
 //! therefore exact — partitioning is mathematically transparent to ranking.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::vector::{SearchResult, VectorIndex};
@@ -36,13 +36,16 @@ use crate::vector::{SearchResult, VectorIndex};
 /// monotonic global clock — no `Vec` reshuffling, no `&mut self` for a touch.
 struct Shard {
     index: VectorIndex,
+    /// Canonical `EmbeddingIdentity::as_key_string()` for every vector in this shard.
+    identity: String,
     last_touched: AtomicU64,
 }
 
 impl Shard {
-    fn new(index: VectorIndex, stamp: u64) -> Self {
+    fn new(index: VectorIndex, identity: String, stamp: u64) -> Self {
         Self {
             index,
+            identity,
             last_touched: AtomicU64::new(stamp),
         }
     }
@@ -59,12 +62,51 @@ pub struct ShardedSearch {
     pub cold_repos: Vec<String>,
 }
 
+/// Identity-aware outcome for a single-repo search.
+///
+/// `IdentityMismatch` never contains results: cosine search is not attempted when
+/// the resident shard belongs to a different embedding space.
+#[derive(Debug)]
+pub enum ScopedSearch {
+    Hit(ShardedSearch),
+    /// The canonical identity actually observed under the same read guard.
+    IdentityMismatch(String),
+    Cold,
+}
+
+/// Identity-aware outcome for a multi-repo search.
+///
+/// Only identity-matching shards contribute `results`. Cold and mismatched repos
+/// are returned separately so the engine can warm/repair them asynchronously.
+#[derive(Debug, Default)]
+pub struct ScopedAll {
+    pub results: Vec<SearchResult>,
+    pub cold_repos: Vec<String>,
+    /// `(repo, identity_observed)` pairs captured atomically with validation.
+    pub mismatch_repos: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ShardMatch {
+    Hit,
+    Mismatch(String),
+    Cold,
+}
+
 /// Per-repo sharded vector index. Not internally synchronized — the engine wraps
 /// the whole struct in one `tokio::sync::RwLock` (see module docs). `search` only
 /// needs a read guard; recency is tracked via per-shard atomic stamps.
 pub struct ShardedVectorIndex {
-    /// One vector shard (+ recency stamp) per repo, keyed by repo path string.
+    /// Searchable resident shards. A repo under a destructive update is removed
+    /// from this map before its DB rows are deleted.
     shards: HashMap<String, Shard>,
+    /// Repos whose DB `chunk` rows are being destructively replaced. Warm installs
+    /// are rejected while a repo is present, closing the scan/install race.
+    mutating_repos: HashSet<String>,
+    /// Old incremental shards retained off the searchable path so unaffected
+    /// vectors can be re-used when the delta publishes. Full rebuilds do not retain
+    /// an old shard.
+    pending_incremental: HashMap<String, Shard>,
     /// Monotonic logical clock. Each touch fetch-adds 1 and stamps the shard, so a
     /// higher stamp == more recently used. Eviction picks the lowest stamp (LRU).
     clock: AtomicU64,
@@ -80,6 +122,8 @@ impl ShardedVectorIndex {
     pub fn new(cap_bytes: usize) -> Self {
         Self {
             shards: HashMap::new(),
+            mutating_repos: HashSet::new(),
+            pending_incremental: HashMap::new(),
             clock: AtomicU64::new(0),
             cap_bytes,
         }
@@ -111,9 +155,114 @@ impl ShardedVectorIndex {
         self.shards.keys().cloned().collect()
     }
 
+    /// The ONE canonicalization applied to every repo key that enters this struct.
+    ///
+    /// `shards`, `pending_incremental` and `mutating_repos` share a single key
+    /// space, so they must be keyed identically or a `begin_*_update` could fence
+    /// one spelling while leaving the other spelling's shard searchable. Applying
+    /// this at every boundary makes the fence invariant to caller spelling
+    /// (separator style, case on Windows, trailing separator) instead of relying on
+    /// every writer remembering to normalize first. `normalize_repo_path` is
+    /// idempotent, so re-normalizing an already-canonical key is a no-op.
+    fn repo_key(repo: &str) -> String {
+        crate::store::normalize_repo_path(repo)
+    }
+
+    /// Canonicalize a caller-supplied repo list (eviction `active` set, search
+    /// `scope`) so its entries compare equal to the canonical shard keys.
+    fn repo_keys(repos: &[String]) -> Vec<String> {
+        repos.iter().map(|r| Self::repo_key(r)).collect()
+    }
+
     /// True if `repo` currently has a resident shard.
     pub fn is_resident(&self, repo: &str) -> bool {
-        self.shards.contains_key(repo)
+        let repo = Self::repo_key(repo);
+        !self.mutating_repos.contains(&repo) && self.shards.contains_key(&repo)
+    }
+
+    /// True while a destructive DB update owns this repo's vector publication.
+    pub fn is_mutating(&self, repo: &str) -> bool {
+        self.mutating_repos.contains(&Self::repo_key(repo))
+    }
+
+    /// Begin a full rebuild before `delete_all_data` runs. The old shard becomes
+    /// immediately unsearchable and is dropped; warm cannot install a replacement
+    /// until the pipeline publishes successfully.
+    pub fn begin_full_update(&mut self, repo: &str) {
+        let repo = Self::repo_key(repo);
+        self.shards.remove(&repo);
+        self.pending_incremental.remove(&repo);
+        self.mutating_repos.insert(repo);
+    }
+
+    /// Begin an incremental update before affected chunk rows are deleted. The old
+    /// shard becomes unsearchable, but is retained privately so unaffected vectors
+    /// can be re-used at publish time without an O(repo) DB reload.
+    pub fn begin_incremental_update(&mut self, repo: &str) {
+        let repo = Self::repo_key(repo);
+        self.pending_incremental.remove(&repo);
+        if let Some(shard) = self.shards.remove(&repo) {
+            self.pending_incremental.insert(repo.clone(), shard);
+        }
+        self.mutating_repos.insert(repo);
+    }
+
+    /// Install a warm-built shard only if no destructive run owns publication.
+    /// Returns false when the scan raced an index run; the caller must discard it.
+    pub fn install_shard_if_not_mutating(
+        &mut self,
+        repo: &str,
+        shard: VectorIndex,
+        identity: String,
+        active: &[String],
+    ) -> bool {
+        let repo = Self::repo_key(repo);
+        if self.mutating_repos.contains(&repo) {
+            return false;
+        }
+        self.install_shard(&repo, shard, identity, active);
+        true
+    }
+
+    /// Atomically publish a full replacement and release the mutation fence.
+    pub fn publish_full_update(
+        &mut self,
+        repo: &str,
+        new_vectors: &[(crate::vector::ChunkId, Vec<f32>)],
+        identity: String,
+        active: &[String],
+    ) {
+        let repo = Self::repo_key(repo);
+        self.pending_incremental.remove(&repo);
+        self.replace_repo(&repo, new_vectors, identity, active);
+        self.mutating_repos.remove(&repo);
+    }
+
+    /// Atomically apply an incremental delta to the hidden old shard, make it
+    /// searchable again, and release the mutation fence.
+    pub fn publish_incremental_update(
+        &mut self,
+        repo: &str,
+        removed_files: &[String],
+        new_vectors: &[(crate::vector::ChunkId, Vec<f32>)],
+        identity: String,
+        active: &[String],
+    ) {
+        let repo = Self::repo_key(repo);
+        if let Some(shard) = self.pending_incremental.remove(&repo) {
+            self.shards.insert(repo.clone(), shard);
+        }
+        self.apply_incremental(&repo, removed_files, new_vectors, identity, active);
+        self.mutating_repos.remove(&repo);
+    }
+
+    /// Keep the repo fail-closed after a failed run while dropping any hidden old
+    /// shard. A later successful full rebuild releases the mutation fence.
+    pub fn abort_update_fail_closed(&mut self, repo: &str) {
+        let repo = Self::repo_key(repo);
+        self.shards.remove(&repo);
+        self.pending_incremental.remove(&repo);
+        self.mutating_repos.insert(repo);
     }
 
     // ── Recency bookkeeping ──────────────────────────────────────────────────
@@ -142,16 +291,23 @@ impl ShardedVectorIndex {
     ///
     /// `active` is the set of repos that must never be evicted by this call
     /// (the just-installed repo is always implicitly protected).
-    pub fn install_shard(&mut self, repo: &str, shard: VectorIndex, active: &[String]) {
+    pub fn install_shard(
+        &mut self,
+        repo: &str,
+        shard: VectorIndex,
+        identity: String,
+        active: &[String],
+    ) {
+        let repo = Self::repo_key(repo);
         if shard.is_empty() {
             // An empty shard carries no information; drop it.
-            self.shards.remove(repo);
+            self.shards.remove(&repo);
             return;
         }
         let stamp = self.next_stamp();
         self.shards
-            .insert(repo.to_string(), Shard::new(shard, stamp));
-        self.evict_to_cap(repo, active);
+            .insert(repo.clone(), Shard::new(shard, identity, stamp));
+        self.evict_to_cap(&repo, active);
     }
 
     /// Evict least-recently-used shards until resident bytes are at or below the
@@ -163,6 +319,8 @@ impl ShardedVectorIndex {
         if self.cap_bytes == 0 {
             return; // cap disabled
         }
+        let protected = Self::repo_key(protected);
+        let active = Self::repo_keys(active);
         while self.resident_bytes() > self.cap_bytes {
             // Find the evictable shard with the lowest recency stamp (true LRU).
             let victim = self
@@ -185,7 +343,7 @@ impl ShardedVectorIndex {
     /// Explicitly evict a single repo's shard (e.g. when its DB handle is evicted
     /// by the synchronized repo_dbs LRU). Idempotent.
     pub fn evict_repo(&mut self, repo: &str) {
-        self.shards.remove(repo);
+        self.shards.remove(&Self::repo_key(repo));
     }
 
     // ── Incremental write helpers (used by the pipeline) ─────────────────────
@@ -198,13 +356,16 @@ impl ShardedVectorIndex {
         repo: &str,
         removed_files: &[String],
         new_vectors: &[(crate::vector::ChunkId, Vec<f32>)],
+        identity: String,
         active: &[String],
     ) {
+        let repo = Self::repo_key(repo);
         let stamp = self.next_stamp();
         let shard = self
             .shards
-            .entry(repo.to_string())
-            .or_insert_with(|| Shard::new(VectorIndex::new(), stamp));
+            .entry(repo.clone())
+            .or_insert_with(|| Shard::new(VectorIndex::new(), identity.clone(), stamp));
+        shard.identity = identity;
         for file in removed_files {
             shard.index.remove_file(file);
         }
@@ -212,10 +373,10 @@ impl ShardedVectorIndex {
         shard.last_touched.store(stamp, Ordering::Relaxed);
         // An emptied shard is dropped to free its (now-zero) slot.
         if shard.index.is_empty() {
-            self.evict_repo(repo);
+            self.evict_repo(&repo);
             return;
         }
-        self.evict_to_cap(repo, active);
+        self.evict_to_cap(&repo, active);
     }
 
     /// Replace a repo's shard contents wholesale (full-rebuild path): clear the
@@ -224,19 +385,128 @@ impl ShardedVectorIndex {
         &mut self,
         repo: &str,
         new_vectors: &[(crate::vector::ChunkId, Vec<f32>)],
+        identity: String,
         active: &[String],
     ) {
+        let repo = Self::repo_key(repo);
         // Drop the old resident shard before building the replacement so a
         // full-rebuild publish does not transiently hold old+new shards in the
         // resident map. This runs under the outer write lock, so queries cannot
         // observe the repo as missing between remove and install.
-        self.shards.remove(repo);
+        self.shards.remove(&repo);
         let mut shard = VectorIndex::new();
         shard.insert(new_vectors);
-        self.install_shard(repo, shard, active);
+        self.install_shard(&repo, shard, identity, active);
     }
 
     // ── Search ────────────────────────────────────────────────────────────────
+
+    // ── Identity-fenced search helpers ───────────────────────────────────────
+
+    /// The ONE identity comparison primitive used by both single- and multi-repo
+    /// search. Keeping this centralized prevents one query scope from accidentally
+    /// bypassing the embedding-space fence.
+    fn shard_match(&self, repo: &str, expected_identity: &str) -> ShardMatch {
+        let repo = Self::repo_key(repo);
+        if self.mutating_repos.contains(&repo) {
+            return ShardMatch::Cold;
+        }
+        match self.shards.get(&repo) {
+            None => ShardMatch::Cold,
+            Some(shard) if shard.identity != expected_identity => {
+                ShardMatch::Mismatch(shard.identity.clone())
+            }
+            Some(_) => ShardMatch::Hit,
+        }
+    }
+
+    /// Identity carried by a resident shard, cloned for identity-fenced eviction.
+    pub fn resident_identity(&self, repo: &str) -> Option<String> {
+        let repo = Self::repo_key(repo);
+        if self.mutating_repos.contains(&repo) {
+            return None;
+        }
+        self.shards.get(&repo).map(|s| s.identity.clone())
+    }
+
+    /// Evict `repo` only if it still carries `stale_identity`.
+    ///
+    /// Between dropping a search read guard and acquiring a write guard, a newer
+    /// shard may have been installed. This fence prevents the stale query/rollback
+    /// from deleting that newer shard.
+    pub fn evict_if_identity(&mut self, repo: &str, stale_identity: &str) -> bool {
+        let repo = Self::repo_key(repo);
+        if self
+            .shards
+            .get(&repo)
+            .is_some_and(|s| s.identity == stale_identity)
+        {
+            self.shards.remove(&repo);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Atomically validate identity and search one repo under the caller's single
+    /// read guard. No cosine search is attempted on an identity mismatch.
+    pub fn search_scoped(
+        &self,
+        query: &[f32],
+        top_k: usize,
+        repo: &str,
+        expected_identity: &str,
+    ) -> ScopedSearch {
+        let repo = Self::repo_key(repo);
+        match self.shard_match(&repo, expected_identity) {
+            ShardMatch::Cold => ScopedSearch::Cold,
+            ShardMatch::Mismatch(identity) => ScopedSearch::IdentityMismatch(identity),
+            ShardMatch::Hit => {
+                let shard = self.shards.get(&repo).expect("matched shard exists");
+                let results = shard.index.search(query, top_k);
+                self.touch(&repo);
+                ScopedSearch::Hit(ShardedSearch {
+                    results,
+                    cold_repos: Vec::new(),
+                })
+            }
+        }
+    }
+
+    /// Identity-aware fan-out search. Only matching shards contribute results;
+    /// mismatched shards are reported for fenced eviction + background repair.
+    pub fn search_all_scoped(
+        &self,
+        query: &[f32],
+        top_k: usize,
+        scope: &[String],
+        expected_identity: &str,
+    ) -> ScopedAll {
+        let mut out = ScopedAll::default();
+        for repo in scope {
+            let key = Self::repo_key(repo);
+            match self.shard_match(&key, expected_identity) {
+                ShardMatch::Cold => out.cold_repos.push(repo.clone()),
+                ShardMatch::Mismatch(identity) => {
+                    out.mismatch_repos.push((repo.clone(), identity));
+                }
+                ShardMatch::Hit => {
+                    let shard = self.shards.get(&key).expect("matched shard exists");
+                    out.results.extend(shard.index.search(query, top_k));
+                    self.touch(&key);
+                }
+            }
+        }
+        out.results.sort_unstable_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        out.results.truncate(top_k);
+        out
+    }
+
+    // ── Legacy unscoped search (non-query internal/tests only) ───────────────
 
     /// Fan-out search over resident shards, merge to a global top-k.
     ///
@@ -260,9 +530,10 @@ impl ShardedVectorIndex {
 
         match repo_filter {
             Some(repo) => {
-                if let Some(shard) = self.shards.get(repo) {
+                let key = Self::repo_key(repo);
+                if let Some(shard) = self.shards.get(&key) {
                     merged.extend(shard.index.search(query, top_k));
-                    self.touch(repo);
+                    self.touch(&key);
                 } else {
                     cold_repos.push(repo.to_string());
                 }
@@ -278,7 +549,7 @@ impl ShardedVectorIndex {
                 }
                 // Any in-scope repo that is not resident is cold → warm in background.
                 for repo in scope {
-                    if !self.shards.contains_key(repo) {
+                    if !self.shards.contains_key(&Self::repo_key(repo)) {
                         cold_repos.push(repo.clone());
                     }
                 }
@@ -303,12 +574,13 @@ impl ShardedVectorIndex {
     /// Remove all vectors belonging to `repo` across shards (repo deletion path).
     /// Boundary-safe: also drops any shard whose key path is inside `repo`.
     pub fn remove_repo(&mut self, repo: &str) {
-        self.shards.remove(repo);
+        let repo = Self::repo_key(repo);
+        self.shards.remove(&repo);
         // Defensive: also clear vectors physically inside the repo from any shard
         // (covers nested-path edge cases consistent with the old merged-index
         // `remove_repo` semantics at vector/mod.rs).
         for shard in self.shards.values_mut() {
-            shard.index.remove_repo(repo);
+            shard.index.remove_repo(&repo);
         }
     }
 }
@@ -380,7 +652,7 @@ mod tests {
         let mut sharded = ShardedVectorIndex::new(bytes_for(1000, 8));
         let scope: Vec<String> = repo_gids.iter().map(|(r, _)| r.to_string()).collect();
         for (repo, gids) in &repo_gids {
-            sharded.install_shard(repo, shard_from_gids(repo, gids), &scope);
+            sharded.install_shard(repo, shard_from_gids(repo, gids), "test".to_owned(), &scope);
         }
 
         // Query points at slot 0 — score strictly increases with gid.
@@ -435,16 +707,19 @@ mod tests {
         idx.install_shard(
             "/r/a",
             shard_from_gids("/r/a", &(0..10).collect::<Vec<_>>()),
+            "test".to_owned(),
             &active,
         );
         idx.install_shard(
             "/r/b",
             shard_from_gids("/r/b", &(10..20).collect::<Vec<_>>()),
+            "test".to_owned(),
             &active,
         );
         idx.install_shard(
             "/r/c",
             shard_from_gids("/r/c", &(20..30).collect::<Vec<_>>()),
+            "test".to_owned(),
             &active,
         );
 
@@ -487,7 +762,12 @@ mod tests {
         let scope = vec!["/r/hot".to_string(), "/r/cold".to_string()];
 
         // Only "/r/hot" is resident.
-        idx.install_shard("/r/hot", shard_from_gids("/r/hot", &[0, 1, 2]), &scope);
+        idx.install_shard(
+            "/r/hot",
+            shard_from_gids("/r/hot", &[0, 1, 2]),
+            "test".to_owned(),
+            &scope,
+        );
 
         let mut query = vec![0.0f32; 8];
         query[0] = 1.0;
@@ -513,7 +793,12 @@ mod tests {
         );
 
         // Simulate the background warm completing.
-        idx.install_shard("/r/cold", shard_from_gids("/r/cold", &[3, 4]), &scope);
+        idx.install_shard(
+            "/r/cold",
+            shard_from_gids("/r/cold", &[3, 4]),
+            "test".to_owned(),
+            &scope,
+        );
         let out2 = idx.search(&query, 10, None, &scope);
         assert!(
             out2.cold_repos.is_empty(),
@@ -532,7 +817,12 @@ mod tests {
     fn filtered_search_to_cold_repo_flags_only_that_repo() {
         let mut idx = ShardedVectorIndex::new(bytes_for(1000, 8));
         let scope = vec!["/r/hot".to_string(), "/r/cold".to_string()];
-        idx.install_shard("/r/hot", shard_from_gids("/r/hot", &[0, 1, 2]), &scope);
+        idx.install_shard(
+            "/r/hot",
+            shard_from_gids("/r/hot", &[0, 1, 2]),
+            "test".to_owned(),
+            &scope,
+        );
 
         let mut query = vec![0.0f32; 8];
         query[0] = 1.0;
@@ -564,11 +854,13 @@ mod tests {
         idx.install_shard(
             "/r/a",
             shard_from_gids("/r/a", &(0..10).collect::<Vec<_>>()),
+            "test".to_owned(),
             &[],
         );
         idx.install_shard(
             "/r/b",
             shard_from_gids("/r/b", &(10..20).collect::<Vec<_>>()),
+            "test".to_owned(),
             &[],
         );
 
@@ -584,6 +876,7 @@ mod tests {
         idx.install_shard(
             "/r/c",
             shard_from_gids("/r/c", &(20..30).collect::<Vec<_>>()),
+            "test".to_owned(),
             &[],
         );
 
@@ -597,5 +890,85 @@ mod tests {
             !idx.is_resident("/r/b"),
             "b became LRU after a's search-touch → must be the eviction victim"
         );
+    }
+
+    #[test]
+    fn full_update_evicts_and_blocks_warm_until_publish() {
+        let repo = "/r/full";
+        let mut idx = ShardedVectorIndex::new(0);
+        idx.install_shard(repo, shard_from_gids(repo, &[1]), "id".to_owned(), &[]);
+
+        idx.begin_full_update(repo);
+        assert!(!idx.is_resident(repo));
+        assert!(idx.is_mutating(repo));
+        assert!(matches!(
+            idx.search_scoped(&vec_for_gid(1), 10, repo, "id"),
+            ScopedSearch::Cold
+        ));
+        assert!(
+            !idx.install_shard_if_not_mutating(
+                repo,
+                shard_from_gids(repo, &[99]),
+                "id".to_owned(),
+                &[],
+            ),
+            "warm install must be rejected while full rebuild owns publication"
+        );
+
+        let replacement = vec![(
+            ChunkId {
+                file: format!("{repo}/new.rs"),
+                line_start: 1,
+                line_end: 2,
+            },
+            vec_for_gid(2),
+        )];
+        idx.publish_full_update(repo, &replacement, "id".to_owned(), &[]);
+        assert!(idx.is_resident(repo));
+        assert!(!idx.is_mutating(repo));
+    }
+
+    #[test]
+    fn incremental_update_hides_old_vectors_and_reuses_unaffected_on_publish() {
+        let repo = "/r/incremental";
+        let changed = format!("{repo}/g1.rs");
+        let unaffected = format!("{repo}/g2.rs");
+        let mut idx = ShardedVectorIndex::new(0);
+        idx.install_shard(repo, shard_from_gids(repo, &[1, 2]), "id".to_owned(), &[]);
+
+        idx.begin_incremental_update(repo);
+        assert!(!idx.is_resident(repo), "old shard must not be searchable");
+        assert!(matches!(
+            idx.search_scoped(&vec_for_gid(2), 10, repo, "id"),
+            ScopedSearch::Cold
+        ));
+
+        let replacement = vec![(
+            ChunkId {
+                file: changed.clone(),
+                line_start: 1,
+                line_end: 2,
+            },
+            vec_for_gid(3),
+        )];
+        idx.publish_incremental_update(
+            repo,
+            std::slice::from_ref(&changed),
+            &replacement,
+            "id".to_owned(),
+            &[],
+        );
+        let files: Vec<String> = idx
+            .search(&vec_for_gid(2), 10, Some(repo), &[repo.to_owned()])
+            .results
+            .into_iter()
+            .map(|r| r.chunk_id.file)
+            .collect();
+        assert!(files.contains(&changed), "replacement vector must publish");
+        assert!(
+            files.contains(&unaffected),
+            "unaffected vector retained off-path must survive incremental publish"
+        );
+        assert!(!idx.is_mutating(repo));
     }
 }

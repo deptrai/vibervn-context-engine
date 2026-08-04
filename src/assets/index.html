@@ -656,7 +656,7 @@
             <span>codebase-retrieval</span>
           </label>
           <label class="flex items-center gap-2 text-sm text-gray-700 dark:text-wiki-text cursor-pointer">
-            <input id="mcp-tool-file-retrieval" type="checkbox" checked
+            <input id="mcp-tool-file-retrieval" type="checkbox"
                    class="h-4 w-4 rounded border-gray-300 dark:border-wiki-border text-blue-600
                           focus:outline-none focus:ring-2 focus:ring-blue-400" />
             <span>file-retrieval</span>
@@ -898,6 +898,21 @@
 
         <!-- Results tab -->
         <div role="tabpanel" id="rpanel-results">
+          <!-- Graph-pending badge. Its row is permanently reserved (`min-h-8`)
+               and only opacity transitions, so appearing/disappearing never
+               shifts the results below.
+               a11y: opacity alone leaves the node in the accessibility tree, so
+               `aria-hidden` is toggled in lockstep with it (see setGraphPending).
+               The text is injected/cleared there too — a polite live region only
+               announces on content CHANGE, so a static string would announce at
+               the wrong time (or never). No `data-i18n` on the inner span on
+               purpose: applyI18n would refill it while the badge is off and fire
+               a spurious announcement. -->
+          <div id="search-graph-pending-badge" aria-live="polite" aria-hidden="true"
+               class="min-h-8 opacity-0 transition-opacity duration-200 ease-out
+                      text-xs text-amber-700 dark:text-amber-300">
+            <span id="search-graph-pending-text" class="inline-block py-1.5"></span>
+          </div>
           <div id="search-rerank-badge" class="hidden mb-3 text-xs text-gray-400 dark:text-wiki-text-muted"></div>
           <div id="search-results" class="space-y-4"></div>
           <div id="search-empty" data-i18n="search.noResults" class="hidden text-gray-400 dark:text-wiki-text-muted text-sm">No results found.</div>
@@ -1183,6 +1198,15 @@ function applyI18n() {
   // data-i18n default. Guarded on cfg.
   if (typeof cfg !== 'undefined' && cfg && typeof syncEmbeddingProviderUi === 'function') {
     syncEmbeddingProviderUi(cfg.embedding.provider || 'voyage');
+  }
+  // The graph-pending badge is intentionally not data-i18n (that would refill it
+  // while it's off and fire a spurious live-region announcement), so re-translate
+  // it here only when it's actually showing. `aria-hidden` is the source of truth
+  // for on/off.
+  const gp = document.getElementById('search-graph-pending-badge');
+  const gpText = document.getElementById('search-graph-pending-text');
+  if (gp && gpText && gp.getAttribute('aria-hidden') === 'false') {
+    gpText.textContent = t('search.graphPending');
   }
 }
 
@@ -1526,6 +1550,7 @@ const STR = {
   'search.tabLlmReq':  { en: `LLM Request`, vi: `LLM Request`, zh: `LLM 请求` },
   'search.tabLlmResp': { en: `LLM Response`, vi: `LLM Response`, zh: `LLM 响应` },
   'search.noResults':  { en: `No results found.`, vi: `Không tìm thấy kết quả.`, zh: `未找到结果。` },
+  'search.graphPending': { en: `Call graph still resolving — callers/callees not available yet.`, vi: `Call graph đang resolve — callers/callees chưa sẵn sàng.`, zh: `Call graph 仍在解析中 — callers/callees 尚不可用。` },
   'search.noLlmReq':   { en: `No LLM request available.`, vi: `Không có LLM request.`, zh: `没有可用的 LLM 请求。` },
   'search.noLlmResp':  { en: `No LLM response available.`, vi: `Không có LLM response.`, zh: `没有可用的 LLM 响应。` },
   'search.rerankSkip': { en: `Rerank: skipped — {reason}`, vi: `Rerank: bỏ qua — {reason}`, zh: `重排序：已跳过 — {reason}` },
@@ -2216,7 +2241,7 @@ function renderAll() {
   });
   document.getElementById('banner-setup').classList.toggle('hidden', !needsSetup());
   // MCP tools checkboxes
-  const enabledTools = cfg.enabled_mcp_tools || ['codebase-retrieval', 'file-retrieval'];
+  const enabledTools = cfg.enabled_mcp_tools || ['codebase-retrieval'];
   document.getElementById('mcp-tool-codebase-retrieval').checked = enabledTools.includes('codebase-retrieval');
   document.getElementById('mcp-tool-file-retrieval').checked = enabledTools.includes('file-retrieval');
   // Custom extensions
@@ -3574,7 +3599,7 @@ function buildOpencodeConfigSnippet(endpointUrl) {
 }
 
 function buildClaudeMdSnippet() {
-  const enabled = (cfg && cfg.enabled_mcp_tools) || ['codebase-retrieval', 'file-retrieval'];
+  const enabled = (cfg && cfg.enabled_mcp_tools) || ['codebase-retrieval'];
   const lines = [
     '# CLAUDE.md',
     '',
@@ -4047,6 +4072,27 @@ document.getElementById('modal-repo-mcp').addEventListener('click', (e) => {
   if (e.target === e.currentTarget) closeRepoMcpModal();
 });
 
+// Toggle the graph-pending badge. Three things move in lockstep and all three
+// matter:
+//   - opacity: the visual fade (row height is reserved by `min-h-8`, so no reflow)
+//   - aria-hidden: opacity-0 does NOT remove a node from the accessibility tree,
+//     so without this a screen reader announces the badge even when the graph is
+//     ready
+//   - textContent: `aria-live="polite"` fires on content CHANGE, so the string is
+//     injected on enable and cleared on disable. That makes the announcement land
+//     exactly when the state flips, and stay silent otherwise.
+function setGraphPending(on) {
+  const el = document.getElementById('search-graph-pending-badge');
+  const textEl = document.getElementById('search-graph-pending-text');
+  if (!el || !textEl) return;
+  el.classList.toggle('opacity-100', on);
+  el.classList.toggle('opacity-0', !on);
+  el.setAttribute('aria-hidden', String(!on));
+  // Clearing before the fade-out would be announced as a change; an empty string
+  // is not announced, so ordering here is safe either way.
+  textEl.textContent = on ? t('search.graphPending') : '';
+}
+
 async function runSearch() {
   const input = document.getElementById('input-search');
   const btn = document.getElementById('btn-search');
@@ -4067,6 +4113,9 @@ async function runSearch() {
   emptyEl.classList.add('hidden');
   timingEl.classList.add('hidden');
   resultTabsEl.classList.add('hidden');
+  // Reset to off so a stale badge from the previous search never carries over.
+  // The row stays reserved, so result cards don't jump.
+  setGraphPending(false);
 
   try {
     const payload = { query: q, top_k: 30 };
@@ -4103,6 +4152,10 @@ async function runSearch() {
       errorEl.classList.remove('hidden');
       return;
     }
+
+    // Show the graph state selected by the shared readiness gate. The badge row
+    // is always reserved, so flipping this between searches never moves results.
+    setGraphPending(data.graph_pending === true);
 
     // Show result tabs
     resultTabsEl.classList.remove('hidden');

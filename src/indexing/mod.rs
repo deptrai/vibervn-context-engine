@@ -2,9 +2,13 @@ pub mod events;
 pub mod frameworks;
 pub mod import_resolver;
 pub mod pipeline;
+pub mod rebuild_guard;
 pub mod tracker;
 pub mod walker;
 pub mod watcher;
+
+#[cfg(test)]
+mod load_repos_tests;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -19,14 +23,16 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use crate::config::Settings;
+use crate::embedding::identity::{EMBEDDING_IDENTITY_KEY, EmbeddingIdentity};
 use crate::embedding::voyage::VoyageClient;
 use crate::indexing::events::{IndexEvent, IndexEventBus};
 use crate::indexing::pipeline::IndexPipeline;
+use crate::indexing::rebuild_guard::IdentityRebuildGuard;
 use crate::indexing::tracker::FileChange;
 use crate::indexing::watcher::start_watcher;
 use crate::store::ops::set_meta;
 use crate::store::{self, RepoDbMap};
-use crate::vector::{SearchResult, ShardedSearch, ShardedVectorIndex, VectorIndex};
+use crate::vector::{ScopedAll, ScopedSearch, SearchResult, ShardedVectorIndex, VectorIndex};
 
 use surrealdb::Surreal;
 use surrealdb::engine::local::Db;
@@ -288,6 +294,8 @@ pub struct IndexEngine {
     /// an `.await`. Wrapped in `Arc` so the detached scheduler task can hold a
     /// reference without borrowing the engine.
     recompute_slots: Arc<std::sync::Mutex<HashMap<String, RecomputeSlot>>>,
+    /// Coalesces automatic identity-mismatch rebuild triggers per repo.
+    identity_rebuild: IdentityRebuildGuard,
 }
 
 #[derive(Debug)]
@@ -296,6 +304,14 @@ pub struct IndexTrigger {
     pub changes: Option<Vec<FileChange>>, // None = full incremental scan
     /// Force a full rebuild (clear + re-embed everything) regardless of staleness.
     pub rebuild: bool,
+}
+
+/// Outcome of warming one repo's resident vector shard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WarmResult {
+    Installed(usize),
+    IdentityMismatch,
+    MutationInProgress,
 }
 
 /// Warm one repo's vector shard: load its embeddings from DB into a temp
@@ -313,45 +329,52 @@ pub(crate) async fn warm_repo_shard(
     data_dir: &std::path::Path,
     repo: &str,
     generation: u32,
+    current: &EmbeddingIdentity,
     active: &[String],
-) -> usize {
-    let db = match store::get_or_open(repo_dbs, data_dir, repo, generation).await {
-        Ok(db) => db,
-        Err(e) => {
-            warn!(repo = %repo, error = %e, "warm: failed to open DB; skipping repo");
-            return 0;
+) -> anyhow::Result<WarmResult> {
+    let db = store::get_or_open(repo_dbs, data_dir, repo, generation).await?;
+
+    // DB reads happen with NO vector-index lock held. Fail closed: inability to
+    // establish either content or identity never falls through to installing or
+    // searching an unverified shard.
+    let chunk_count = crate::store::ops::count_chunks(&db).await?;
+    if chunk_count == 0 {
+        return Ok(WarmResult::Installed(0));
+    }
+
+    let current_key = current.as_key_string();
+    let stored_key = crate::store::ops::get_meta(&db, EMBEDDING_IDENTITY_KEY).await?;
+    if stored_key.as_deref() != Some(current_key.as_str()) {
+        // Durable marker is a cross-restart safety net. Correctness does not depend
+        // on this write succeeding: warm_repo_blocking also queues rebuild:true.
+        if let Err(e) = set_meta(&db, "needs_rebuild", "1").await {
+            warn!(repo = %repo, error = %e, "warm: failed to persist needs_rebuild after embedding identity mismatch");
         }
-    };
-    // DB scan happens here with NO vector_index lock held.
-    // First, the staleness stamp = current chunk-row count. Cheap; also tells us
-    // whether a persisted shard file is current.
-    let stamp = crate::store::ops::count_chunks(&db).await.unwrap_or(0);
+        warn!(repo = %repo, stored_identity = ?stored_key, current_identity = %current_key,
+              "warm: embedding identity mismatch; blocking stale shard and forcing rebuild");
+        return Ok(WarmResult::IdentityMismatch);
+    }
+
+    let stamp = current.content_stamp(chunk_count);
 
     // Fast path: a valid, current persisted shard file → mmap it (near-instant,
-    // no SELECT + decode). Its f32 payload is OS-page-cache-resident, off our heap.
-    // dim is unknown until we have a shard; probe the model dim from any one chunk
-    // via the file header's own dim (open_current validates it against expected).
-    // We pass the model dim by reading it from the file header indirectly: try the
-    // common dims is brittle, so we instead trust the header's dim and only reject
-    // on a mismatch with a known dim. Here we accept the file's own dim by passing
-    // it through a two-step: peek is folded into open_current (expected_dim=0 means
-    // "accept the header dim"). See shard_file::open_current.
+    // no SELECT + decode). The identity is already validated against DB above;
+    // content_stamp independently invalidates same-count shards from other models.
     match crate::vector::shard_file::open_current(data_dir, repo, 0, stamp) {
         Ok(Some((shard, generation_loaded))) => {
             let count = shard.len();
             if count > 0 {
                 let mut vi = vector_index.write().await;
-                vi.install_shard(repo, shard, active);
-                // Reap stale generations now that the new one is installed; keep
-                // only the generation we just mapped (under the same write lock
-                // that governs CURRENT, so no reader/reaper race).
+                if !vi.install_shard_if_not_mutating(repo, shard, current_key.clone(), active) {
+                    return Ok(WarmResult::MutationInProgress);
+                }
                 crate::vector::shard_file::reap_stale_generations(
                     data_dir,
                     repo,
                     &[generation_loaded],
                 );
                 info!(repo = %repo, count, generation = generation_loaded, "warm: mmap'd persisted shard (no DB scan)");
-                return count;
+                return Ok(WarmResult::Installed(count));
             }
         }
         Ok(None) => {} // no usable file — build from DB below
@@ -360,22 +383,19 @@ pub(crate) async fn warm_repo_shard(
         }
     }
 
-    // Slow path: build from the chunk table (the existing SELECT + decode), then
-    // persist a new generation so subsequent warms mmap it.
-    let shard = match VectorIndex::load_from_db(&db).await {
-        Ok(vi) => vi,
-        Err(e) => {
-            warn!(repo = %repo, error = %e, "warm: failed to load shard from DB; skipping repo");
-            return 0;
-        }
-    };
+    // Slow path: build from the chunk table, then persist a new generation so
+    // subsequent warms mmap it. DB decode errors propagate (fail closed).
+    let shard = VectorIndex::load_from_db(&db).await?;
     let count = shard.len();
     if count == 0 {
-        return 0;
+        return Ok(WarmResult::Installed(0));
     }
-    // Persist the built shard to a fresh generation + flip CURRENT (win32-safe:
-    // no existing mapped file is touched). Best-effort — a write failure just
-    // means the next warm rebuilds from DB again.
+    {
+        let vi = vector_index.read().await;
+        if vi.is_mutating(repo) {
+            return Ok(WarmResult::MutationInProgress);
+        }
+    }
     let persisted = match crate::vector::shard_file::write_new_generation(
         data_dir, repo, &shard, stamp,
     ) {
@@ -385,23 +405,26 @@ pub(crate) async fn warm_repo_shard(
             None
         }
     };
-    // Re-open the just-written file as an mmap so the resident shard is page-cache
-    // backed (not the heap copy we just built). Falls back to the heap shard if the
-    // re-open fails for any reason.
+
     let mut vi = vector_index.write().await;
     if let Some(g) = persisted
         && let Ok(Some((mmap_shard, _))) =
             crate::vector::shard_file::open_current(data_dir, repo, shard.dim(), stamp)
     {
-        vi.install_shard(repo, mmap_shard, active);
+        if !vi.install_shard_if_not_mutating(repo, mmap_shard, current_key, active) {
+            drop(vi);
+            crate::vector::shard_file::invalidate_current_if_generation(data_dir, repo, Some(g));
+            return Ok(WarmResult::MutationInProgress);
+        }
         crate::vector::shard_file::reap_stale_generations(data_dir, repo, &[g]);
         info!(repo = %repo, count, generation = g, "warm: built from DB, persisted + mmap'd shard");
     } else {
-        // Heap fallback: install the in-RAM shard we built.
-        vi.install_shard(repo, shard, active);
+        if !vi.install_shard_if_not_mutating(repo, shard, current_key, active) {
+            return Ok(WarmResult::MutationInProgress);
+        }
         info!(repo = %repo, count, "warm: installed in-RAM shard (persist/mmap unavailable)");
     }
-    count
+    Ok(WarmResult::Installed(count))
 }
 
 /// Restore persisted per-repo status (file count + last-indexed timestamp) from
@@ -563,6 +586,7 @@ impl IndexEngine {
             cancel_tokens: Mutex::new(HashMap::new()),
             settings_handle: settings_handle.clone(),
             recompute_slots: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            identity_rebuild: IdentityRebuildGuard::default(),
         });
 
         // Initialise status entries.
@@ -736,6 +760,14 @@ impl IndexEngine {
         self.statuses.read().await.get(&repo).cloned()
     }
 
+    /// True only during the destructive DB/vector publication window for `repo`.
+    /// Unlike `RepoStatus::Indexing`, this does not include queued/early work that
+    /// can safely continue serving the previous complete index.
+    pub async fn repo_is_mutating(&self, repo: &str) -> bool {
+        let repo = crate::store::normalize_repo_path(repo);
+        self.vector_index.read().await.is_mutating(&repo)
+    }
+
     /// Clear all in-memory index state for a repo after its on-disk index has
     /// been removed: reset the status counters to default (Idle, 0 files) and
     /// evict the resident vector shard. The status entry is reset in place — not
@@ -862,54 +894,106 @@ impl IndexEngine {
         top_k: usize,
         repo_filter: Option<&str>,
         warm_wait: std::time::Duration,
+        current: &EmbeddingIdentity,
     ) -> VectorSearchOutcome {
-        // Single-repo scope: block-warm a cold repo before searching so the first
-        // query of the session returns complete results instead of empty.
-        let mut warming = false;
+        let identity_key = current.as_key_string();
+
         if let Some(repo) = repo_filter {
-            let resident = self.vector_index.read().await.is_resident(repo);
-            if !resident {
-                // Bound the wait so a huge/slow repo never hangs the request. On
-                // timeout the warm future is dropped (releasing its warm lock via
-                // guard drop) and we proceed with whatever is resident — a later
-                // query re-attempts the warm.
-                let _ = tokio::time::timeout(warm_wait, self.warm_repo_blocking(repo.to_string()))
-                    .await;
-                // Re-check residency AFTER the bounded warm. If the shard is STILL
-                // not resident, the warm-wait expired before load_from_db finished
-                // (e.g. a multi-GB shard, or it was evicted under memory pressure).
-                // The search below will return empty — but that empty means "still
-                // warming", NOT "the index contains nothing". Surface that distinction
-                // so callers retry instead of concluding the codebase is empty.
-                warming = !self.vector_index.read().await.is_resident(repo);
+            // Atomic validation + cosine search under ONE read guard. A mismatch
+            // returns the observed stale identity without searching any vector.
+            let first = {
+                self.vector_index.read().await.search_scoped(
+                    query_embedding,
+                    top_k,
+                    repo,
+                    &identity_key,
+                )
+            };
+            match first {
+                ScopedSearch::Hit(found) => {
+                    return VectorSearchOutcome {
+                        results: found.results,
+                        warming: false,
+                    };
+                }
+                ScopedSearch::IdentityMismatch(stale_identity) => {
+                    // Drop read guard before the write lock; identity fence prevents
+                    // deleting a newer shard installed in this handoff window.
+                    self.vector_index
+                        .write()
+                        .await
+                        .evict_if_identity(repo, &stale_identity);
+                }
+                ScopedSearch::Cold => {}
             }
+
+            // The ONLY warm path. Pass the query client's exact identity snapshot;
+            // warm never re-derives it from mutable settings.
+            let _ = tokio::time::timeout(
+                warm_wait,
+                self.warm_repo_blocking(repo.to_string(), current.clone()),
+            )
+            .await;
+
+            // Cold re-check is identity-fenced too — never fall back to plain search.
+            return match self.vector_index.read().await.search_scoped(
+                query_embedding,
+                top_k,
+                repo,
+                &identity_key,
+            ) {
+                ScopedSearch::Hit(found) => VectorSearchOutcome {
+                    results: found.results,
+                    warming: false,
+                },
+                ScopedSearch::IdentityMismatch(_) | ScopedSearch::Cold => VectorSearchOutcome {
+                    results: Vec::new(),
+                    warming: true,
+                },
+            };
         }
 
-        let scope: Vec<String> = match repo_filter {
-            Some(repo) => vec![repo.to_string()],
-            None => {
-                let statuses = self.statuses.read().await;
-                statuses.keys().cloned().collect()
-            }
+        // Multi-repo safety path (query handlers currently require a repo, but this
+        // retained branch must still be correct): only identity-matching shards can
+        // contribute results. `search_all_scoped` and `search_scoped` share the ONE
+        // `shard_match` primitive in vector/sharded.rs.
+        let scope: Vec<String> = {
+            let statuses = self.statuses.read().await;
+            statuses.keys().cloned().collect()
         };
-
-        let ShardedSearch {
+        let ScopedAll {
             results,
             cold_repos,
+            mismatch_repos,
         } = {
-            // READ lock — concurrent searches run in parallel. `search` bumps
-            // per-shard atomic recency stamps under this shared guard.
-            let index = self.vector_index.read().await;
-            index.search(query_embedding, top_k, repo_filter, &scope)
-        }; // read lock dropped HERE — before spawning any warm task
+            self.vector_index.read().await.search_all_scoped(
+                query_embedding,
+                top_k,
+                &scope,
+                &identity_key,
+            )
+        };
+        let warming = !cold_repos.is_empty() || !mismatch_repos.is_empty();
 
-        // Only reached for the `None` (search-all) path now, since a `Some` cold
-        // repo was already block-warmed above. Background-warm any cold in-scope
-        // repo so subsequent queries hit it; non-blocking (results already returned).
-        for repo in cold_repos {
+        // Evict mismatches with the identity observed atomically during validation.
+        for (repo, stale_identity) in &mismatch_repos {
+            self.vector_index
+                .write()
+                .await
+                .evict_if_identity(repo, stale_identity);
+        }
+
+        // Background-warm every cold/mismatched repo with the same query identity.
+        // Warm is the sole authority that persists needs_rebuild and queues one
+        // `rebuild: true` trigger when the DB marker itself mismatches.
+        for repo in cold_repos
+            .into_iter()
+            .chain(mismatch_repos.into_iter().map(|(repo, _)| repo))
+        {
             let engine = Arc::clone(self);
+            let identity = current.clone();
             tokio::spawn(async move {
-                engine.warm_repo_blocking(repo).await;
+                engine.warm_repo_blocking(repo, identity).await;
             });
         }
 
@@ -940,34 +1024,63 @@ impl IndexEngine {
     /// `warm_repo_shard` error path, panic unwind, AND tokio task cancellation — the
     /// future being dropped mid-`.await`, e.g. when the `vector_search` timeout
     /// fires), so a dropped/aborted warm never strands the repo's warm lock.
-    async fn warm_repo_blocking(self: &Arc<Self>, repo: String) {
+    async fn warm_repo_blocking(self: &Arc<Self>, repo: String, current: EmbeddingIdentity) {
         let lock = self.get_warm_lock(&repo).await;
         let _guard = lock.lock().await;
 
-        // Coalesce: a prior holder may have already warmed this repo while we waited.
-        if self.vector_index.read().await.is_resident(&repo) {
+        // Coalesce only when the resident shard already matches THIS query identity.
+        // A resident shard from another embedding space must still be repaired.
+        let current_key = current.as_key_string();
+        if self
+            .vector_index
+            .read()
+            .await
+            .resident_identity(&repo)
+            .as_deref()
+            == Some(current_key.as_str())
+        {
             return;
         }
 
-        // Warm with an empty active set: the cap may freely evict LRU shards to make
-        // room. In-flight searches are NOT at risk — they hold a read guard and
-        // return owned results (cloned ChunkIds); install/evict take the write guard
-        // afterwards. The warmed repo is protected internally by install_shard.
-        //
-        // Resolve the repo's current generation from live settings (read guard
-        // dropped before the await on warm work). Safe to read mid-run: generation
-        // only advances after a delete dropped the cached handle + evicted the shard,
-        // so a warm here always targets the live directory.
+        // Resolve the repo generation from live settings, then drop the guard before
+        // DB warm work. Embedding identity is NOT read from settings: it came from
+        // the real query client and is passed by value above.
         let generation = self.settings_handle.read().await.repo_generation(&repo);
-        warm_repo_shard(
+        match warm_repo_shard(
             &self.vector_index,
             &self.repo_dbs,
             &self.data_dir,
             &repo,
             generation,
+            &current,
             &[],
         )
-        .await;
+        .await
+        {
+            Ok(WarmResult::IdentityMismatch) => self.request_identity_rebuild(&repo).await,
+            Ok(WarmResult::Installed(_) | WarmResult::MutationInProgress) => {}
+            Err(e) => {
+                warn!(repo = %repo, error = %format!("{e:#}"), "warm: failed closed; shard remains unavailable")
+            }
+        }
+    }
+
+    /// Queue at most one automatic full rebuild per repo until the consumer
+    /// completes or fails. `rebuild: true` makes correctness independent of the
+    /// best-effort durable needs_rebuild write in the warm mismatch path.
+    async fn request_identity_rebuild(&self, repo: &str) {
+        if !self.identity_rebuild.reserve(repo) {
+            return;
+        }
+        let trigger = IndexTrigger {
+            repo: repo.to_string(),
+            changes: None,
+            rebuild: true,
+        };
+        if let Err(e) = self.trigger_tx.send(trigger).await {
+            self.identity_rebuild.release(repo);
+            warn!(repo = %repo, error = %e, "failed to queue embedding-identity rebuild");
+        }
     }
 
     /// Record an index completion for `repo` and (re)arm the debounced
@@ -1153,6 +1266,7 @@ async fn run_consumer(
                 repo: repo.clone(),
                 error: msg,
             });
+            engine_ref.identity_rebuild.release(&repo);
             engine_ref.clear_cancel_token(&repo).await;
             continue;
         } else {
@@ -1481,314 +1595,7 @@ async fn run_consumer(
                 }
             }
         }
+        engine_ref.identity_rebuild.release(&repo);
         engine_ref.clear_cancel_token(&repo).await;
-    }
-}
-
-#[cfg(test)]
-mod load_repos_tests {
-    use super::*;
-    use tempfile::TempDir;
-
-    /// Seed `n` chunk rows (each with a non-empty 4-d embedding) into `repo`'s DB,
-    /// writing THROUGH the shared `repo_dbs` map (one cached handle per repo, like
-    /// production). RocksDB holds an exclusive per-directory lock, so a second
-    /// uncached `open_db` on the same path would deadlock on the lock file —
-    /// seeding through `get_or_open` keeps a single handle, mirroring real usage.
-    async fn seed_repo(repo_dbs: &RepoDbMap, home: &std::path::Path, repo: &str, n: usize) {
-        let db = store::get_or_open(repo_dbs, home, repo, 0)
-            .await
-            .expect("get_or_open");
-        for i in 0..n {
-            let q = format!(
-                "CREATE chunk SET file = '{repo}/f{i}.rs', line_start = 1, line_end = 2, \
-                 content = 'x', embedding = [0.1, 0.2, 0.3, 0.4], symbol_ref = NONE;"
-            );
-            db.query(&q).await.expect("seed chunk");
-        }
-    }
-
-    /// Warming EACH configured repo into its own resident shard (when the cap
-    /// allows) installs an independent shard per repo, not just the first. Two
-    /// repos seeded with 1 and 2 chunks → both shards resident, total 3 vectors
-    /// searchable across shards. This is the per-repo lazy-warm path now used on
-    /// first query (boot no longer eagerly warms).
-    #[tokio::test]
-    async fn loads_all_repos_not_just_first() {
-        let home = TempDir::new().expect("tempdir");
-        let repo_one = "/proj/repo_one".to_string();
-        let repo_two = "/proj/repo_two".to_string();
-
-        // Shared map used for BOTH seeding and warming — exactly one handle per repo.
-        let repo_dbs: RepoDbMap = Arc::new(RwLock::new(HashMap::new()));
-        seed_repo(&repo_dbs, home.path(), &repo_one, 1).await;
-        seed_repo(&repo_dbs, home.path(), &repo_two, 2).await;
-
-        // Large cap so both repos stay resident after warming.
-        let vector_index = Arc::new(RwLock::new(ShardedVectorIndex::new(1024 * 1024 * 1024)));
-        warm_repo_shard(&vector_index, &repo_dbs, home.path(), &repo_one, 0, &[]).await;
-        warm_repo_shard(&vector_index, &repo_dbs, home.path(), &repo_two, 0, &[]).await;
-
-        let vi = vector_index.read().await;
-        assert!(vi.is_resident(&repo_one), "repo_one shard must be resident");
-        assert!(vi.is_resident(&repo_two), "repo_two shard must be resident");
-        assert_eq!(
-            vi.resident_repo_count(),
-            2,
-            "expected both repos warmed into shards, not just the first"
-        );
-    }
-
-    /// Seed `n` file_meta rows for `repo`, writing through the shared `repo_dbs`
-    /// map (single cached handle per repo — see [`seed_repo`] for why RocksDB
-    /// requires this).
-    async fn seed_file_meta(repo_dbs: &RepoDbMap, home: &std::path::Path, repo: &str, n: usize) {
-        let db = store::get_or_open(repo_dbs, home, repo, 0)
-            .await
-            .expect("get_or_open");
-        for i in 0..n {
-            let path = format!("{repo}/f{i}.rs");
-            db.query("CREATE file_meta SET path = $path, mtime = 0, size = 1, repo = $repo, chunk_count = 1;")
-                .bind(("path", path))
-                .bind(("repo", repo.to_string()))
-                .await
-                .expect("seed file_meta");
-        }
-    }
-
-    /// After a restart, a repo indexed in a prior session must show its persisted
-    /// file count — not the zeroed default. A never-indexed repo must stay at 0
-    /// so the UI can render a "Not indexed" placeholder.
-    #[tokio::test]
-    async fn seeds_status_from_persisted_file_meta() {
-        let home = TempDir::new().expect("tempdir");
-        let indexed_raw = "/proj/indexed".to_string();
-        let empty_raw = "/proj/empty".to_string();
-        let indexed = store::normalize_repo_path(&indexed_raw);
-        let empty = store::normalize_repo_path(&empty_raw);
-
-        // Shared map for seeding AND the seed-status call — one handle per repo.
-        let repo_dbs: RepoDbMap = Arc::new(RwLock::new(HashMap::new()));
-        seed_file_meta(&repo_dbs, home.path(), &indexed, 5).await;
-        // `empty` gets a DB (cached) but no file_meta rows.
-        let _ = store::get_or_open(&repo_dbs, home.path(), &empty, 0)
-            .await
-            .expect("get_or_open");
-
-        let statuses: Arc<RwLock<HashMap<String, RepoStatus>>> =
-            Arc::new(RwLock::new(HashMap::new()));
-        {
-            let mut m = statuses.write().await;
-            m.insert(indexed.clone(), RepoStatus::default());
-            m.insert(empty.clone(), RepoStatus::default());
-        }
-
-        seed_statuses_from_db(
-            &statuses,
-            &repo_dbs,
-            home.path(),
-            &[indexed_raw, empty_raw],
-            &HashMap::new(),
-            &Arc::new(RwLock::new(crate::config::Settings::default())),
-        )
-        .await;
-
-        let m = statuses.read().await;
-        assert_eq!(
-            m[&indexed].indexed_files, 5,
-            "indexed repo must restore its file count"
-        );
-        assert_eq!(
-            m[&empty].indexed_files, 0,
-            "never-indexed repo must stay at 0"
-        );
-    }
-
-    /// A run that has already advanced a repo's status by the time the seed task
-    /// runs must not be clobbered back to the persisted (possibly stale) count.
-    #[tokio::test]
-    async fn seed_does_not_clobber_live_run() {
-        let home = TempDir::new().expect("tempdir");
-        let repo_raw = "/proj/live".to_string();
-        let repo = store::normalize_repo_path(&repo_raw);
-        let repo_dbs: RepoDbMap = Arc::new(RwLock::new(HashMap::new()));
-        seed_file_meta(&repo_dbs, home.path(), &repo, 5).await;
-
-        let statuses: Arc<RwLock<HashMap<String, RepoStatus>>> =
-            Arc::new(RwLock::new(HashMap::new()));
-        {
-            let mut m = statuses.write().await;
-            m.insert(
-                repo.clone(),
-                RepoStatus {
-                    state: IndexState::Indexing,
-                    ..Default::default()
-                },
-            );
-        }
-
-        seed_statuses_from_db(
-            &statuses,
-            &repo_dbs,
-            home.path(),
-            &[repo_raw],
-            &HashMap::new(),
-            &Arc::new(RwLock::new(crate::config::Settings::default())),
-        )
-        .await;
-
-        let m = statuses.read().await;
-        assert_eq!(
-            m[&repo].state,
-            IndexState::Indexing,
-            "in-flight run must survive the seed"
-        );
-        assert_eq!(
-            m[&repo].indexed_files, 0,
-            "seed must not overwrite a live run's numerator"
-        );
-    }
-
-    /// Single-flight coalescing: concurrent `warm_repo_blocking` calls for the same
-    /// cold repo must result in exactly ONE `load_from_db` scan + install — the
-    /// later callers block on the per-repo warm lock, then observe the repo already
-    /// resident and return without re-scanning. We assert the end state (resident,
-    /// correct vector count) and that the shard was installed once (no duplicate /
-    /// doubled vectors), which is the observable guarantee of coalescing.
-    #[tokio::test]
-    async fn warm_blocking_is_single_flight() {
-        let home = TempDir::new().expect("tempdir");
-        let repo = "/proj/warm".to_string();
-
-        let repo_dbs: RepoDbMap = Arc::new(RwLock::new(HashMap::new()));
-        seed_repo(&repo_dbs, home.path(), &repo, 3).await;
-
-        // Minimal engine sharing the SAME repo_dbs map used for seeding (one handle).
-        let settings = crate::config::Settings {
-            repos: vec![repo.clone()],
-            ..Default::default()
-        };
-        let settings_handle = Arc::new(RwLock::new(settings.clone()));
-        let engine = IndexEngine::start(
-            home.path().to_path_buf(),
-            home.path().join("embeddings"),
-            &settings,
-            repo_dbs.clone(),
-            settings_handle,
-            false,
-        )
-        .await;
-
-        // Fire several concurrent warms for the same cold repo.
-        let mut handles = Vec::new();
-        for _ in 0..5 {
-            let e = engine.clone();
-            let r = repo.clone();
-            handles.push(tokio::spawn(async move {
-                e.warm_repo_blocking(r).await;
-            }));
-        }
-        for h in handles {
-            h.await.expect("warm task");
-        }
-
-        let vi = engine.vector_index.read().await;
-        assert!(vi.is_resident(&repo), "repo must be resident after warm");
-        // Exactly the seeded 3 vectors — coalescing means no doubled inserts.
-        let mut q = vec![0.0f32; 4];
-        q[0] = 1.0;
-        let out = vi.search(&q, 100, Some(&repo), std::slice::from_ref(&repo));
-        assert_eq!(
-            out.results.len(),
-            3,
-            "single-flight warm must install the shard once (3 seeded vectors, not doubled)"
-        );
-    }
-
-    /// A shard that is NOT resident after the warm attempt yields warming=true with
-    /// empty results — the "retry, not empty" signal. Forced deterministically with a
-    /// 0-chunk repo: warm_repo_shard loads nothing (count==0) and never installs a
-    /// shard, so it stays non-resident regardless of timing — exactly the condition
-    /// `warming = !is_resident(repo)` detects after the bounded warm.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn vector_search_signals_warming_when_shard_not_resident() {
-        let home = TempDir::new().expect("tempdir");
-        let repo = "/proj/cold".to_string();
-        let repo_dbs: RepoDbMap = Arc::new(RwLock::new(HashMap::new()));
-        // 0 chunks → warm installs no shard → non-resident after the warm attempt.
-        seed_repo(&repo_dbs, home.path(), &repo, 0).await;
-        let settings = crate::config::Settings {
-            repos: vec![repo.clone()],
-            ..Default::default()
-        };
-        let settings_handle = Arc::new(RwLock::new(settings.clone()));
-        let engine = IndexEngine::start(
-            home.path().to_path_buf(),
-            home.path().join("embeddings"),
-            &settings,
-            repo_dbs.clone(),
-            settings_handle,
-            false,
-        )
-        .await;
-
-        let q = vec![1.0f32, 0.0, 0.0, 0.0];
-        let outcome = engine
-            .vector_search(&q, 10, Some(&repo), std::time::Duration::from_secs(5))
-            .await;
-        assert!(
-            outcome.results.is_empty(),
-            "non-resident shard search returns empty"
-        );
-        assert!(
-            outcome.warming,
-            "non-resident shard after warm attempt must signal warming=true"
-        );
-    }
-
-    /// A resident shard that genuinely matches nothing yields warming=false — a real
-    /// empty, NOT a warming state. (Here the shard is warmed first via a generous wait.)
-    #[tokio::test(flavor = "multi_thread")]
-    async fn vector_search_resident_empty_is_not_warming() {
-        let home = TempDir::new().expect("tempdir");
-        let repo = "/proj/resident".to_string();
-        let repo_dbs: RepoDbMap = Arc::new(RwLock::new(HashMap::new()));
-        seed_repo(&repo_dbs, home.path(), &repo, 3).await;
-        let settings = crate::config::Settings {
-            repos: vec![repo.clone()],
-            ..Default::default()
-        };
-        let settings_handle = Arc::new(RwLock::new(settings.clone()));
-        let engine = IndexEngine::start(
-            home.path().to_path_buf(),
-            home.path().join("embeddings"),
-            &settings,
-            repo_dbs.clone(),
-            settings_handle,
-            false,
-        )
-        .await;
-
-        // Warm the shard explicitly so it is resident before the search.
-        engine.warm_repo_blocking(repo.clone()).await;
-        assert!(
-            engine.vector_index.read().await.is_resident(&repo),
-            "precondition: resident"
-        );
-
-        // Query with a generous wait; the shard is resident so warming must be false.
-        // top_k=0 forces an empty result set on a resident shard (genuine empty).
-        let q = vec![1.0f32, 0.0, 0.0, 0.0];
-        let outcome = engine
-            .vector_search(&q, 0, Some(&repo), std::time::Duration::from_secs(10))
-            .await;
-        assert!(
-            outcome.results.is_empty(),
-            "top_k=0 yields empty on a resident shard"
-        );
-        assert!(
-            !outcome.warming,
-            "resident shard must NOT signal warming, even when empty"
-        );
     }
 }

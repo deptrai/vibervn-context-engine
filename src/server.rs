@@ -835,7 +835,8 @@ async fn post_ignore_file(
     // 2. Evict vectors from the in-memory shard.
     {
         let mut vi = state.index_engine.vector_index.write().await;
-        vi.apply_incremental(&repo, &[file_path], &[], &[]);
+        let identity = vi.resident_identity(&repo).unwrap_or_default();
+        vi.apply_incremental(&repo, &[file_path], &[], identity, &[]);
     }
     // The shard changed → invalidate the persisted file so the next warm rebuilds it.
     {
@@ -999,7 +1000,8 @@ async fn post_ignore_files(
         // 3. Evict this page's vectors from the in-memory shard.
         {
             let mut vi = state.index_engine.vector_index.write().await;
-            vi.apply_incremental(&repo, &abs_paths, &[], &[]);
+            let identity = vi.resident_identity(&repo).unwrap_or_default();
+            vi.apply_incremental(&repo, &abs_paths, &[], identity, &[]);
         }
 
         total += page_len;
@@ -1244,6 +1246,32 @@ async fn post_query(State(state): State<AppState>, Json(req): Json<QueryRequest>
         }
     };
 
+    let gate = crate::mcp::query_gate::rest_gate(
+        crate::mcp::readiness::await_index_ready(
+            &settings,
+            &state.index_engine,
+            &state.repo_dbs,
+            &state.data_dir,
+            repo_filter,
+        )
+        .await,
+    );
+    let (graph_mode, warm_budget, graph_pending) = if let Some(parts) = gate.query_parts() {
+        parts
+    } else {
+        let body = gate
+            .degrade_body()
+            .expect("degrades always have a JSON body");
+        let status = if matches!(gate, crate::mcp::query_gate::RestGate::Warming) {
+            StatusCode::from_u16(crate::mcp::query_gate::WARMING_STATUS)
+                .expect("WARMING_STATUS must be a valid HTTP status")
+        } else {
+            StatusCode::from_u16(crate::mcp::query_gate::INDEX_FAILED_STATUS)
+                .expect("INDEX_FAILED_STATUS must be a valid HTTP status")
+        };
+        return (status, Json(body)).into_response();
+    };
+
     // Delegate to the shared query op (VoyageClient build, optional LlmClient,
     // repo normalization, query::run_query with all settings-derived args) so the
     // CLI and server produce byte-identical retrieval. The `settings` snapshot was
@@ -1256,10 +1284,18 @@ async fn post_query(State(state): State<AppState>, Json(req): Json<QueryRequest>
         &req.query,
         req.top_k,
         req.rerank,
+        graph_mode,
+        warm_budget,
     )
     .await
     {
-        Ok(result) => Json(result).into_response(),
+        Ok(mut result) => {
+            // Keep the flag at the top level of the normal query JSON. The
+            // field is always present, so the UI can reserve badge space and
+            // transition visibility without shifting the results layout.
+            result.graph_pending = graph_pending;
+            Json(result).into_response()
+        }
         Err(e) => {
             let body = json!({ "error": format!("query failed: {e}") });
             (StatusCode::BAD_GATEWAY, Json(body)).into_response()
@@ -1362,13 +1398,16 @@ async fn post_mcp_setup(
     };
 
     // Repo must be a configured repo — never write into an arbitrary path.
-    {
+    // Capture the same enabled_mcp_tools list used by MCP runtime construction
+    // so generated prompt guidance never advertises a disabled tool.
+    let enabled_tools = {
         let settings = state.settings.read().await;
         if !settings.repos.contains(&repo) {
             let body = json!({ "error": "repo not found" });
             return (StatusCode::NOT_FOUND, Json(body)).into_response();
         }
-    }
+        settings.enabled_mcp_tools.clone()
+    };
 
     // The URL must be THIS repo's own MCP endpoint. We accept any scheme/host
     // (reverse proxies are valid) but the path must end with the repo's
@@ -1392,7 +1431,7 @@ async fn post_mcp_setup(
     let repo_root = PathBuf::from(&repo);
     let endpoint_url = req.endpoint_url.clone();
     let actions = match tokio::task::spawn_blocking(move || {
-        crate::mcp_setup::run_setup(&repo_root, target, &endpoint_url)
+        crate::mcp_setup::run_setup(&repo_root, target, &endpoint_url, &enabled_tools)
     })
     .await
     {

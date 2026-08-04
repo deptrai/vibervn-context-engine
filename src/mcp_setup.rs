@@ -18,6 +18,9 @@
 //!   * Path-escape safe: the caller validates the repo against settings; every
 //!     target path is a fixed relative constant joined under the repo root, so
 //!     nothing can be coaxed to write outside the repo.
+//!   * Never committed: every config file this module can write carries a
+//!     machine-local MCP URL, so all of `GITIGNORED_CONFIGS` is added to the
+//!     repo's `.gitignore` on every run, whichever tool was set up.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -35,6 +38,19 @@ const GUIDANCE_FILE: &str = "When you need to read a specific file but don't kno
 
 /// MCP server name written into every tool's config.
 const SERVER_NAME: &str = "codebase-retrieval";
+
+/// Every config file auto-setup can write, all of which are machine-local: the
+/// MCP URL they carry embeds *this* machine's live listen port, so committing
+/// them would push a port that is wrong for every other checkout. Auto-setup
+/// ignores the whole set regardless of which tool was set up, so a repo shared
+/// between Claude/Codex/Opencode users never grows a committed config for the
+/// tool the next person happens to run.
+const GITIGNORED_CONFIGS: &[&str] = &[
+    ".codex/config.toml",
+    "opencode.json",
+    ".claude/settings.local.json",
+    ".mcp.json",
+];
 
 // ─── Target tool ─────────────────────────────────────────────────────────
 
@@ -115,23 +131,32 @@ impl FileAction {
 /// Returns one `FileAction` per file touched. Per-file errors (e.g. a
 /// malformed existing config) are captured as `FileStatus::Error` actions and
 /// do NOT abort the other files — best-effort, never destructive.
-pub fn run_setup(repo_root: &Path, target: Target, endpoint_url: &str) -> Vec<FileAction> {
-    match target {
+pub fn run_setup(
+    repo_root: &Path,
+    target: Target,
+    endpoint_url: &str,
+    enabled_tools: &[String],
+) -> Vec<FileAction> {
+    let mut actions = match target {
         Target::Claude => vec![
             write_claude_mcp_json(repo_root, endpoint_url),
             write_claude_settings_local(repo_root),
-            ensure_gitignored(repo_root, ".claude/settings.local.json"),
-            write_prompt_file(repo_root, "CLAUDE.md"),
+            write_prompt_file(repo_root, "CLAUDE.md", enabled_tools),
         ],
         Target::Codex => vec![
             write_codex_config_toml(repo_root, endpoint_url),
-            write_prompt_file(repo_root, "AGENTS.md"),
+            write_prompt_file(repo_root, "AGENTS.md", enabled_tools),
         ],
         Target::Opencode => vec![
             write_opencode_json(repo_root, endpoint_url),
-            write_prompt_file(repo_root, "AGENTS.md"),
+            write_prompt_file(repo_root, "AGENTS.md", enabled_tools),
         ],
-    }
+    };
+    // Ignore the full config set for every target, not just the one we wrote:
+    // the same repo gets set up from different tools, and none of these files
+    // is safe to commit (see `GITIGNORED_CONFIGS`).
+    actions.push(ensure_gitignored(repo_root, GITIGNORED_CONFIGS));
+    actions
 }
 
 // ─── Path-safe file IO ─────────────────────────────────────────────────────
@@ -289,14 +314,15 @@ fn write_claude_settings_local(repo_root: &Path) -> FileAction {
 
 // ─── .gitignore ────────────────────────────────────────────────────────────
 
-/// Ensure `entry` is listed in the repo's `.gitignore`, appending it if absent
-/// and creating the file if it doesn't exist.
+/// Ensure every entry in `entries` is listed in the repo's `.gitignore`,
+/// appending the missing ones and creating the file if it doesn't exist.
 ///
-/// `settings.local.json` holds machine-local MCP-enablement state, so it should
-/// not be committed. Matching is line-exact against the trimmed entry (so a
-/// pre-existing `.claude/settings.local.json` line — with or without a leading
-/// `/` — is respected and not duplicated); we never rewrite existing lines.
-fn ensure_gitignored(repo_root: &Path, entry: &str) -> FileAction {
+/// Every auto-setup config file is machine-local (its MCP URL embeds this
+/// machine's live port), so none of them should be committed. Matching is
+/// line-exact against the trimmed entry (so a pre-existing `opencode.json`
+/// line — with or without a leading `/` — is respected and not duplicated); we
+/// never rewrite or reorder existing lines, only append.
+fn ensure_gitignored(repo_root: &Path, entries: &[&str]) -> FileAction {
     const REL: &str = ".gitignore";
     let path = match safe_join(repo_root, REL) {
         Ok(p) => p,
@@ -310,12 +336,19 @@ fn ensure_gitignored(repo_root: &Path, entry: &str) -> FileAction {
     };
 
     // Already ignored? Accept the bare path or a leading-slash anchored form.
-    let anchored = format!("/{entry}");
-    let already = current.lines().any(|l| {
-        let l = l.trim();
-        l == entry || l == anchored
-    });
-    if already {
+    let missing: Vec<&str> = entries
+        .iter()
+        .copied()
+        .filter(|entry| {
+            let anchored = format!("/{entry}");
+            !current.lines().any(|l| {
+                let l = l.trim();
+                l == *entry || l == anchored
+            })
+        })
+        .collect();
+
+    if missing.is_empty() {
         return FileAction {
             file: rel_label(REL),
             status: if existed {
@@ -331,8 +364,10 @@ fn ensure_gitignored(repo_root: &Path, entry: &str) -> FileAction {
     if !out.is_empty() && !out.ends_with('\n') {
         out.push('\n');
     }
-    out.push_str(entry);
-    out.push('\n');
+    for entry in missing {
+        out.push_str(entry);
+        out.push('\n');
+    }
 
     match atomic_write(&path, &out) {
         Ok(()) => FileAction {
@@ -496,12 +531,13 @@ fn write_codex_config_toml(repo_root: &Path, endpoint_url: &str) -> FileAction {
 
 // ─── Prompt files: CLAUDE.md / AGENTS.md ───────────────────────────────────
 
-/// Append guidance paragraphs the file is missing. Each block is gated
-/// independently: append GUIDANCE_CODEBASE iff `codebase-retrieval` is absent,
-/// GUIDANCE_FILE iff `file-retrieval` is absent. A brand-new file gets only the
-/// missing blocks (no `# CLAUDE.md` header). Existing content is never
-/// rewritten — blocks are appended at the end.
-fn write_prompt_file(repo_root: &Path, rel: &str) -> FileAction {
+/// Append guidance paragraphs for enabled tools that the file is missing. Each
+/// block is gated independently by BOTH config and existing content: append
+/// GUIDANCE_CODEBASE iff `codebase-retrieval` is enabled and absent;
+/// GUIDANCE_FILE iff `file-retrieval` is enabled and absent. A brand-new file
+/// gets only guidance for currently enabled tools (no heading). Existing content
+/// is never rewritten — blocks are appended at the end.
+fn write_prompt_file(repo_root: &Path, rel: &str, enabled_tools: &[String]) -> FileAction {
     let path = match safe_join(repo_root, rel) {
         Ok(p) => p,
         Err(e) => return error_action(rel, e),
@@ -513,16 +549,14 @@ fn write_prompt_file(repo_root: &Path, rel: &str) -> FileAction {
         Ok(t) => t,
     };
 
-    let need_codebase = !current.contains("codebase-retrieval");
-    let need_file = !current.contains("file-retrieval");
+    let need_codebase = enabled_tools.iter().any(|t| t == "codebase-retrieval")
+        && !current.contains("codebase-retrieval");
+    let need_file =
+        enabled_tools.iter().any(|t| t == "file-retrieval") && !current.contains("file-retrieval");
     if !need_codebase && !need_file {
         return FileAction {
             file: rel_label(rel),
-            status: if existed {
-                FileStatus::Unchanged
-            } else {
-                FileStatus::Created
-            },
+            status: FileStatus::Unchanged,
             detail: None,
         };
     }
@@ -570,6 +604,13 @@ mod tests {
 
     const URL: &str = "http://localhost:6699/mcp-repo/d__repo";
 
+    fn both_tools() -> Vec<String> {
+        vec![
+            "codebase-retrieval".to_string(),
+            "file-retrieval".to_string(),
+        ]
+    }
+
     fn read(dir: &TempDir, rel: &str) -> String {
         fs::read_to_string(dir.path().join(rel)).unwrap()
     }
@@ -591,7 +632,7 @@ mod tests {
     #[test]
     fn claude_fresh_repo_creates_all_three_files() {
         let dir = TempDir::new().unwrap();
-        let actions = run_setup(dir.path(), Target::Claude, URL);
+        let actions = run_setup(dir.path(), Target::Claude, URL, &both_tools());
         assert_eq!(status_of(&actions, ".mcp.json"), FileStatus::Created);
         assert_eq!(
             status_of(&actions, ".claude/settings.local.json"),
@@ -614,12 +655,38 @@ mod tests {
     }
 
     #[test]
+    fn claude_fresh_repo_omits_disabled_file_retrieval_guidance() {
+        let dir = TempDir::new().unwrap();
+        let enabled = vec!["codebase-retrieval".to_string()];
+        let actions = run_setup(dir.path(), Target::Claude, URL, &enabled);
+        assert_eq!(status_of(&actions, "CLAUDE.md"), FileStatus::Created);
+
+        let md = read(&dir, "CLAUDE.md");
+        assert!(md.contains("codebase-retrieval"));
+        assert!(
+            !md.contains("file-retrieval"),
+            "auto-setup must not advertise a disabled MCP tool"
+        );
+    }
+
+    #[test]
+    fn prompt_file_is_not_created_when_all_tools_are_disabled() {
+        let dir = TempDir::new().unwrap();
+        let actions = run_setup(dir.path(), Target::Codex, URL, &[]);
+        assert_eq!(status_of(&actions, "AGENTS.md"), FileStatus::Unchanged);
+        assert!(
+            !dir.path().join("AGENTS.md").exists(),
+            "auto-setup must not create an empty prompt file"
+        );
+    }
+
+    #[test]
     fn claude_preserves_other_servers_and_updates_url() {
         let dir = TempDir::new().unwrap();
         let pre = r#"{"mcpServers":{"other":{"type":"stdio","command":"foo"},"codebase-retrieval":{"type":"http","url":"http://localhost:1111/mcp-repo/d__repo"}}}"#;
         fs::write(dir.path().join(".mcp.json"), pre).unwrap();
 
-        let actions = run_setup(dir.path(), Target::Claude, URL);
+        let actions = run_setup(dir.path(), Target::Claude, URL, &both_tools());
         assert_eq!(status_of(&actions, ".mcp.json"), FileStatus::Updated);
 
         let mcp = json_at(&dir, ".mcp.json");
@@ -632,8 +699,8 @@ mod tests {
     #[test]
     fn claude_idempotent_second_run_is_unchanged() {
         let dir = TempDir::new().unwrap();
-        run_setup(dir.path(), Target::Claude, URL);
-        let actions = run_setup(dir.path(), Target::Claude, URL);
+        run_setup(dir.path(), Target::Claude, URL, &both_tools());
+        let actions = run_setup(dir.path(), Target::Claude, URL, &both_tools());
         assert_eq!(status_of(&actions, ".mcp.json"), FileStatus::Unchanged);
         assert_eq!(
             status_of(&actions, ".claude/settings.local.json"),
@@ -649,7 +716,7 @@ mod tests {
         let pre = r#"{"permissions":{"allow":["Read"]},"enabledMcpjsonServers":["existing"]}"#;
         fs::write(dir.path().join(".claude/settings.local.json"), pre).unwrap();
 
-        run_setup(dir.path(), Target::Claude, URL);
+        run_setup(dir.path(), Target::Claude, URL, &both_tools());
         let s = json_at(&dir, ".claude/settings.local.json");
         // Unrelated key preserved.
         assert_eq!(s["permissions"]["allow"][0], "Read");
@@ -666,55 +733,101 @@ mod tests {
         let bad = "{ this is not json ]";
         fs::write(dir.path().join(".mcp.json"), bad).unwrap();
 
-        let actions = run_setup(dir.path(), Target::Claude, URL);
+        let actions = run_setup(dir.path(), Target::Claude, URL, &both_tools());
         assert_eq!(status_of(&actions, ".mcp.json"), FileStatus::Error);
         // File left byte-for-byte intact.
         assert_eq!(read(&dir, ".mcp.json"), bad);
     }
 
     #[test]
-    fn claude_creates_gitignore_with_settings_local() {
+    fn claude_creates_gitignore_with_every_config_file() {
         let dir = TempDir::new().unwrap();
-        let actions = run_setup(dir.path(), Target::Claude, URL);
+        let actions = run_setup(dir.path(), Target::Claude, URL, &both_tools());
         assert_eq!(status_of(&actions, ".gitignore"), FileStatus::Created);
         let gi = read(&dir, ".gitignore");
-        assert!(gi.contains(".claude/settings.local.json"));
+        for entry in GITIGNORED_CONFIGS {
+            assert!(gi.contains(entry), "missing {entry} in .gitignore:\n{gi}");
+        }
     }
 
     #[test]
-    fn claude_appends_gitignore_preserving_existing() {
+    fn every_target_gitignores_every_config_file() {
+        for target in [Target::Claude, Target::Codex, Target::Opencode] {
+            let dir = TempDir::new().unwrap();
+            let actions = run_setup(dir.path(), target, URL, &both_tools());
+            assert_eq!(
+                status_of(&actions, ".gitignore"),
+                FileStatus::Created,
+                "target {target:?} did not create .gitignore"
+            );
+            let gi = read(&dir, ".gitignore");
+            for entry in GITIGNORED_CONFIGS {
+                assert!(
+                    gi.contains(entry),
+                    "target {target:?} missing {entry} in .gitignore:\n{gi}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn gitignore_appends_preserving_existing() {
         let dir = TempDir::new().unwrap();
         let pre = "node_modules/\ntarget/\n";
         fs::write(dir.path().join(".gitignore"), pre).unwrap();
 
-        let actions = run_setup(dir.path(), Target::Claude, URL);
+        let actions = run_setup(dir.path(), Target::Claude, URL, &both_tools());
         assert_eq!(status_of(&actions, ".gitignore"), FileStatus::Updated);
         let gi = read(&dir, ".gitignore");
         assert!(gi.contains("node_modules/")); // existing kept
         assert!(gi.contains("target/"));
-        assert!(gi.contains(".claude/settings.local.json"));
+        for entry in GITIGNORED_CONFIGS {
+            assert!(gi.contains(entry), "missing {entry} in .gitignore:\n{gi}");
+        }
     }
 
     #[test]
-    fn claude_gitignore_idempotent_and_respects_anchored_form() {
+    fn gitignore_appends_only_the_missing_entries() {
         let dir = TempDir::new().unwrap();
-        // Pre-existing leading-slash anchored entry must not be duplicated.
-        fs::write(
-            dir.path().join(".gitignore"),
-            "/.claude/settings.local.json\n",
-        )
-        .unwrap();
-        let actions = run_setup(dir.path(), Target::Claude, URL);
-        assert_eq!(status_of(&actions, ".gitignore"), FileStatus::Unchanged);
+        // One of the four already present — the other three get appended.
+        fs::write(dir.path().join(".gitignore"), "opencode.json\n").unwrap();
+
+        let actions = run_setup(dir.path(), Target::Opencode, URL, &both_tools());
+        assert_eq!(status_of(&actions, ".gitignore"), FileStatus::Updated);
         let gi = read(&dir, ".gitignore");
-        assert_eq!(gi.matches("settings.local.json").count(), 1);
+        assert_eq!(
+            gi.matches("opencode.json").count(),
+            1,
+            "existing entry must not be duplicated:\n{gi}"
+        );
+        for entry in GITIGNORED_CONFIGS {
+            assert!(gi.contains(entry), "missing {entry} in .gitignore:\n{gi}");
+        }
     }
 
     #[test]
-    fn non_claude_targets_do_not_touch_gitignore() {
+    fn gitignore_idempotent_and_respects_anchored_form() {
         let dir = TempDir::new().unwrap();
-        run_setup(dir.path(), Target::Codex, URL);
-        assert!(!dir.path().join(".gitignore").exists());
+        // Pre-existing leading-slash anchored entries must not be duplicated.
+        let pre: String = GITIGNORED_CONFIGS
+            .iter()
+            .map(|e| format!("/{e}\n"))
+            .collect();
+        fs::write(dir.path().join(".gitignore"), &pre).unwrap();
+
+        let actions = run_setup(dir.path(), Target::Claude, URL, &both_tools());
+        assert_eq!(status_of(&actions, ".gitignore"), FileStatus::Unchanged);
+        assert_eq!(read(&dir, ".gitignore"), pre, "file must be left as-is");
+    }
+
+    #[test]
+    fn gitignore_second_run_is_unchanged() {
+        let dir = TempDir::new().unwrap();
+        run_setup(dir.path(), Target::Codex, URL, &both_tools());
+        let first = read(&dir, ".gitignore");
+        let actions = run_setup(dir.path(), Target::Codex, URL, &both_tools());
+        assert_eq!(status_of(&actions, ".gitignore"), FileStatus::Unchanged);
+        assert_eq!(read(&dir, ".gitignore"), first);
     }
 
     // ── Codex ───────────────────────────────────────────────────────────
@@ -722,7 +835,7 @@ mod tests {
     #[test]
     fn codex_fresh_creates_toml_and_agents_md() {
         let dir = TempDir::new().unwrap();
-        let actions = run_setup(dir.path(), Target::Codex, URL);
+        let actions = run_setup(dir.path(), Target::Codex, URL, &both_tools());
         assert_eq!(
             status_of(&actions, ".codex/config.toml"),
             FileStatus::Created
@@ -742,7 +855,7 @@ mod tests {
             "# my codex config\nmodel = \"gpt-5\"\n\n[mcp_servers.other]\nurl = \"http://x\"\n";
         fs::write(dir.path().join(".codex/config.toml"), pre).unwrap();
 
-        let actions = run_setup(dir.path(), Target::Codex, URL);
+        let actions = run_setup(dir.path(), Target::Codex, URL, &both_tools());
         assert_eq!(
             status_of(&actions, ".codex/config.toml"),
             FileStatus::Updated
@@ -762,7 +875,7 @@ mod tests {
         let bad = "this = = not valid toml [[[";
         fs::write(dir.path().join(".codex/config.toml"), bad).unwrap();
 
-        let actions = run_setup(dir.path(), Target::Codex, URL);
+        let actions = run_setup(dir.path(), Target::Codex, URL, &both_tools());
         assert_eq!(status_of(&actions, ".codex/config.toml"), FileStatus::Error);
         assert_eq!(read(&dir, ".codex/config.toml"), bad);
     }
@@ -772,7 +885,7 @@ mod tests {
     #[test]
     fn opencode_fresh_sets_schema_and_remote_server() {
         let dir = TempDir::new().unwrap();
-        let actions = run_setup(dir.path(), Target::Opencode, URL);
+        let actions = run_setup(dir.path(), Target::Opencode, URL, &both_tools());
         assert_eq!(status_of(&actions, "opencode.json"), FileStatus::Created);
 
         let j = json_at(&dir, "opencode.json");
@@ -788,7 +901,7 @@ mod tests {
         let pre = r#"{"$schema":"https://custom","theme":"dark","mcp":{"other":{"type":"local"}}}"#;
         fs::write(dir.path().join("opencode.json"), pre).unwrap();
 
-        run_setup(dir.path(), Target::Opencode, URL);
+        run_setup(dir.path(), Target::Opencode, URL, &both_tools());
         let j = json_at(&dir, "opencode.json");
         assert_eq!(j["$schema"], "https://custom"); // not overridden
         assert_eq!(j["theme"], "dark"); // unrelated key kept
@@ -805,7 +918,7 @@ mod tests {
         let pre = "# Notes\n\nWe use codebase-retrieval already.\n";
         fs::write(dir.path().join("AGENTS.md"), pre).unwrap();
 
-        let actions = run_setup(dir.path(), Target::Codex, URL);
+        let actions = run_setup(dir.path(), Target::Codex, URL, &both_tools());
         assert_eq!(status_of(&actions, "AGENTS.md"), FileStatus::Updated);
 
         let md = read(&dir, "AGENTS.md");
@@ -819,8 +932,8 @@ mod tests {
     #[test]
     fn prompt_unchanged_when_both_blocks_present() {
         let dir = TempDir::new().unwrap();
-        run_setup(dir.path(), Target::Codex, URL); // creates AGENTS.md
-        let actions = run_setup(dir.path(), Target::Codex, URL);
+        run_setup(dir.path(), Target::Codex, URL, &both_tools()); // creates AGENTS.md
+        let actions = run_setup(dir.path(), Target::Codex, URL, &both_tools());
         assert_eq!(status_of(&actions, "AGENTS.md"), FileStatus::Unchanged);
     }
 

@@ -8,6 +8,7 @@ use surrealdb::engine::local::Db;
 use tokio::sync::RwLock;
 use tracing::warn;
 
+use crate::embedding::identity::EmbeddingIdentity;
 use crate::embedding::voyage::VoyageClient;
 use crate::indexing::IndexEngine;
 use crate::llm::LlmClient;
@@ -88,6 +89,13 @@ pub struct QueryResult {
     /// NOT "the index contains nothing". False for a genuine empty or a hit.
     #[serde(default)]
     pub warming: bool,
+    /// True when this query ran WITHOUT call-graph expansion because phase 2
+    /// (edge resolution) had not finished. The vector results are complete and
+    /// correct; only callers/callees are missing. Derived from the graph mode the
+    /// readiness gate selected, so the API surface cannot disagree with what the
+    /// pipeline actually did.
+    #[serde(default)]
+    pub graph_pending: bool,
 }
 
 // ─── DB row types ─────────────────────────────────────────────────────────
@@ -224,11 +232,18 @@ pub(crate) async fn run_query_with_filters_and_mode(
     // ── Step 2: Vector search ─────────────────────────────────────────────
     let search_start = Instant::now();
     // Search for 2× top_k so graph expansion has candidates to work with.
+    let current_identity = EmbeddingIdentity::from_client(voyage_client);
     let crate::indexing::VectorSearchOutcome {
         results: raw_results,
-        warming,
+        mut warming,
     } = index_engine
-        .vector_search(&embedding, top_k * 2, repo_filter, warm_wait)
+        .vector_search(
+            &embedding,
+            top_k * 2,
+            repo_filter,
+            warm_wait,
+            &current_identity,
+        )
         .await;
     let search_ms = search_start.elapsed().as_millis() as u64;
 
@@ -246,6 +261,7 @@ pub(crate) async fn run_query_with_filters_and_mode(
             },
             rerank: None,
             warming,
+            graph_pending: matches!(graph_mode, QueryGraphMode::VectorOnly),
         });
     }
 
@@ -267,24 +283,29 @@ pub(crate) async fn run_query_with_filters_and_mode(
         guard.clone()
     }; // read lock dropped HERE — before any async DB queries
 
-    let mut base_chunks: Vec<MergeChunk> = Vec::with_capacity(filtered.len());
-    for sr in &filtered {
-        let (content, symbol, symbol_fqn, symbol_kind) = fetch_chunk_content(
-            &db_map,
-            &sr.chunk_id.file,
-            sr.chunk_id.line_start,
-            sr.chunk_id.line_end,
-        )
-        .await;
-        base_chunks.push(MergeChunk {
-            file: sr.chunk_id.file.clone(),
-            line_start: sr.chunk_id.line_start,
-            line_end: sr.chunk_id.line_end,
-            score: sr.score,
-            content,
-            symbol,
-            symbol_fqn,
-            symbol_kind,
+    let fenced = hydrate_candidates(&db_map, &filtered).await;
+    if fenced.dropped > 0 {
+        // A vector candidate without a durable chunk row is an index publication
+        // race, never a valid empty result. Preserve resolved partial results but
+        // surface retry/incomplete state to the caller.
+        warming = true;
+    }
+    let mut base_chunks = fenced.kept;
+    if base_chunks.is_empty() && fenced.dropped > 0 {
+        return Ok(QueryResult {
+            results: vec![],
+            pre_rerank_results: vec![],
+            timing: QueryTiming {
+                embed_ms,
+                search_ms,
+                graph_ms: 0,
+                merge_ms: 0,
+                rerank_ms: 0,
+                total_ms: total_start.elapsed().as_millis() as u64,
+            },
+            rerank: None,
+            warming: true,
+            graph_pending: matches!(graph_mode, QueryGraphMode::VectorOnly),
         });
     }
 
@@ -478,6 +499,12 @@ pub(crate) async fn run_query_with_filters_and_mode(
         }
     }
 
+    let before_final_fence = results.len();
+    results.retain(|r| !crate::query::content_fence::is_unresolved_content(&r.content));
+    if results.len() != before_final_fence {
+        warming = true;
+    }
+
     // Pre-rerank diagnostic output, reusing the same numbered reads.
     let mut pre_rerank_results: Vec<CodeResult> = Vec::with_capacity(merged.len());
     for (i, chunk) in merged.iter().enumerate() {
@@ -504,6 +531,8 @@ pub(crate) async fn run_query_with_filters_and_mode(
         });
     }
 
+    pre_rerank_results.retain(|r| !crate::query::content_fence::is_unresolved_content(&r.content));
+
     let total_ms = total_start.elapsed().as_millis() as u64;
 
     let rerank_info = RerankInfo {
@@ -526,6 +555,7 @@ pub(crate) async fn run_query_with_filters_and_mode(
         },
         rerank: Some(rerank_info),
         warming,
+        graph_pending: matches!(graph_mode, QueryGraphMode::VectorOnly),
     })
 }
 
@@ -550,11 +580,18 @@ pub(crate) async fn run_sub_query(
         bail!("embed_query returned an empty vector");
     }
 
+    let current_identity = EmbeddingIdentity::from_client(voyage_client);
     let crate::indexing::VectorSearchOutcome {
         results: raw_results,
         ..
     } = index_engine
-        .vector_search(&embedding, top_k * 2, Some(repo_filter), warm_wait)
+        .vector_search(
+            &embedding,
+            top_k * 2,
+            Some(repo_filter),
+            warm_wait,
+            &current_identity,
+        )
         .await;
     if raw_results.is_empty() {
         return Ok(vec![]);
@@ -571,26 +608,7 @@ pub(crate) async fn run_sub_query(
         guard.clone()
     };
 
-    let mut base_chunks: Vec<MergeChunk> = Vec::with_capacity(filtered.len());
-    for sr in &filtered {
-        let (content, symbol, symbol_fqn, symbol_kind) = fetch_chunk_content(
-            &db_map,
-            &sr.chunk_id.file,
-            sr.chunk_id.line_start,
-            sr.chunk_id.line_end,
-        )
-        .await;
-        base_chunks.push(MergeChunk {
-            file: sr.chunk_id.file.clone(),
-            line_start: sr.chunk_id.line_start,
-            line_end: sr.chunk_id.line_end,
-            score: sr.score,
-            content,
-            symbol,
-            symbol_fqn,
-            symbol_kind,
-        });
-    }
+    let base_chunks = hydrate_candidates(&db_map, &filtered).await.kept;
 
     let schema_version = if graph_mode.uses_call_graph() {
         Some(if let Some(db) = db_map.values().next() {
@@ -985,6 +1003,35 @@ pub fn format_callee_tag(stats: &CallerCalleeStats) -> String {
 /// Fetch stored chunk content, symbol short name, full FQN, and symbol kind
 /// from whichever DB contains the file.
 #[allow(clippy::result_large_err)]
+/// Resolve vector candidates against durable chunk rows, then apply the shared
+/// fail-closed content fence. Kept candidates preserve vector ranking order.
+pub(crate) async fn hydrate_candidates(
+    db_map: &HashMap<String, Surreal<Db>>,
+    candidates: &[crate::vector::SearchResult],
+) -> crate::query::content_fence::ContentFence {
+    let mut chunks = Vec::with_capacity(candidates.len());
+    for sr in candidates {
+        let (content, symbol, symbol_fqn, symbol_kind) = fetch_chunk_content(
+            db_map,
+            &sr.chunk_id.file,
+            sr.chunk_id.line_start,
+            sr.chunk_id.line_end,
+        )
+        .await;
+        chunks.push(MergeChunk {
+            file: sr.chunk_id.file.clone(),
+            line_start: sr.chunk_id.line_start,
+            line_end: sr.chunk_id.line_end,
+            score: sr.score,
+            content,
+            symbol,
+            symbol_fqn,
+            symbol_kind,
+        });
+    }
+    crate::query::content_fence::apply(chunks)
+}
+
 async fn fetch_chunk_content(
     db_map: &HashMap<String, Surreal<Db>>,
     file: &str,
@@ -996,7 +1043,10 @@ async fn fetch_chunk_content(
         None => return (String::new(), None, None, None),
     };
 
-    let rows: Result<Vec<ChunkContentRow>, _> = db
+    // Deliberately NOT `.and_then(|mut r| r.take(0))`: a closure returning
+    // `Result<_, surrealdb::Error>` trips `clippy::result_large_err` (the error
+    // variant is >140 bytes). The match is equivalent and allocation-free.
+    let response = db
         .query(
             "SELECT content, symbol_ref FROM chunk \
              WHERE file = $file AND line_start = $ls AND line_end = $le LIMIT 1",
@@ -1004,8 +1054,11 @@ async fn fetch_chunk_content(
         .bind(("file", file.to_string()))
         .bind(("ls", line_start as i64))
         .bind(("le", line_end as i64))
-        .await
-        .and_then(|mut r| r.take(0));
+        .await;
+    let rows: Result<Vec<ChunkContentRow>, _> = match response {
+        Ok(mut r) => r.take(0),
+        Err(e) => Err(e),
+    };
 
     match rows {
         Ok(rows) => {

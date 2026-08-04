@@ -45,6 +45,7 @@ pub const RERANK_AGENTIC_TOOL_READ: &str = include_str!("rerank_agentic_tool_rea
 // ─── MCP freshness/degradation guidance (mcp.rs) ─────────────────────────
 pub const MCP_DEGRADE_INDEX_FAILED: &str = include_str!("mcp_degrade_index_failed.txt");
 pub const MCP_DEGRADE_INDEXING: &str = include_str!("mcp_degrade_indexing.txt");
+pub const MCP_GRAPH_PENDING: &str = include_str!("mcp_graph_pending.txt");
 pub const MCP_FILE_RETRIEVAL_HINT: &str = include_str!("mcp_file_retrieval_hint.txt");
 
 // ─── LLM transport (llm/openai.rs) ───────────────────────────────────────

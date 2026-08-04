@@ -1,0 +1,2 @@
+(index is resolving the call graph; showing vector-only results without callers/callees)
+

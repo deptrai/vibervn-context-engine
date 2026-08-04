@@ -18,7 +18,8 @@ use crate::config::{Settings, config_path, write_settings_atomic};
 use crate::embedding::voyage::VoyageClient;
 use crate::indexing::IndexEngine;
 use crate::llm::LlmClient;
-use crate::query::{self, QueryResult};
+use crate::query::QueryResult;
+use crate::query::engine::{QueryGraphMode, run_query_with_filters_and_mode};
 use crate::store::{self, RepoDbMap};
 
 /// Result of [`remove_index`]: whether the old generation's directory was fully
@@ -170,6 +171,8 @@ pub async fn run_query_op(
     query_text: &str,
     top_k: usize,
     rerank: bool,
+    graph_mode: QueryGraphMode,
+    warm_budget: Duration,
 ) -> Result<QueryResult> {
     // Build the embedding client through the provider-aware factory so the
     // configured `embedding.provider` (Voyage or OpenAI) is honored.
@@ -194,7 +197,7 @@ pub async fn run_query_op(
     // Queries are always scoped to one repository.
     let repo_filter = store::normalize_repo_path(repo);
 
-    query::run_query(
+    run_query_with_filters_and_mode(
         query_text,
         top_k,
         Some(&repo_filter),
@@ -203,11 +206,13 @@ pub async fn run_query_op(
         repo_dbs,
         settings.llm.rerank_min_prune_lines,
         llm_client.as_ref(),
-        Duration::from_secs(settings.mcp_index_wait_secs),
+        warm_budget,
         settings.llm.agentic_rag,
         settings.llm.agentic_rag_max_turns,
         settings.llm.agentic_rag_max_chunk_chars,
         settings.llm.agentic_rag_grep_read,
+        None,
+        graph_mode,
     )
     .await
 }
