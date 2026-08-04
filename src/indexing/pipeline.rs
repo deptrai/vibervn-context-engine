@@ -793,6 +793,7 @@ impl IndexPipeline {
                         event_bus,
                         key_hints,
                         cancel_token.as_ref(),
+                        run_identity_key.as_deref(),
                     )
                     .await?;
                 let indexed = get_all_file_meta(db, &self.repo).await?.len() as u64;
