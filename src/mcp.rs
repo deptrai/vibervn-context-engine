@@ -332,10 +332,16 @@ impl McpHandler {
         settings: Arc<RwLock<crate::config::Settings>>,
         enabled_tools: &[String],
     ) -> Self {
-        let all_tools: &[&str] = &["codebase-retrieval", "file-retrieval"];
+        let all_tools: &[&str] = &[
+            "codebase-retrieval",
+            "codebase_retrieval",
+            "file-retrieval",
+            "file_retrieval",
+        ];
         let mut router = Self::tool_router();
         for &name in all_tools {
-            if !enabled_tools.iter().any(|e| e == name) {
+            let normalized_name = name.replace('_', "-");
+            if !enabled_tools.iter().any(|e| e == name || e.replace('_', "-") == normalized_name) {
                 router.disable_route(name);
             }
         }
@@ -377,6 +383,15 @@ impl McpHandler {
         Ok(CallToolResult::success(vec![Content::text(text)]))
     }
 
+    #[doc = include_str!("prompts/mcp_codebase_retrieval.txt")]
+    #[tool(name = "codebase_retrieval")]
+    async fn codebase_retrieval_snake(
+        &self,
+        params: Parameters<CodebaseRetrievalArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.codebase_retrieval(params).await
+    }
+
     #[doc = include_str!("prompts/mcp_file_retrieval.txt")]
     #[tool(name = "file-retrieval")]
     async fn file_retrieval(
@@ -395,6 +410,15 @@ impl McpHandler {
         )
         .await;
         Ok(CallToolResult::success(vec![Content::text(text)]))
+    }
+
+    #[doc = include_str!("prompts/mcp_file_retrieval.txt")]
+    #[tool(name = "file_retrieval")]
+    async fn file_retrieval_snake(
+        &self,
+        params: Parameters<FileRetrievalArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.file_retrieval(params).await
     }
 }
 
@@ -450,10 +474,16 @@ impl RepoMcpHandler {
         settings: Arc<RwLock<crate::config::Settings>>,
         enabled_tools: &[String],
     ) -> Self {
-        let all_tools: &[&str] = &["codebase-retrieval", "file-retrieval"];
+        let all_tools: &[&str] = &[
+            "codebase-retrieval",
+            "codebase_retrieval",
+            "file-retrieval",
+            "file_retrieval",
+        ];
         let mut router = Self::tool_router();
         for &name in all_tools {
-            if !enabled_tools.iter().any(|e| e == name) {
+            let normalized_name = name.replace('_', "-");
+            if !enabled_tools.iter().any(|e| e == name || e.replace('_', "-") == normalized_name) {
                 router.disable_route(name);
             }
         }
@@ -488,6 +518,15 @@ impl RepoMcpHandler {
         Ok(CallToolResult::success(vec![Content::text(text)]))
     }
 
+    #[doc = include_str!("prompts/mcp_codebase_retrieval.txt")]
+    #[tool(name = "codebase_retrieval")]
+    async fn codebase_retrieval_snake(
+        &self,
+        params: Parameters<RepoCodebaseRetrievalArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.codebase_retrieval(params).await
+    }
+
     #[doc = include_str!("prompts/mcp_file_retrieval_repo.txt")]
     #[tool(name = "file-retrieval")]
     async fn file_retrieval(
@@ -506,6 +545,15 @@ impl RepoMcpHandler {
         )
         .await;
         Ok(CallToolResult::success(vec![Content::text(text)]))
+    }
+
+    #[doc = include_str!("prompts/mcp_file_retrieval_repo.txt")]
+    #[tool(name = "file_retrieval")]
+    async fn file_retrieval_snake(
+        &self,
+        params: Parameters<RepoFileRetrievalArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.file_retrieval(params).await
     }
 }
 

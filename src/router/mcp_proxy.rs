@@ -68,10 +68,16 @@ pub struct ProxyMcpHandler {
 #[tool_router]
 impl ProxyMcpHandler {
     pub fn new(proxy: ProxyCtx, enabled_tools: &[String]) -> Self {
-        let all_tools: &[&str] = &["codebase-retrieval", "file-retrieval"];
+        let all_tools: &[&str] = &[
+            "codebase-retrieval",
+            "codebase_retrieval",
+            "file-retrieval",
+            "file_retrieval",
+        ];
         let mut router = Self::tool_router();
         for &name in all_tools {
-            if !enabled_tools.iter().any(|e| e == name) {
+            let normalized_name = name.replace('_', "-");
+            if !enabled_tools.iter().any(|e| e == name || e.replace('_', "-") == normalized_name) {
                 router.disable_route(name);
             }
         }
@@ -105,6 +111,15 @@ impl ProxyMcpHandler {
         Ok(CallToolResult::success(vec![Content::text(text)]))
     }
 
+    #[doc = include_str!("../prompts/mcp_codebase_retrieval.txt")]
+    #[tool(name = "codebase_retrieval")]
+    async fn codebase_retrieval_snake(
+        &self,
+        params: Parameters<ProxyCodebaseRetrievalArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.codebase_retrieval(params).await
+    }
+
     #[doc = include_str!("../prompts/mcp_file_retrieval.txt")]
     #[tool(name = "file-retrieval")]
     async fn file_retrieval(
@@ -127,6 +142,15 @@ impl ProxyMcpHandler {
             .await
             .unwrap_or_else(|e| format!("Error: {e}"));
         Ok(CallToolResult::success(vec![Content::text(text)]))
+    }
+
+    #[doc = include_str!("../prompts/mcp_file_retrieval.txt")]
+    #[tool(name = "file_retrieval")]
+    async fn file_retrieval_snake(
+        &self,
+        params: Parameters<ProxyFileRetrievalArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.file_retrieval(params).await
     }
 }
 
